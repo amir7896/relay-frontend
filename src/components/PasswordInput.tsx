@@ -5,6 +5,7 @@ type PasswordInputProps = Omit<
   'type'
 > & {
   label: string;
+  error?: string;
 };
 
 function EyeIcon() {
@@ -47,12 +48,23 @@ function EyeOffIcon() {
   );
 }
 
-export function PasswordInput({ label, id, name, ...props }: PasswordInputProps) {
+export function PasswordInput({
+  label,
+  id,
+  name,
+  error,
+  className,
+  ...props
+}: PasswordInputProps) {
   const [visible, setVisible] = useState(false);
   const inputId = id ?? name ?? 'password';
+  const errorId = `${inputId}-error`;
 
   return (
-    <label className="password-field" htmlFor={inputId}>
+    <label
+      className={`password-field${error ? ' field-invalid' : ''}`}
+      htmlFor={inputId}
+    >
       {label}
       <span className="password-input-wrap">
         <input
@@ -60,7 +72,9 @@ export function PasswordInput({ label, id, name, ...props }: PasswordInputProps)
           id={inputId}
           name={name}
           type={visible ? 'text' : 'password'}
-          className="password-input"
+          className={`password-input${className ? ` ${className}` : ''}${error ? ' input-invalid' : ''}`}
+          aria-invalid={error ? true : undefined}
+          aria-describedby={error ? errorId : undefined}
         />
         <button
           className="password-toggle"
@@ -72,6 +86,11 @@ export function PasswordInput({ label, id, name, ...props }: PasswordInputProps)
           {visible ? <EyeOffIcon /> : <EyeIcon />}
         </button>
       </span>
+      {error ? (
+        <span className="field-error" id={errorId} role="alert">
+          {error}
+        </span>
+      ) : null}
     </label>
   );
 }

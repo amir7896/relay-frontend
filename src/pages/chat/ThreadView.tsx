@@ -21,6 +21,11 @@ import {
   parseMentionQuery,
   renderMessageBody,
 } from '../../lib/chatComposer';
+import {
+  clearMessageDraft,
+  getMessageDraft,
+  setMessageDraft,
+} from '../../lib/messageDrafts';
 import { useDirectory } from '../../people/useDirectory';
 import type {
   ChatMessage,
@@ -216,7 +221,7 @@ export function ThreadView() {
     setError('');
     setActionError('');
     setDetails(false);
-    setComposer('');
+    setComposer(getMessageDraft(id));
     setTyping('');
     setReplyTo(null);
     setEditingMessage(null);
@@ -339,6 +344,16 @@ export function ThreadView() {
   }, [id, me, clearUnread, joinConversation, navigate, subscribe]);
 
   useEffect(() => {
+    if (editingMessage) {
+      return;
+    }
+    const handle = window.setTimeout(() => {
+      setMessageDraft(id, composer);
+    }, 300);
+    return () => window.clearTimeout(handle);
+  }, [composer, editingMessage, id]);
+
+  useEffect(() => {
     const node = scroller.current;
     if (!node) {
       return;
@@ -413,6 +428,7 @@ export function ThreadView() {
         );
         setMessages((current) => upsertMessage(current, response.data));
         setComposer('');
+        clearMessageDraft(id);
         setEditingMessage(null);
       } catch (err) {
         setActionError(err instanceof Error ? err.message : 'Could not edit message');
@@ -445,6 +461,7 @@ export function ThreadView() {
     });
     setMessages((current) => upsertMessage(current, response.data));
     setComposer('');
+    clearMessageDraft(id);
     setReplyTo(null);
     setPendingLinkPreview(null);
     void sendTyping(false);
@@ -542,6 +559,7 @@ export function ThreadView() {
       });
       setMessages((current) => upsertMessage(current, response.data));
       setComposer('');
+      clearMessageDraft(id);
       setReplyTo(null);
       setEditingMessage(null);
     } catch (err) {
@@ -721,7 +739,7 @@ export function ThreadView() {
       }
       if (editingMessage?.id === message.id) {
         setEditingMessage(null);
-        setComposer('');
+        setComposer(getMessageDraft(id));
       }
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not delete message');
@@ -1152,7 +1170,7 @@ export function ThreadView() {
             aria-label="Cancel edit"
             onClick={() => {
               setEditingMessage(null);
-              setComposer('');
+              setComposer(getMessageDraft(id));
             }}
           >
             ×

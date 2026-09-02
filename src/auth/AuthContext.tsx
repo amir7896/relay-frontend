@@ -15,6 +15,7 @@ type RegisterInput = {
   password: string;
   firstName: string;
   lastName: string;
+  inviteToken?: string;
 };
 
 type AuthContextValue = {
@@ -34,6 +35,7 @@ function toSession(result: AuthResult): Session {
       id: result.user.id,
       email: result.user.email,
       role: result.user.role,
+      isEmailVerified: result.user.isEmailVerified,
     },
   };
 }

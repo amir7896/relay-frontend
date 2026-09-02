@@ -6,10 +6,21 @@ import { PasswordInput } from '../components/PasswordInput';
 import { initials } from '../lib/format';
 import {
   getNotificationPermission,
-  requestPermission,
+  subscribeWebPush,
 } from '../lib/notifications';
 import { resetDemoTour } from '../components/DemoTour';
 import type { UserProfile, WorkspaceSettings } from '../api/types';
+
+type WorkspaceInvite = {
+  id: string;
+  email: string | null;
+  inviteUrl: string;
+  maxUses: number;
+  usedCount: number;
+  expiresAt: string;
+  revokedAt: string | null;
+  createdAt: string;
+};
 
 export function ProfilePage() {
   const { session, logout } = useAuth();
@@ -23,6 +34,9 @@ export function ProfilePage() {
   const isAdmin = session?.user.role === 'admin';
   const [branding, setBranding] = useState<WorkspaceSettings | null>(null);
   const [brandingSaved, setBrandingSaved] = useState('');
+  const [invites, setInvites] = useState<WorkspaceInvite[]>([]);
+  const [inviteUrl, setInviteUrl] = useState('');
+  const [inviteBusy, setInviteBusy] = useState(false);
 
   useEffect(() => {
     void api<UserProfile>('/users/me')
@@ -43,7 +57,51 @@ export function ProfilePage() {
     void api<WorkspaceSettings>('/workspace/settings')
       .then((response) => setBranding(response.data))
       .catch(() => undefined);
+    void loadInvites();
   }, [isAdmin]);
+
+  async function loadInvites() {
+    try {
+      const response = await api<WorkspaceInvite[]>('/auth/invites');
+      setInvites(response.data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not load invites');
+    }
+  }
+
+  async function createInvite(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setInviteBusy(true);
+    setError('');
+    const form = new FormData(event.currentTarget);
+    const email = String(form.get('email') ?? '').trim();
+    try {
+      const response = await api<WorkspaceInvite>('/auth/invites', {
+        method: 'POST',
+        body: JSON.stringify({
+          email: email || undefined,
+          expiresInDays: Number(form.get('expiresInDays') ?? 7),
+          maxUses: email ? 1 : Number(form.get('maxUses') ?? 25),
+        }),
+      });
+      setInviteUrl(response.data.inviteUrl);
+      event.currentTarget.reset();
+      await loadInvites();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not create invite');
+    } finally {
+      setInviteBusy(false);
+    }
+  }
+
+  async function revokeInvite(id: string) {
+    try {
+      await api(`/auth/invites/${id}`, { method: 'DELETE' });
+      await loadInvites();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not revoke invite');
+    }
+  }
 
   async function saveBranding(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -66,16 +124,23 @@ export function ProfilePage() {
 
   async function enableDesktopNotifications() {
     setNotifyHint('');
-    const permission = await requestPermission();
-    setNotifyStatus(permission);
-    if (permission === 'granted') {
-      setNotifyHint('Desktop notifications are on.');
-    } else if (permission === 'denied') {
-      setNotifyHint(
-        'Notifications are blocked in your browser. Open site settings for this page and allow notifications.',
-      );
-    } else if (permission === 'unsupported') {
-      setNotifyHint('This browser does not support desktop notifications.');
+    try {
+      const permission = await subscribeWebPush();
+      setNotifyStatus(permission === 'disabled' ? 'granted' : permission);
+      if (permission === 'granted') {
+        setNotifyHint('Desktop and push notifications are on.');
+      } else if (permission === 'disabled') {
+        setNotifyHint('Desktop notifications are on, but server push is not configured.');
+      } else if (permission === 'denied') {
+        setNotifyHint(
+          'Notifications are blocked in your browser. Open site settings for this page and allow notifications.',
+        );
+      } else if (permission === 'unsupported') {
+        setNotifyHint('This browser does not support push notifications.');
+      }
+    } catch (err) {
+      setNotifyHint(err instanceof Error ? err.message : 'Could not enable push notifications.');
+      setNotifyStatus(getNotificationPermission());
     }
   }
 
@@ -132,6 +197,14 @@ export function ProfilePage() {
     ? `${profile.firstName} ${profile.lastName}`.trim()
     : session?.user.email ?? 'You';
   const avatarUrl = profile?.avatar?.trim() || '';
+  const notifyLabel =
+    notifyStatus === 'granted'
+      ? 'Allowed'
+      : notifyStatus === 'denied'
+        ? 'Blocked'
+        : notifyStatus === 'unsupported'
+          ? 'Unsupported'
+          : 'Off';
 
   return (
     <main className="page profile-page">
@@ -143,10 +216,18 @@ export function ProfilePage() {
             <div className="avatar xl profile-avatar-fallback">{initials(name)}</div>
           )}
         </div>
-        <h1 className="profile-name">{name || 'Your profile'}</h1>
-        <p className="profile-email">{session?.user.email}</p>
-        <span className="role-chip">{isAdmin ? 'Admin' : 'Member'}</span>
-        {profile?.bio ? <p className="profile-bio-preview">{profile.bio}</p> : null}
+        <div className="profile-hero-copy">
+          <p className="eyebrow">Your account</p>
+          <h1 className="profile-name">{name || 'Your profile'}</h1>
+          <p className="profile-email">{session?.user.email}</p>
+          <div className="profile-hero-meta">
+            <span className="role-chip">{isAdmin ? 'Admin' : 'Member'}</span>
+            {profile?.showLastSeen === false ? (
+              <span className="profile-meta-chip">Last seen hidden</span>
+            ) : null}
+          </div>
+          {profile?.bio ? <p className="profile-bio-preview">{profile.bio}</p> : null}
+        </div>
       </section>
 
       {error ? <p className="error profile-flash">{error}</p> : null}
@@ -157,12 +238,17 @@ export function ProfilePage() {
         key={profile?.id ?? 'profile'}
         onSubmit={(event) => void saveProfile(event)}
       >
-        <header className="profile-sheet-head">
-          <h2>About</h2>
-          <p className="muted">How you appear to people in Relay.</p>
+        <header className="profile-sheet-head profile-sheet-head-row">
+          <div>
+            <h2>About</h2>
+            <p className="muted">How you appear to people in Relay.</p>
+          </div>
+          <button className="btn profile-save-inline" type="submit" disabled={busy}>
+            {busy ? 'Saving…' : 'Save profile'}
+          </button>
         </header>
 
-        <div className="profile-fields">
+        <div className="profile-fields profile-fields-grid">
           <label className="profile-field">
             <span className="profile-field-icon" aria-hidden="true">
               <PersonIcon />
@@ -208,7 +294,7 @@ export function ProfilePage() {
               />
             </span>
           </label>
-          <label className="profile-field profile-field-tall">
+          <label className="profile-field profile-field-tall profile-field-span">
             <span className="profile-field-icon" aria-hidden="true">
               <InfoIcon />
             </span>
@@ -222,7 +308,7 @@ export function ProfilePage() {
               />
             </span>
           </label>
-          <label className="profile-field">
+          <label className="profile-field profile-field-span">
             <span className="profile-field-icon" aria-hidden="true">
               <ImageIcon />
             </span>
@@ -236,7 +322,7 @@ export function ProfilePage() {
               />
             </span>
           </label>
-          <label className="profile-field profile-check">
+          <label className="profile-field profile-check profile-field-span">
             <span className="profile-field-icon" aria-hidden="true">
               <EyeIcon />
             </span>
@@ -254,9 +340,9 @@ export function ProfilePage() {
           </label>
         </div>
 
-        <div className="profile-sheet-actions">
+        <div className="profile-sheet-actions profile-sheet-actions-mobile">
           <button className="btn" type="submit" disabled={busy}>
-            Save profile
+            {busy ? 'Saving…' : 'Save profile'}
           </button>
         </div>
       </form>
@@ -265,48 +351,50 @@ export function ProfilePage() {
         <header className="profile-sheet-head">
           <h2>Notifications</h2>
           <p className="muted">
-            Desktop alerts for new messages when Relay is in the background. Muted chats stay quiet.
+            Alerts for new messages when Relay is in the background. Muted chats stay quiet.
           </p>
         </header>
         <div className="profile-notify">
-          <p className="profile-notify-status">
-            Status:{' '}
-            <strong>
-              {notifyStatus === 'granted'
-                ? 'Allowed'
-                : notifyStatus === 'denied'
-                  ? 'Blocked by browser'
-                  : notifyStatus === 'unsupported'
-                    ? 'Not supported'
-                    : 'Not enabled yet'}
-            </strong>
-          </p>
+          <div className="profile-notify-row">
+            <p className="profile-notify-status">
+              Status{' '}
+              <span className={`notify-pill notify-pill-${notifyStatus}`}>{notifyLabel}</span>
+            </p>
+            {notifyStatus === 'default' ? (
+              <button className="btn" type="button" onClick={() => void enableDesktopNotifications()}>
+                Enable notifications
+              </button>
+            ) : null}
+          </div>
           {notifyHint ? <p className="muted">{notifyHint}</p> : null}
           {notifyStatus === 'granted' ? (
             <p className="muted">
               To turn them off, use your browser site settings for this page.
             </p>
-          ) : notifyStatus === 'denied' ? (
+          ) : null}
+          {notifyStatus === 'denied' ? (
             <p className="muted">
-              Relay cannot ask again after a browser block. Allow notifications in the address-bar site
-              settings, then refresh.
+              Relay cannot ask again after a browser block. Allow notifications in the address-bar
+              site settings, then refresh.
             </p>
-          ) : notifyStatus === 'default' ? (
-            <button className="btn" type="button" onClick={() => void enableDesktopNotifications()}>
-              Enable desktop notifications
-            </button>
           ) : null}
         </div>
       </section>
 
       {isAdmin && branding ? (
         <form className="profile-sheet" onSubmit={(event) => void saveBranding(event)}>
-          <header className="profile-sheet-head">
-            <h2>Workspace branding</h2>
-            <p className="muted">White-label Relay for client demos — name, tagline, and accent color.</p>
+          <header className="profile-sheet-head profile-sheet-head-row">
+            <div>
+              <p className="eyebrow">Admin</p>
+              <h2>Workspace branding</h2>
+              <p className="muted">White-label Relay for client demos — name, tagline, and accent.</p>
+            </div>
+            <button className="btn profile-save-inline" type="submit">
+              Save branding
+            </button>
           </header>
-          <div className="profile-fields">
-            <label>
+          <div className="profile-fields profile-fields-grid profile-branding-fields">
+            <label className="profile-plain-field">
               App name
               <input
                 value={branding.appName}
@@ -316,7 +404,7 @@ export function ProfilePage() {
                 maxLength={80}
               />
             </label>
-            <label>
+            <label className="profile-plain-field">
               Tagline
               <input
                 value={branding.tagline}
@@ -326,19 +414,22 @@ export function ProfilePage() {
                 maxLength={200}
               />
             </label>
-            <label>
+            <label className="profile-plain-field profile-color-field">
               Primary color
-              <input
-                type="color"
-                value={branding.primaryColor}
-                onChange={(event) =>
-                  setBranding({ ...branding, primaryColor: event.target.value })
-                }
-              />
+              <span className="profile-color-row">
+                <input
+                  type="color"
+                  value={branding.primaryColor}
+                  onChange={(event) =>
+                    setBranding({ ...branding, primaryColor: event.target.value })
+                  }
+                />
+                <code>{branding.primaryColor}</code>
+              </span>
             </label>
           </div>
-          {brandingSaved ? <p className="success">{brandingSaved}</p> : null}
-          <div className="profile-sheet-actions">
+          {brandingSaved ? <p className="ok profile-inline-ok">{brandingSaved}</p> : null}
+          <div className="profile-sheet-actions profile-sheet-actions-mobile">
             <button className="btn" type="submit">
               Save branding
             </button>
@@ -346,12 +437,78 @@ export function ProfilePage() {
         </form>
       ) : null}
 
-      <section className="profile-sheet">
-        <header className="profile-sheet-head">
-          <h2>Product tour</h2>
-          <p className="muted">Replay the guided walkthrough shown on first sign-in.</p>
-        </header>
-        <div className="profile-sheet-body">
+      {isAdmin ? (
+        <section className="profile-sheet">
+          <header className="profile-sheet-head">
+            <p className="eyebrow">Admin</p>
+            <h2>Workspace invites</h2>
+            <p className="muted">Create an open invite or bind one to a specific email.</p>
+          </header>
+          <form className="invite-form" onSubmit={(event) => void createInvite(event)}>
+            <label>
+              Email (optional)
+              <input name="email" type="email" placeholder="person@example.com" />
+            </label>
+            <label>
+              Expires in days
+              <input name="expiresInDays" type="number" min="1" max="90" defaultValue="7" required />
+            </label>
+            <label>
+              Maximum uses
+              <input name="maxUses" type="number" min="1" max="500" defaultValue="25" required />
+            </label>
+            <button className="btn" type="submit" disabled={inviteBusy}>
+              {inviteBusy ? 'Creating…' : 'Create invite'}
+            </button>
+          </form>
+          {inviteUrl ? (
+            <div className="invite-created">
+              <a href={inviteUrl}>{inviteUrl}</a>
+              <button
+                className="btn ghost"
+                type="button"
+                onClick={() => void navigator.clipboard.writeText(inviteUrl)}
+              >
+                Copy
+              </button>
+            </div>
+          ) : null}
+          <div className="invite-list">
+            {invites.length === 0 ? <p className="muted invite-empty">No invites created yet.</p> : null}
+            {invites.map((invite) => {
+              const expired = new Date(invite.expiresAt).getTime() <= Date.now();
+              return (
+                <div className="invite-row" key={invite.id}>
+                  <div>
+                    <strong>{invite.email ?? 'Open invitation'}</strong>
+                    <small>
+                      {invite.usedCount}/{invite.maxUses} used · expires{' '}
+                      {new Date(invite.expiresAt).toLocaleDateString()}
+                      {invite.revokedAt ? ' · revoked' : expired ? ' · expired' : ''}
+                    </small>
+                  </div>
+                  {!invite.revokedAt && !expired ? (
+                    <button
+                      className="danger-text"
+                      type="button"
+                      onClick={() => void revokeInvite(invite.id)}
+                    >
+                      Revoke
+                    </button>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
+      <section className="profile-sheet profile-sheet-compact">
+        <header className="profile-sheet-head profile-sheet-head-row">
+          <div>
+            <h2>Product tour</h2>
+            <p className="muted">Replay the guided walkthrough shown on first sign-in.</p>
+          </div>
           <button
             className="btn ghost"
             type="button"
@@ -362,7 +519,7 @@ export function ProfilePage() {
           >
             Restart demo tour
           </button>
-        </div>
+        </header>
       </section>
 
       <form className="profile-sheet" onSubmit={(event) => void changePassword(event)}>

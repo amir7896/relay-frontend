@@ -1,3 +1,5 @@
+import { api } from '../api/client';
+
 const DISMISS_KEY = 'relay.notify.dismissed';
 
 export function notificationsSupported(): boolean {
@@ -58,6 +60,64 @@ export async function requestPermission(): Promise<NotificationPermission | 'uns
   } catch {
     return Notification.permission;
   }
+}
+
+export async function registerServiceWorker(): Promise<ServiceWorkerRegistration | null> {
+  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+    return null;
+  }
+  try {
+    return await navigator.serviceWorker.register('/sw.js');
+  } catch {
+    return null;
+  }
+}
+
+function applicationServerKey(value: string): ArrayBuffer {
+  const padding = '='.repeat((4 - (value.length % 4)) % 4);
+  const base64 = (value + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = window.atob(base64);
+  const buffer = new ArrayBuffer(raw.length);
+  const bytes = new Uint8Array(buffer);
+  for (let index = 0; index < raw.length; index += 1) {
+    bytes[index] = raw.charCodeAt(index);
+  }
+  return buffer;
+}
+
+export async function subscribeWebPush(): Promise<
+  NotificationPermission | 'unsupported' | 'disabled'
+> {
+  const permission = await requestPermission();
+  if (permission !== 'granted') {
+    return permission;
+  }
+  const registration = await registerServiceWorker();
+  if (!registration || !('PushManager' in window)) {
+    return 'unsupported';
+  }
+  const response = await api<{ publicKey: string; enabled: boolean }>(
+    '/chat/push/vapid-public-key',
+  );
+  if (!response.data.enabled || !response.data.publicKey) {
+    return 'disabled';
+  }
+  let subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: applicationServerKey(response.data.publicKey),
+    });
+  }
+  const json = subscription.toJSON();
+  if (!json.endpoint || !json.keys?.p256dh || !json.keys.auth) {
+    throw new Error('Browser returned an invalid push subscription');
+  }
+  await api('/chat/push/subscribe', {
+    method: 'POST',
+    body: JSON.stringify({ endpoint: json.endpoint, keys: json.keys }),
+  });
+  return 'granted';
 }
 
 export function notify(options: {

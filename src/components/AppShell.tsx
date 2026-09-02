@@ -7,12 +7,16 @@ import { ChatSocketProvider } from '../chat/ChatSocketContext';
 import { DemoTour } from './DemoTour';
 import { ThemeToggle } from './ThemeToggle';
 import { useWorkspace } from '../theme/WorkspaceContext';
+import { api } from '../api/client';
 
 export function AppShell() {
   const { session, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [verifyMessage, setVerifyMessage] = useState('');
+  const [debugVerifyUrl, setDebugVerifyUrl] = useState('');
+  const [verifyBusy, setVerifyBusy] = useState(false);
   const isAdmin = session?.user.role === 'admin';
   const workspace = useWorkspace();
   const email = session?.user.email ?? '';
@@ -30,6 +34,23 @@ export function AppShell() {
   async function onLogout() {
     await logout();
     navigate('/');
+  }
+
+  async function resendVerification() {
+    setVerifyBusy(true);
+    setVerifyMessage('');
+    try {
+      const response = await api<{ sent: boolean; debugVerifyUrl?: string }>(
+        '/auth/resend-verification',
+        { method: 'POST', body: JSON.stringify({}) },
+      );
+      setVerifyMessage('Verification email sent.');
+      setDebugVerifyUrl(response.data.debugVerifyUrl ?? '');
+    } catch (err) {
+      setVerifyMessage(err instanceof Error ? err.message : 'Could not resend verification');
+    } finally {
+      setVerifyBusy(false);
+    }
   }
 
   return (
@@ -69,6 +90,17 @@ export function AppShell() {
           </button>
         </div>
       </header>
+
+      {session && session.user.isEmailVerified === false ? (
+        <div className="verify-banner">
+          <span>Verify your email to keep your Relay account secure.</span>
+          <button className="ghost" type="button" disabled={verifyBusy} onClick={() => void resendVerification()}>
+            {verifyBusy ? 'Sending…' : 'Resend'}
+          </button>
+          {verifyMessage ? <small>{verifyMessage}</small> : null}
+          {debugVerifyUrl ? <a href={debugVerifyUrl}>Open local verification link</a> : null}
+        </div>
+      ) : null}
 
       {menuOpen ? (
         <div className="mobile-menu" id="app-menu">

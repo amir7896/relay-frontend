@@ -12,7 +12,7 @@ import {
   otherMember,
   relativeTime,
 } from '../../lib/format';
-import { notify, requestPermission, shouldShowNotificationBanner, dismissNotificationPrompt } from '../../lib/notifications';
+import { notify, subscribeWebPush, shouldShowNotificationBanner, dismissNotificationPrompt } from '../../lib/notifications';
 import { useDirectory } from '../../people/useDirectory';
 import type { ChatMessage, Conversation, Paginated } from '../../api/types';
 
@@ -354,8 +354,15 @@ export function MessengerPage() {
   }
 
   async function enableNotifications() {
-    const permission = await requestPermission();
-    setNotifyBanner(permission === 'default' && shouldShowNotificationBanner());
+    try {
+      const permission = await subscribeWebPush();
+      setNotifyBanner(permission === 'default' && shouldShowNotificationBanner());
+      if (permission === 'granted' || permission === 'disabled') {
+        setNotifyBanner(false);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not enable push notifications');
+    }
   }
 
   function dismissNotifications() {

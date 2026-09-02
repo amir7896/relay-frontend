@@ -55,7 +55,7 @@ export async function refreshSession(): Promise<boolean> {
   }
   try {
     const result = await api<{
-      user: { id: string; email: string; role: string };
+      user: { id: string; email: string; role: string; isEmailVerified?: boolean };
       tokens: { accessToken: string; refreshToken: string };
     }>('/auth/refresh', {
       method: 'POST',
@@ -68,6 +68,7 @@ export async function refreshSession(): Promise<boolean> {
         id: result.data.user.id,
         email: result.data.user.email,
         role: result.data.user.role,
+        isEmailVerified: result.data.user.isEmailVerified,
       },
     });
     return true;
