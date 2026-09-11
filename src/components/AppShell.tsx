@@ -4,8 +4,10 @@ import { useAuth } from '../auth/AuthContext';
 import { initials } from '../lib/format';
 import { DirectoryProvider } from '../people/DirectoryContext';
 import { ChatSocketProvider } from '../chat/ChatSocketContext';
+import { VoiceCallProvider } from '../calls/VoiceCallContext';
 import { DemoTour } from './DemoTour';
 import { ThemeToggle } from './ThemeToggle';
+import { VoiceCallOverlay } from './VoiceCallOverlay';
 import { useWorkspace } from '../theme/WorkspaceContext';
 import { api } from '../api/client';
 
@@ -120,8 +122,11 @@ export function AppShell() {
 
       <DirectoryProvider>
         <ChatSocketProvider>
-          <Outlet />
-          <DemoTour />
+          <VoiceCallProvider>
+            <Outlet />
+            <VoiceCallOverlay />
+            <DemoTour />
+          </VoiceCallProvider>
         </ChatSocketProvider>
       </DirectoryProvider>
     </div>

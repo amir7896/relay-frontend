@@ -31,6 +31,35 @@ function previewText(message: ChatMessage | null | undefined, me?: string) {
   if (message.deletedForEveryone) {
     return 'This message was deleted';
   }
+  if (message.type === 'call') {
+    try {
+      const parsed = JSON.parse(message.body) as {
+        media?: string;
+        kind?: string;
+        outcome?: string;
+        durationSeconds?: number;
+      };
+      const media = parsed.media === 'video' ? 'Video' : 'Voice';
+      const group = parsed.kind === 'group' ? 'Group ' : '';
+      if (parsed.outcome === 'missed') {
+        return `Missed ${group.toLowerCase()}${media.toLowerCase()} call`;
+      }
+      if (parsed.outcome === 'declined') {
+        return `${group}${media} call declined`;
+      }
+      if (parsed.outcome === 'cancelled') {
+        return `${group}${media} call cancelled`;
+      }
+      if (parsed.durationSeconds && parsed.durationSeconds > 0) {
+        const mins = Math.floor(parsed.durationSeconds / 60);
+        const secs = parsed.durationSeconds % 60;
+        return `${group}${media} call · ${mins}:${String(secs).padStart(2, '0')}`;
+      }
+      return `${group}${media} call`;
+    } catch {
+      return 'Call';
+    }
+  }
   if (message.attachment && message.type === 'image') {
     const prefix = message.senderId === me ? 'You: ' : '';
     return `${prefix}Photo`;
@@ -89,7 +118,7 @@ export function MessengerPage() {
   const [busy, setBusy] = useState(false);
   const [notifyBanner, setNotifyBanner] = useState(false);
   const [, setClock] = useState(0);
-  const { subscribe } = useChatSocket();
+  const { subscribe, leaveConversation } = useChatSocket();
   const itemsRef = useRef<Conversation[]>([]);
   itemsRef.current = items;
   const byUserIdRef = useRef(byUserId);
@@ -286,11 +315,57 @@ export function MessengerPage() {
           navigate('/chat');
         }
       }),
+      subscribe('chat:conversation_updated', (payload) => {
+        const conversation = payload as Conversation;
+        if (!conversation?.id) {
+          return;
+        }
+        setItems((current) => {
+          const index = current.findIndex((item) => item.id === conversation.id);
+          if (index === -1) {
+            // Newly added to this group — show it immediately
+            const incoming: Conversation = {
+              ...conversation,
+              unreadCount: 0,
+              muted: false,
+              pinned: false,
+              lastReadAt: null,
+            };
+            return [incoming, ...current];
+          }
+          const existing = current[index];
+          const updated: Conversation = {
+            ...conversation,
+            unreadCount: existing.unreadCount,
+            muted: existing.muted,
+            pinned: existing.pinned,
+            lastReadAt: existing.lastReadAt,
+            lastMessage: conversation.lastMessage ?? existing.lastMessage,
+            lastMessageAt: conversation.lastMessageAt ?? existing.lastMessageAt,
+          };
+          const next = [...current];
+          next[index] = updated;
+          return next;
+        });
+      }),
+      subscribe('chat:removed_from_group', (payload) => {
+        const event = payload as { conversationId: string };
+        if (!event?.conversationId) {
+          return;
+        }
+        leaveConversation(event.conversationId);
+        setItems((current) =>
+          current.filter((item) => item.id !== event.conversationId),
+        );
+        if (activeIdRef.current === event.conversationId) {
+          navigate('/chat');
+        }
+      }),
     ];
     return () => {
       unsubs.forEach((unsub) => unsub());
     };
-  }, [applyInboxMessage, navigate, subscribe]);
+  }, [applyInboxMessage, leaveConversation, navigate, subscribe]);
 
   useEffect(() => {
     const memberIds = items.flatMap((item) =>

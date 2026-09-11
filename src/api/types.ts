@@ -59,6 +59,7 @@ export type MessageReply = {
   id: string;
   senderId: string;
   body: string;
+  type?: string;
   deletedForEveryone: boolean;
 };
 

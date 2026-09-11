@@ -4,6 +4,7 @@ import { api } from '../../api/client';
 import { getAccessToken } from '../../auth/session';
 import { useAuth } from '../../auth/AuthContext';
 import { useChatSocket } from '../../chat/ChatSocketContext';
+import { useVoiceCall } from '../../calls/VoiceCallContext';
 import { Modal } from '../../components/Modal';
 import { MessageTicks } from '../../components/MessageTicks';
 import { PeoplePicker } from '../../components/PeoplePicker';
@@ -16,8 +17,13 @@ import {
   conversationTitle,
   displayName,
   formatLastSeen,
+  initials,
   otherMember,
 } from '../../lib/format';
+import {
+  callHistoryLabel,
+  parseCallHistoryBody,
+} from '../../calls/types';
 import {
   extractMentionIds,
   firstUrl,
@@ -78,6 +84,38 @@ function upsertMessage(current: ChatMessage[], payload: ChatMessage): ChatMessag
 
 function isPendingMessage(message: ChatMessage): boolean {
   return Boolean(message.sendStatus);
+}
+
+function replySnippet(message: {
+  body?: string | null;
+  type?: string | null;
+  attachment?: { mime?: string; name?: string } | null;
+  deletedForEveryone?: boolean;
+}): string {
+  if (message.deletedForEveryone) {
+    return 'This message was deleted';
+  }
+  const body = message.body?.trim();
+  if (body && !isPlaceholderBody(body)) {
+    return body.length > 120 ? `${body.slice(0, 117)}…` : body;
+  }
+  const mime = message.attachment?.mime ?? '';
+  if (mime.startsWith('image/') || message.type === 'image') {
+    return 'Photo';
+  }
+  if (mime.startsWith('audio/') || message.type === 'audio') {
+    return 'Voice message';
+  }
+  if (message.type === 'call') {
+    return 'Call';
+  }
+  if (message.attachment) {
+    return message.attachment.name || 'Attachment';
+  }
+  if (message.type === 'image') {
+    return 'Photo';
+  }
+  return body || 'Message';
 }
 
 function revokeAttachmentBlob(message: ChatMessage) {
@@ -184,6 +222,8 @@ export function ThreadView() {
   const [reactPickerId, setReactPickerId] = useState<string | null>(null);
   const [forwardMessage, setForwardMessage] = useState<ChatMessage | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
+  const toolsMenuRef = useRef<HTMLDivElement | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<ChatMessage[]>([]);
   const [searchBusy, setSearchBusy] = useState(false);
@@ -209,9 +249,40 @@ export function ThreadView() {
   const discardOnStopRef = useRef(false);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewUrlRef = useRef<string | null>(null);
+  const composerInputRef = useRef<HTMLInputElement | null>(null);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const touchStartRef = useRef<{ x: number; y: number; id: string } | null>(null);
   const scroller = useRef<HTMLDivElement | null>(null);
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
-  const { joinConversation, subscribe, emit } = useChatSocket();
+  const { joinConversation, leaveConversation, subscribe, emit } = useChatSocket();
+  const {
+    phase: callPhase,
+    startCall,
+    joinCall,
+    refreshLobby,
+    lobbiesByConversation,
+  } = useVoiceCall();
+  const ongoingLobby = lobbiesByConversation[id];
+  const canJoinOngoing =
+    conversation?.type === 'group' &&
+    callPhase === 'idle' &&
+    Boolean(ongoingLobby?.active) &&
+    Boolean(ongoingLobby?.joinedIds.length) &&
+    !ongoingLobby?.joinedIds.includes(me || '');
+
+  const ongoingCallParticipants = useMemo(() => {
+    const joined = ongoingLobby?.joinedIds ?? [];
+    return joined.map((userId) => {
+      const person = byUserId.get(userId);
+      const name = displayName(person);
+      return {
+        userId,
+        name,
+        initials: initials(name),
+        avatar: person?.avatar ? resolveMediaUrl(person.avatar) : null,
+      };
+    });
+  }, [byUserId, ongoingLobby?.joinedIds]);
 
   const title = useMemo(
     () => (conversation ? conversationTitle(conversation, me, byUserId) : 'Conversation'),
@@ -299,6 +370,9 @@ export function ThreadView() {
     setLoading(false);
     clearUnread(id);
     void ensureProfiles(conv.data.members.map((member) => member.userId));
+    if (conv.data.type === 'group') {
+      void refreshLobby(id);
+    }
     try {
       await api(`/chat/conversations/${id}/seen`, {
         method: 'POST',
@@ -450,12 +524,102 @@ export function ThreadView() {
           navigate('/chat');
         }
       }),
+      subscribe('chat:conversation_updated', (payload) => {
+        const next = payload as Conversation;
+        if (next?.id === id) {
+          setConversation((current) =>
+            current
+              ? {
+                  ...next,
+                  unreadCount: current.unreadCount,
+                  muted: current.muted,
+                  pinned: current.pinned,
+                  lastReadAt: current.lastReadAt,
+                }
+              : next,
+          );
+          void refreshInbox();
+        }
+      }),
+      subscribe('chat:removed_from_group', (payload) => {
+        const event = payload as { conversationId: string };
+        if (event.conversationId === id) {
+          leaveConversation(id);
+          setDetails(false);
+          navigate('/chat');
+        }
+      }),
     ];
 
     return () => {
+      leaveConversation(id);
       unsubs.forEach((unsub) => unsub());
     };
-  }, [id, me, clearUnread, joinConversation, navigate, subscribe]);
+  }, [
+    id,
+    me,
+    clearUnread,
+    joinConversation,
+    leaveConversation,
+    navigate,
+    refreshInbox,
+    subscribe,
+  ]);
+
+  useEffect(() => {
+    if (!toolsMenuOpen) {
+      return;
+    }
+    const onPointerDown = (event: Event) => {
+      const root = toolsMenuRef.current;
+      if (root && !root.contains(event.target as Node)) {
+        setToolsMenuOpen(false);
+      }
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setToolsMenuOpen(false);
+      }
+    };
+    const onResize = () => {
+      if (window.innerWidth > 560) {
+        setToolsMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('touchstart', onPointerDown);
+    document.addEventListener('keydown', onKey);
+    window.addEventListener('resize', onResize);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('touchstart', onPointerDown);
+      document.removeEventListener('keydown', onKey);
+      window.removeEventListener('resize', onResize);
+    };
+  }, [toolsMenuOpen]);
+
+  // Keep Join banner in sync if the socket ring was missed
+  useEffect(() => {
+    if (!conversation || conversation.type !== 'group') {
+      return;
+    }
+    void refreshLobby(id);
+    const tick = window.setInterval(() => {
+      if (callPhase === 'idle') {
+        void refreshLobby(id);
+      }
+    }, 20_000);
+    const onFocus = () => {
+      if (callPhase === 'idle') {
+        void refreshLobby(id);
+      }
+    };
+    window.addEventListener('focus', onFocus);
+    return () => {
+      window.clearInterval(tick);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [callPhase, conversation?.type, id, refreshLobby]);
 
   useEffect(() => {
     if (editingMessage) {
@@ -818,9 +982,8 @@ export function ThreadView() {
         ? {
             id: replySnapshot.id,
             senderId: replySnapshot.senderId,
-            body: replySnapshot.deletedForEveryone
-              ? ''
-              : replySnapshot.body,
+            body: replySnippet(replySnapshot),
+            type: replySnapshot.type,
             deletedForEveryone: replySnapshot.deletedForEveryone,
           }
         : null,
@@ -1127,6 +1290,33 @@ export function ThreadView() {
     window.setTimeout(() => setHighlightId(null), 1600);
   }
 
+  function startReply(message: ChatMessage) {
+    if (message.deletedForEveryone || isPendingMessage(message)) {
+      return;
+    }
+    setReplyTo(message);
+    setEditingMessage(null);
+    setMenuMessageId(null);
+    setReactPickerId(null);
+    window.setTimeout(() => composerInputRef.current?.focus(), 50);
+  }
+
+  function clearLongPressTimer() {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }
+
+  useEffect(() => {
+    return () => {
+      if (longPressTimerRef.current) {
+        clearTimeout(longPressTimerRef.current);
+        longPressTimerRef.current = null;
+      }
+    };
+  }, []);
+
   function canDeleteForEveryone(message: ChatMessage) {
     if (
       !me ||
@@ -1216,26 +1406,292 @@ export function ThreadView() {
             </p>
           </div>
         </div>
-        <div className="thread-tools">
+        <div className="thread-tools" ref={toolsMenuRef}>
+          <div className="thread-tools-primary">
+            {(conversation.type === 'private' && peer) ||
+            conversation.type === 'group' ? (
+              canJoinOngoing ? (
+                <button
+                  className="ghost thread-tool-btn call join"
+                  type="button"
+                  aria-label="Join group call"
+                  title="Join call"
+                  onClick={() => void joinCall(conversation.id)}
+                >
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M6.6 10.8a15.5 15.5 0 0 0 6.6 6.6l2.2-2.2a1.2 1.2 0 0 1 1.2-.3 7.7 7.7 0 0 0 2.4.4 1.2 1.2 0 0 1 1.2 1.2V20a1.2 1.2 0 0 1-1.2 1.2A17.2 17.2 0 0 1 2.8 4 1.2 1.2 0 0 1 4 2.8h3.5A1.2 1.2 0 0 1 8.7 4a7.7 7.7 0 0 0 .4 2.4 1.2 1.2 0 0 1-.3 1.2z"
+                    />
+                  </svg>
+                </button>
+              ) : (
+                <>
+                  <button
+                    className="ghost thread-tool-btn call"
+                    type="button"
+                    aria-label={
+                      conversation.type === 'group'
+                        ? 'Start group voice call'
+                        : 'Start voice call'
+                    }
+                    title={conversation.type === 'group' ? 'Group voice call' : 'Voice call'}
+                    disabled={callPhase !== 'idle'}
+                    onClick={() =>
+                      void startCall(
+                        conversation.id,
+                        conversation.type === 'private' ? peer?.userId : undefined,
+                        'audio',
+                      )
+                    }
+                  >
+                    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                      <path
+                        fill="currentColor"
+                        d="M6.6 10.8a15.5 15.5 0 0 0 6.6 6.6l2.2-2.2a1.2 1.2 0 0 1 1.2-.3 7.7 7.7 0 0 0 2.4.4 1.2 1.2 0 0 1 1.2 1.2V20a1.2 1.2 0 0 1-1.2 1.2A17.2 17.2 0 0 1 2.8 4 1.2 1.2 0 0 1 4 2.8h3.5A1.2 1.2 0 0 1 8.7 4a7.7 7.7 0 0 0 .4 2.4 1.2 1.2 0 0 1-.3 1.2z"
+                      />
+                    </svg>
+                  </button>
+                  <button
+                    className="ghost thread-tool-btn call video"
+                    type="button"
+                    aria-label={
+                      conversation.type === 'group'
+                        ? 'Start group video call'
+                        : 'Start video call'
+                    }
+                    title={conversation.type === 'group' ? 'Group video call' : 'Video call'}
+                    disabled={callPhase !== 'idle'}
+                    onClick={() =>
+                      void startCall(
+                        conversation.id,
+                        conversation.type === 'private' ? peer?.userId : undefined,
+                        'video',
+                      )
+                    }
+                  >
+                    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                      <path
+                        fill="currentColor"
+                        d="M17 10.5V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-3.5l5 4v-11l-5 4z"
+                      />
+                    </svg>
+                  </button>
+                </>
+              )
+            ) : null}
+          </div>
+
+          <div className="thread-tools-secondary">
+            <button
+              className={`ghost thread-tool-btn${searchOpen ? ' active' : ''}`}
+              type="button"
+              aria-label="Search messages"
+              title="Search"
+              aria-pressed={searchOpen}
+              onClick={() => {
+                setToolsMenuOpen(false);
+                setSearchOpen((open) => !open);
+              }}
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M15.5 14h-.8l-.3-.3a6.5 6.5 0 1 0-.7.7l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9z"
+                />
+              </svg>
+            </button>
+            <button
+              className={`ghost thread-tool-btn${conversation.pinned ? ' active' : ''}`}
+              type="button"
+              aria-label={conversation.pinned ? 'Unpin chat' : 'Pin chat'}
+              title={conversation.pinned ? 'Unpin' : 'Pin'}
+              onClick={() => {
+                setToolsMenuOpen(false);
+                void togglePin();
+              }}
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2zm-1.5 2h-5L11 12.5V4h2v8.5l1.5 1.5z"
+                />
+              </svg>
+            </button>
+            <button
+              className={`ghost thread-tool-btn${conversation.muted ? ' active' : ''}`}
+              type="button"
+              aria-label={conversation.muted ? 'Unmute chat' : 'Mute chat'}
+              title={conversation.muted ? 'Unmute' : 'Mute'}
+              onClick={() => {
+                setToolsMenuOpen(false);
+                void toggleMute();
+              }}
+            >
+              {conversation.muted ? (
+                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M4.3 3 3 4.3 7.7 9H4v6h3l5 5v-6.7l4.5 4.5c-.7.5-1.5.9-2.5 1.1v2.1a8.9 8.9 0 0 0 4.1-1.8L19.7 21 21 19.7 4.3 3zM12 4 9.9 6.1 12 8.2V4zm7.6 6.6-1.5 1.5A4.9 4.9 0 0 1 17 12c0 1.2-.4 2.3-1.2 3.1l1.4 1.4A6.9 6.9 0 0 0 19 12c0-.9-.2-1.7-.4-2.4z"
+                  />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M12 3 7 8H4v8h3l5 5V3zm5.5 9c0 1.8-.8 3.4-2 4.5v2.2A6.9 6.9 0 0 0 19.5 12 6.9 6.9 0 0 0 15.5 5.3v2.2c1.2 1.1 2 2.7 2 4.5z"
+                  />
+                </svg>
+              )}
+            </button>
+            <button
+              className="ghost thread-tool-btn"
+              type="button"
+              aria-label={conversation.type === 'group' ? 'Group details' : 'Chat info'}
+              title={conversation.type === 'group' ? 'Details' : 'Chat info'}
+              onClick={() => {
+                setToolsMenuOpen(false);
+                setDetails(true);
+              }}
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"
+                />
+              </svg>
+            </button>
+          </div>
+
           <button
-            className="ghost"
+            className={`ghost thread-tool-btn thread-tools-more${
+              toolsMenuOpen ? ' active' : ''
+            }`}
             type="button"
-            aria-pressed={searchOpen}
-            onClick={() => setSearchOpen((open) => !open)}
+            aria-label="More actions"
+            aria-expanded={toolsMenuOpen}
+            aria-haspopup="menu"
+            title="More"
+            onClick={() => setToolsMenuOpen((open) => !open)}
           >
-            Search
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M12 8a2 2 0 1 0 0-4 2 2 0 0 0 0 4zm0 2a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm0 6a2 2 0 1 0 0 4 2 2 0 0 0 0-4z"
+              />
+            </svg>
           </button>
-          <button className="ghost" type="button" onClick={() => void togglePin()}>
-            {conversation.pinned ? 'Unpin' : 'Pin'}
-          </button>
-          <button className="ghost" type="button" onClick={() => void toggleMute()}>
-            {conversation.muted ? 'Unmute' : 'Mute'}
-          </button>
-          <button className="ghost" type="button" onClick={() => setDetails(true)}>
-            {conversation.type === 'group' ? 'Details' : 'Chat info'}
-          </button>
+
+          {toolsMenuOpen ? (
+            <div className="thread-tools-menu" role="menu">
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setToolsMenuOpen(false);
+                  setSearchOpen(true);
+                }}
+              >
+                Search
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setToolsMenuOpen(false);
+                  void togglePin();
+                }}
+              >
+                {conversation.pinned ? 'Unpin' : 'Pin'}
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setToolsMenuOpen(false);
+                  void toggleMute();
+                }}
+              >
+                {conversation.muted ? 'Unmute' : 'Mute'}
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setToolsMenuOpen(false);
+                  setDetails(true);
+                }}
+              >
+                {conversation.type === 'group' ? 'Group details' : 'Chat info'}
+              </button>
+            </div>
+          ) : null}
         </div>
       </header>
+
+      {canJoinOngoing ? (
+        <button
+          className="wa-ongoing-call"
+          type="button"
+          onClick={() => void joinCall(conversation.id)}
+          aria-label={
+            ongoingLobby?.media === 'video'
+              ? 'Join ongoing group video call as voice'
+              : 'Join ongoing group voice call'
+          }
+        >
+          <span className="wa-ongoing-call-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="18" height="18">
+              <path
+                fill="currentColor"
+                d="M6.6 10.8a15.5 15.5 0 0 0 6.6 6.6l2.2-2.2a1.2 1.2 0 0 1 1.2-.3 7.7 7.7 0 0 0 2.4.4 1.2 1.2 0 0 1 1.2 1.2V20a1.2 1.2 0 0 1-1.2 1.2A17.2 17.2 0 0 1 2.8 4 1.2 1.2 0 0 1 4 2.8h3.5A1.2 1.2 0 0 1 8.7 4a7.7 7.7 0 0 0 .4 2.4 1.2 1.2 0 0 1-.3 1.2z"
+              />
+            </svg>
+            <span className="wa-ongoing-call-pulse" />
+          </span>
+
+          <span className="wa-ongoing-call-avatars" aria-hidden="true">
+            {ongoingCallParticipants.slice(0, 3).map((participant, index) => (
+              <span
+                key={participant.userId}
+                className="wa-ongoing-call-avatar"
+                style={{ zIndex: 3 - index }}
+                title={participant.name}
+              >
+                {participant.avatar ? (
+                  <img src={participant.avatar} alt="" />
+                ) : (
+                  participant.initials
+                )}
+              </span>
+            ))}
+            {(ongoingLobby?.joinedIds.length ?? 0) > 3 ? (
+              <span className="wa-ongoing-call-avatar more">
+                +{(ongoingLobby?.joinedIds.length ?? 0) - 3}
+              </span>
+            ) : null}
+          </span>
+
+          <span className="wa-ongoing-call-meta">
+            <strong>
+              {ongoingLobby?.media === 'video'
+                ? 'Ongoing video call'
+                : 'Ongoing voice call'}
+            </strong>
+            <span>
+              {ongoingLobby?.joinedIds.length ?? 0}{' '}
+              {(ongoingLobby?.joinedIds.length ?? 0) === 1
+                ? 'participant'
+                : 'participants'}
+              {ongoingLobby?.media === 'video'
+                ? ' · Tap to join (voice)'
+                : ' · Tap to join'}
+            </span>
+          </span>
+
+          <span className="wa-ongoing-call-join">Join</span>
+        </button>
+      ) : null}
 
       {searchOpen ? (
         <div className="search-panel">
@@ -1282,6 +1738,46 @@ export function ThreadView() {
           </div>
         ) : null}
         {messages.map((message) => {
+          if (message.type === 'call' && !message.deletedForEveryone) {
+            const history = parseCallHistoryBody(message.body);
+            const label = history ? callHistoryLabel(history) : 'Call';
+            const canJoinFromHistory =
+              history &&
+              conversation?.type === 'group' &&
+              canJoinOngoing &&
+              ongoingLobby?.callId === history.callId;
+            return (
+              <div
+                key={message.id}
+                className="wa-call-history"
+                ref={(node) => {
+                  if (node) {
+                    messageRefs.current.set(message.id, node);
+                  } else {
+                    messageRefs.current.delete(message.id);
+                  }
+                }}
+              >
+                <div className="wa-call-history-pill">
+                  <span className="wa-call-history-icon" aria-hidden="true">
+                    {history?.media === 'video' ? '📹' : '📞'}
+                  </span>
+                  <span>{label}</span>
+                  <time dateTime={message.createdAt}>{clock(message.createdAt)}</time>
+                  {canJoinFromHistory ? (
+                    <button
+                      type="button"
+                      className="wa-call-history-join"
+                      onClick={() => void joinCall(conversation.id)}
+                    >
+                      Join
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            );
+          }
+
           const mine = message.senderId === me;
           const pending = isPendingMessage(message);
           const seen = Boolean(
@@ -1325,7 +1821,59 @@ export function ThreadView() {
                   messageRefs.current.delete(message.id);
                 }
               }}
+              onTouchStart={(event) => {
+                if (pending || message.deletedForEveryone) {
+                  return;
+                }
+                const touch = event.touches[0];
+                touchStartRef.current = {
+                  x: touch.clientX,
+                  y: touch.clientY,
+                  id: message.id,
+                };
+                clearLongPressTimer();
+                longPressTimerRef.current = setTimeout(() => {
+                  setReactPickerId(null);
+                  setMenuMessageId(message.id);
+                  if (navigator.vibrate) {
+                    navigator.vibrate(12);
+                  }
+                }, 480);
+              }}
+              onTouchMove={(event) => {
+                const start = touchStartRef.current;
+                if (!start || start.id !== message.id) {
+                  return;
+                }
+                const touch = event.touches[0];
+                if (
+                  Math.abs(touch.clientX - start.x) > 12 ||
+                  Math.abs(touch.clientY - start.y) > 12
+                ) {
+                  clearLongPressTimer();
+                }
+              }}
+              onTouchEnd={(event) => {
+                clearLongPressTimer();
+                const start = touchStartRef.current;
+                touchStartRef.current = null;
+                if (!start || start.id !== message.id || pending || message.deletedForEveryone) {
+                  return;
+                }
+                const touch = event.changedTouches[0];
+                const dx = touch.clientX - start.x;
+                const dy = Math.abs(touch.clientY - start.y);
+                // Swipe right to reply (WhatsApp-style)
+                if (dx > 64 && dy < 40) {
+                  startReply(message);
+                }
+              }}
+              onTouchCancel={() => {
+                clearLongPressTimer();
+                touchStartRef.current = null;
+              }}
             >
+              <div className={`wa-msg${mine ? ' mine' : ' theirs'}`}>
               <div
                 className={mine ? 'wa-bubble mine' : 'wa-bubble theirs'}
                 onContextMenu={(event) => {
@@ -1346,7 +1894,11 @@ export function ThreadView() {
                   <span className="wa-forwarded">Forwarded</span>
                 ) : null}
                 {message.replyTo ? (
-                  <div className="wa-reply">
+                  <button
+                    type="button"
+                    className="wa-reply"
+                    onClick={() => jumpToMessage(message.replyTo!.id)}
+                  >
                     <strong>
                       {message.replyTo.deletedForEveryone
                         ? 'Deleted message'
@@ -1355,9 +1907,9 @@ export function ThreadView() {
                     <span>
                       {message.replyTo.deletedForEveryone
                         ? 'This message was deleted'
-                        : message.replyTo.body}
+                        : replySnippet(message.replyTo)}
                     </span>
-                  </div>
+                  </button>
                 ) : null}
                 {message.deletedForEveryone ? (
                   <p className="wa-text wa-deleted">This message was deleted</p>
@@ -1440,43 +1992,38 @@ export function ThreadView() {
                     ) : null}
                   </>
                 )}
-                {!pending &&
-                !message.deletedForEveryone &&
-                message.reactions.length > 0 ? (
-                  <div className="wa-reactions">
-                    {message.reactions.map((reaction) => (
-                      <button
-                        key={reaction.emoji}
-                        type="button"
-                        className={
-                          reaction.reactedByMe
-                            ? 'wa-reaction active'
-                            : 'wa-reaction'
-                        }
-                        onClick={() => void toggleReaction(message, reaction.emoji)}
-                      >
-                        <span>{reaction.emoji}</span>
-                        <span>{reaction.count}</span>
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
                 <span className="wa-meta">
-                  {!pending ? (
-                    <button
-                      className="msg-menu-btn"
-                      type="button"
-                      aria-label="Message actions"
-                      onClick={() => {
-                        setReactPickerId(null);
-                        setMenuMessageId((current) =>
-                          current === message.id ? null : message.id,
-                        );
-                      }}
-                    >
-                      ⋮
-                    </button>
-                  ) : message.sendStatus === 'failed' ? (
+                  {!pending && !message.deletedForEveryone ? (
+                    <>
+                      <button
+                        className="msg-reply-btn"
+                        type="button"
+                        aria-label="Reply"
+                        title="Reply"
+                        onClick={() => startReply(message)}
+                      >
+                        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                          <path
+                            fill="currentColor"
+                            d="M10 9V5l-7 7 7 7v-4.1c5 0 8.5 1.6 11 5.1-1-5-4-10-11-11z"
+                          />
+                        </svg>
+                      </button>
+                      <button
+                        className="msg-menu-btn"
+                        type="button"
+                        aria-label="Message actions"
+                        onClick={() => {
+                          setReactPickerId(null);
+                          setMenuMessageId((current) =>
+                            current === message.id ? null : message.id,
+                          );
+                        }}
+                      >
+                        ⋮
+                      </button>
+                    </>
+                  ) : pending && message.sendStatus === 'failed' ? (
                     <button
                       className="msg-retry-btn"
                       type="button"
@@ -1528,11 +2075,7 @@ export function ThreadView() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => {
-                            setReplyTo(message);
-                            setEditingMessage(null);
-                            setMenuMessageId(null);
-                          }}
+                          onClick={() => startReply(message)}
                         >
                           Reply
                         </button>
@@ -1567,6 +2110,28 @@ export function ThreadView() {
                   </div>
                 ) : null}
               </div>
+              {!pending &&
+              !message.deletedForEveryone &&
+              message.reactions.length > 0 ? (
+                <div className="wa-reactions" aria-label="Reactions">
+                  {message.reactions.map((reaction) => (
+                    <button
+                      key={reaction.emoji}
+                      type="button"
+                      className={
+                        reaction.reactedByMe
+                          ? 'wa-reaction active'
+                          : 'wa-reaction'
+                      }
+                      onClick={() => void toggleReaction(message, reaction.emoji)}
+                    >
+                      <span>{reaction.emoji}</span>
+                      <span>{reaction.count}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              </div>
             </div>
           );
         })}
@@ -1597,7 +2162,7 @@ export function ThreadView() {
         <div className="reply-bar">
           <div>
             <strong>Replying to {displayName(byUserId.get(replyTo.senderId))}</strong>
-            <span>{replyTo.deletedForEveryone ? 'This message was deleted' : replyTo.body}</span>
+            <span>{replySnippet(replyTo)}</span>
           </div>
           <button
             className="ghost icon-btn"
@@ -1770,20 +2335,20 @@ export function ThreadView() {
           </div>
         ) : (
           <>
-            {!editingMessage ? (
-              <>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/jpeg,image/png,image/gif,image/webp"
-                  hidden
-                  onChange={(event) => {
-                    const file = event.target.files?.[0];
-                    if (file) {
-                      void uploadAndSend(file);
-                    }
-                  }}
-                />
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/gif,image/webp"
+              hidden
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  void uploadAndSend(file);
+                }
+              }}
+            />
+            <div className="composer-shell">
+              {!editingMessage ? (
                 <button
                   className="composer-attach"
                   type="button"
@@ -1795,7 +2360,7 @@ export function ThreadView() {
                   {uploading ? (
                     <span className="composer-attach-busy">…</span>
                   ) : (
-                    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
                       <path
                         d="M14.5 5.5 7.8 12.2a3.2 3.2 0 1 0 4.5 4.5l7.2-7.2a4.8 4.8 0 0 0-6.8-6.8L5.5 10a1.2 1.2 0 0 0 1.7 1.7l7.2-7.2"
                         fill="none"
@@ -1807,6 +2372,23 @@ export function ThreadView() {
                     </svg>
                   )}
                 </button>
+              ) : null}
+              <input
+                ref={composerInputRef}
+                value={composer}
+                onChange={(event) => setComposer(event.target.value)}
+                onFocus={() => void sendTyping(true)}
+                onBlur={() => void sendTyping(false)}
+                placeholder={
+                  editingMessage
+                    ? 'Edit message'
+                    : replyTo
+                      ? 'Type a reply'
+                      : 'Type a message'
+                }
+                autoComplete="off"
+              />
+              {!editingMessage && !composer.trim() ? (
                 <button
                   className="composer-voice"
                   type="button"
@@ -1815,25 +2397,30 @@ export function ThreadView() {
                   disabled={uploading}
                   onClick={() => void startVoiceRecording()}
                 >
-                  🎙
+                  <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2z"
+                    />
+                  </svg>
                 </button>
-              </>
-            ) : null}
-            <input
-              value={composer}
-              onChange={(event) => setComposer(event.target.value)}
-              onFocus={() => void sendTyping(true)}
-              onBlur={() => void sendTyping(false)}
-              placeholder={editingMessage ? 'Edit message' : 'Write a message'}
-              autoComplete="off"
-            />
-            <button
-              className="btn"
-              type="submit"
-              disabled={editingMessage ? !composer.trim() : !composer.trim()}
-            >
-              {editingMessage ? 'Save' : 'Send'}
-            </button>
+              ) : (
+                <button
+                  className="composer-send"
+                  type="submit"
+                  aria-label={editingMessage ? 'Save edit' : 'Send message'}
+                  title={editingMessage ? 'Save' : 'Send'}
+                  disabled={editingMessage ? !composer.trim() : !composer.trim()}
+                >
+                  <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"
+                    />
+                  </svg>
+                </button>
+              )}
+            </div>
           </>
         )}
       </form>

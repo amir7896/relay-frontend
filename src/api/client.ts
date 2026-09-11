@@ -19,6 +19,8 @@ export async function api<T>(
   if (!headers.has('Content-Type') && init.body) {
     headers.set('Content-Type', 'application/json');
   }
+  // ngrok free tier interstitial otherwise breaks JSON /api responses
+  headers.set('ngrok-skip-browser-warning', 'true');
   const token = getAccessToken();
   if (token) {
     headers.set('Authorization', `Bearer ${token}`);
