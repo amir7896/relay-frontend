@@ -36,6 +36,7 @@ import {
   getMessageDraft,
   setMessageDraft,
 } from '../../lib/messageDrafts';
+import { downloadMedia, openMedia as openAttachmentMedia } from '../../lib/downloadMedia';
 import { useDirectory } from '../../people/useDirectory';
 import type {
   ChatMessage,
@@ -51,6 +52,37 @@ const EDIT_WINDOW_MS = 15 * 60 * 1000;
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'] as const;
 
 type VoicePhase = 'idle' | 'recording' | 'preview';
+type MediaKindTab = 'all' | 'image' | 'file' | 'audio';
+
+function mediaKindOf(message: ChatMessage): 'image' | 'file' | 'audio' {
+  const mime = message.attachment?.mime ?? '';
+  if (
+    message.type === 'audio' ||
+    mime.startsWith('audio/') ||
+    (message.type === 'audio' && mime.startsWith('video/'))
+  ) {
+    return 'audio';
+  }
+  if (message.type === 'image' || mime.startsWith('image/')) {
+    return 'image';
+  }
+  return 'file';
+}
+
+function mediaDownloadName(message: ChatMessage): string {
+  const attachment = message.attachment;
+  if (attachment?.name?.trim()) {
+    return attachment.name.trim();
+  }
+  const kind = mediaKindOf(message);
+  if (kind === 'image') {
+    return 'photo.jpg';
+  }
+  if (kind === 'audio') {
+    return 'voice-note.webm';
+  }
+  return 'file';
+}
 
 function formatRecordingClock(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
@@ -106,16 +138,66 @@ function replySnippet(message: {
   if (mime.startsWith('audio/') || message.type === 'audio') {
     return 'Voice message';
   }
+  if (message.type === 'file' || message.attachment) {
+    return message.attachment?.name || 'File';
+  }
   if (message.type === 'call') {
     return 'Call';
   }
-  if (message.attachment) {
-    return message.attachment.name || 'Attachment';
-  }
-  if (message.type === 'image') {
-    return 'Photo';
-  }
   return body || 'Message';
+}
+
+function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '';
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileKindFromMime(mime: string, name = ''): 'image' | 'audio' | 'file' {
+  if (mime.startsWith('image/')) {
+    return 'image';
+  }
+  if (mime.startsWith('audio/') || mime === 'video/webm') {
+    return 'audio';
+  }
+  const lower = name.toLowerCase();
+  if (/\.(jpe?g|png|gif|webp)$/.test(lower)) {
+    return 'image';
+  }
+  if (/\.(webm|ogg|mp3|m4a|wav)$/.test(lower)) {
+    return 'audio';
+  }
+  return 'file';
+}
+
+function fileExtLabel(name: string, mime: string): string {
+  const fromName = name.includes('.') ? name.split('.').pop()!.toUpperCase() : '';
+  if (fromName && fromName.length <= 5) {
+    return fromName;
+  }
+  if (mime === 'application/pdf') {
+    return 'PDF';
+  }
+  if (mime.includes('word') || mime.includes('document')) {
+    return 'DOC';
+  }
+  if (mime.includes('sheet') || mime.includes('excel')) {
+    return 'XLS';
+  }
+  if (mime.includes('presentation') || mime.includes('powerpoint')) {
+    return 'PPT';
+  }
+  if (mime.includes('zip') || mime.includes('rar')) {
+    return 'ZIP';
+  }
+  return 'FILE';
 }
 
 function revokeAttachmentBlob(message: ChatMessage) {
@@ -222,6 +304,13 @@ export function ThreadView() {
   const [reactPickerId, setReactPickerId] = useState<string | null>(null);
   const [forwardMessage, setForwardMessage] = useState<ChatMessage | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [mediaOpen, setMediaOpen] = useState(false);
+  const [mediaKind, setMediaKind] = useState<MediaKindTab>('all');
+  const [mediaItems, setMediaItems] = useState<ChatMessage[]>([]);
+  const [mediaBusy, setMediaBusy] = useState(false);
+  const [mediaPage, setMediaPage] = useState(1);
+  const [mediaHasMore, setMediaHasMore] = useState(false);
+  const [mediaDownloadingId, setMediaDownloadingId] = useState<string | null>(null);
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
   const toolsMenuRef = useRef<HTMLDivElement | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -229,6 +318,7 @@ export function ThreadView() {
   const [searchBusy, setSearchBusy] = useState(false);
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasOlder, setHasOlder] = useState(false);
   const [messagePage, setMessagePage] = useState(1);
@@ -241,6 +331,8 @@ export function ThreadView() {
   const [previewFile, setPreviewFile] = useState<File | null>(null);
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const docInputRef = useRef<HTMLInputElement | null>(null);
+  const attachMenuRef = useRef<HTMLDivElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -414,6 +506,12 @@ export function ThreadView() {
     setSearchOpen(false);
     setSearchQuery('');
     setSearchResults([]);
+    setMediaOpen(false);
+    setMediaKind('all');
+    setMediaItems([]);
+    setMediaPage(1);
+    setMediaHasMore(false);
+    setMediaDownloadingId(null);
     setHighlightId(null);
     setMessages((current) => {
       current.forEach(revokeAttachmentBlob);
@@ -598,6 +696,31 @@ export function ThreadView() {
     };
   }, [toolsMenuOpen]);
 
+  useEffect(() => {
+    if (!attachMenuOpen) {
+      return;
+    }
+    const onPointerDown = (event: Event) => {
+      const root = attachMenuRef.current;
+      if (root && !root.contains(event.target as Node)) {
+        setAttachMenuOpen(false);
+      }
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setAttachMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('touchstart', onPointerDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('touchstart', onPointerDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [attachMenuOpen]);
+
   // Keep Join banner in sync if the socket ring was missed
   useEffect(() => {
     if (!conversation || conversation.type !== 'group') {
@@ -772,6 +895,74 @@ export function ThreadView() {
       setActionError(err instanceof Error ? err.message : 'Could not summarize thread');
     } finally {
       setSummaryBusy(false);
+    }
+  }
+
+  async function loadMedia(page = 1, kind: MediaKindTab = mediaKind, append = false) {
+    if (!id) {
+      return;
+    }
+    setMediaBusy(true);
+    try {
+      const response = await api<Paginated<ChatMessage>>(
+        `/chat/conversations/${id}/media?page=${page}&limit=40&kind=${kind}`,
+      );
+      const items = response.data.items
+        .map(normalizeMessage)
+        .filter((item) => item.attachment && !item.deletedForEveryone);
+      setMediaItems((current) => (append ? [...current, ...items] : items));
+      setMediaPage(page);
+      setMediaHasMore(Boolean(response.data.meta.hasNextPage));
+    } catch (err) {
+      if (!append) {
+        setMediaItems([]);
+      }
+      setActionError(err instanceof Error ? err.message : 'Could not load media');
+    } finally {
+      setMediaBusy(false);
+    }
+  }
+
+  function openMedia(kind: MediaKindTab = 'all') {
+    setToolsMenuOpen(false);
+    setSearchOpen(false);
+    setMediaKind(kind);
+    setMediaOpen(true);
+    setMediaItems([]);
+    setMediaPage(1);
+    setMediaHasMore(false);
+    void loadMedia(1, kind, false);
+  }
+
+  async function handleDownloadMedia(message: ChatMessage) {
+    if (!message.attachment?.url) {
+      return;
+    }
+    setMediaDownloadingId(message.id);
+    try {
+      await downloadMedia(message.attachment.url, mediaDownloadName(message), {
+        conversationId: id,
+        messageId: message.id,
+        mime: message.attachment.mime,
+      });
+    } finally {
+      setMediaDownloadingId(null);
+    }
+  }
+
+  async function handleOpenMedia(message: ChatMessage) {
+    if (!message.attachment?.url || isPendingMessage(message)) {
+      return;
+    }
+    setMediaDownloadingId(message.id);
+    try {
+      await openAttachmentMedia(message.attachment.url, mediaDownloadName(message), {
+        conversationId: id,
+        messageId: message.id,
+        mime: message.attachment.mime,
+      });
+    } finally {
+      setMediaDownloadingId(null);
     }
   }
 
@@ -959,11 +1150,23 @@ export function ThreadView() {
     });
   }
 
-  async function uploadAndSend(file: File, kind: 'image' | 'audio' = 'image') {
+  async function uploadAndSend(
+    file: File,
+    kind?: 'image' | 'audio' | 'file',
+  ) {
     if (!me) {
       setActionError('You must be signed in to send media');
       return;
     }
+
+    const resolvedKind: 'image' | 'audio' | 'file' =
+      kind === 'audio'
+        ? 'audio'
+        : kind === 'image'
+          ? 'image'
+          : kind === 'file'
+            ? 'file'
+            : fileKindFromMime(file.type, file.name);
 
     const clientId =
       typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -972,12 +1175,18 @@ export function ThreadView() {
     const localUrl = URL.createObjectURL(file);
     const caption = composer.trim();
     const replySnapshot = replyTo;
+    const placeholder =
+      resolvedKind === 'audio'
+        ? '[Voice note]'
+        : resolvedKind === 'file'
+          ? '[File]'
+          : '[Image]';
     const pendingMessage: ChatMessage = {
       id: clientId,
       conversationId: id,
       senderId: me,
-      body: caption || (kind === 'audio' ? '[Voice note]' : '[Image]'),
-      type: kind,
+      body: caption || placeholder,
+      type: resolvedKind,
       replyTo: replySnapshot
         ? {
             id: replySnapshot.id,
@@ -989,7 +1198,13 @@ export function ThreadView() {
         : null,
       attachment: {
         url: localUrl,
-        mime: file.type || (kind === 'audio' ? 'audio/webm' : 'image/jpeg'),
+        mime:
+          file.type ||
+          (resolvedKind === 'audio'
+            ? 'audio/webm'
+            : resolvedKind === 'file'
+              ? 'application/octet-stream'
+              : 'image/jpeg'),
         name: file.name,
         size: file.size,
       },
@@ -1007,6 +1222,7 @@ export function ThreadView() {
 
     setMessages((current) => [...current, pendingMessage]);
     setUploading(true);
+    setAttachMenuOpen(false);
     setActionError('');
     setComposer('');
     clearMessageDraft(id);
@@ -1034,7 +1250,7 @@ export function ThreadView() {
         method: 'POST',
         body: JSON.stringify({
           body: caption || undefined,
-          type: kind === 'audio' ? 'audio' : 'image',
+          type: resolvedKind,
           attachmentUrl: attachment.url,
           attachmentMime: attachment.mime,
           attachmentName: attachment.name,
@@ -1053,6 +1269,9 @@ export function ThreadView() {
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
+      if (docInputRef.current) {
+        docInputRef.current.value = '';
+      }
     }
   }
 
@@ -1063,8 +1282,8 @@ export function ThreadView() {
     try {
       const response = await fetch(message.attachment.url);
       const blob = await response.blob();
-      const file = new File([blob], message.attachment.name || 'voice.webm', {
-        type: message.attachment.mime || blob.type || 'audio/webm',
+      const file = new File([blob], message.attachment.name || 'attachment', {
+        type: message.attachment.mime || blob.type || 'application/octet-stream',
       });
       setMessages((current) => {
         const pending = current.find((item) => item.id === message.id);
@@ -1073,10 +1292,13 @@ export function ThreadView() {
         }
         return current.filter((item) => item.id !== message.id);
       });
-      await uploadAndSend(
-        file,
-        message.type === 'audio' ? 'audio' : 'image',
-      );
+      const kind =
+        message.type === 'audio'
+          ? 'audio'
+          : message.type === 'file'
+            ? 'file'
+            : fileKindFromMime(file.type, file.name);
+      await uploadAndSend(file, kind);
     } catch {
       setActionError('Could not retry sending');
     }
@@ -1484,6 +1706,27 @@ export function ThreadView() {
 
           <div className="thread-tools-secondary">
             <button
+              className={`ghost thread-tool-btn${mediaOpen ? ' active' : ''}`}
+              type="button"
+              aria-label="Media"
+              title="Media"
+              aria-pressed={mediaOpen}
+              onClick={() => {
+                if (mediaOpen) {
+                  setMediaOpen(false);
+                } else {
+                  openMedia('all');
+                }
+              }}
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 0h7v7h-7v-7z"
+                />
+              </svg>
+            </button>
+            <button
               className={`ghost thread-tool-btn${searchOpen ? ' active' : ''}`}
               type="button"
               aria-label="Search messages"
@@ -1491,6 +1734,7 @@ export function ThreadView() {
               aria-pressed={searchOpen}
               onClick={() => {
                 setToolsMenuOpen(false);
+                setMediaOpen(false);
                 setSearchOpen((open) => !open);
               }}
             >
@@ -1587,8 +1831,16 @@ export function ThreadView() {
               <button
                 type="button"
                 role="menuitem"
+                onClick={() => openMedia('all')}
+              >
+                Media
+              </button>
+              <button
+                type="button"
+                role="menuitem"
                 onClick={() => {
                   setToolsMenuOpen(false);
+                  setMediaOpen(false);
                   setSearchOpen(true);
                 }}
               >
@@ -1789,7 +2041,8 @@ export function ThreadView() {
             message.attachment &&
             (message.type === 'image' ||
               message.attachment.mime.startsWith('image/')) &&
-            message.type !== 'audio';
+            message.type !== 'audio' &&
+            message.type !== 'file';
           const showAudio =
             !message.deletedForEveryone &&
             message.attachment &&
@@ -1798,6 +2051,12 @@ export function ThreadView() {
               // Chrome sometimes records audio-only MediaRecorder blobs as video/webm
               (message.type === 'audio' &&
                 message.attachment.mime.startsWith('video/')));
+          const showFile =
+            !message.deletedForEveryone &&
+            message.attachment &&
+            !showImage &&
+            !showAudio &&
+            (message.type === 'file' || Boolean(message.attachment.url));
           const caption =
             message.body && !isPlaceholderBody(message.body) ? message.body : null;
           const bodyParts = caption
@@ -1916,47 +2175,139 @@ export function ThreadView() {
                 ) : (
                   <>
                     {showImage && message.attachment ? (
-                      <a
-                        className={`wa-image-link${pending ? ' is-sending' : ''}`}
-                        href={resolveMediaUrl(message.attachment.url)}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={(event) => {
-                          if (pending) {
-                            event.preventDefault();
-                          }
-                        }}
-                      >
-                        <img
-                          className="wa-image"
-                          src={resolveMediaUrl(message.attachment.url)}
-                          alt={message.attachment.name || 'Image'}
-                          loading="lazy"
-                        />
-                        {pending ? (
-                          <span className="wa-image-send-overlay">
-                            {message.sendStatus === 'failed'
-                              ? 'Failed'
-                              : message.sendStatus === 'uploading'
-                                ? `${Math.round(message.uploadProgress ?? 0)}%`
-                                : 'Sending…'}
-                          </span>
+                      <div className={`wa-media-wrap${pending ? ' is-sending' : ''}`}>
+                        <a
+                          className="wa-image-link"
+                          href={resolveMediaUrl(message.attachment.url)}
+                          target="_blank"
+                          rel="noreferrer"
+                          onClick={(event) => {
+                            if (pending) {
+                              event.preventDefault();
+                            }
+                          }}
+                        >
+                          <img
+                            className="wa-image"
+                            src={resolveMediaUrl(message.attachment.url)}
+                            alt={message.attachment.name || 'Image'}
+                            loading="lazy"
+                          />
+                          {pending ? (
+                            <span className="wa-image-send-overlay">
+                              {message.sendStatus === 'failed'
+                                ? 'Failed'
+                                : message.sendStatus === 'uploading'
+                                  ? `${Math.round(message.uploadProgress ?? 0)}%`
+                                  : 'Sending…'}
+                            </span>
+                          ) : null}
+                        </a>
+                        {!pending ? (
+                          <button
+                            type="button"
+                            className="wa-media-download"
+                            aria-label="Download image"
+                            title="Download"
+                            disabled={mediaDownloadingId === message.id}
+                            onClick={() => void handleDownloadMedia(message)}
+                          >
+                            ↓
+                          </button>
                         ) : null}
-                      </a>
+                      </div>
                     ) : null}
                     {showAudio && message.attachment ? (
-                      <VoiceNotePlayer
-                        src={message.attachment.url}
-                        mime={message.attachment.mime}
-                        mine={mine}
-                        sendStatus={message.sendStatus}
-                        uploadProgress={message.uploadProgress}
-                        onRetry={
-                          message.sendStatus === 'failed'
-                            ? () => void retryPendingMessage(message)
-                            : undefined
-                        }
-                      />
+                      <div className="wa-media-wrap audio">
+                        <VoiceNotePlayer
+                          src={message.attachment.url}
+                          mime={message.attachment.mime}
+                          mine={mine}
+                          sendStatus={message.sendStatus}
+                          uploadProgress={message.uploadProgress}
+                          onRetry={
+                            message.sendStatus === 'failed'
+                              ? () => void retryPendingMessage(message)
+                              : undefined
+                          }
+                        />
+                        {!pending ? (
+                          <button
+                            type="button"
+                            className="wa-media-download"
+                            aria-label="Download voice note"
+                            title="Download"
+                            disabled={mediaDownloadingId === message.id}
+                            onClick={() => void handleDownloadMedia(message)}
+                          >
+                            ↓
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {showFile && message.attachment ? (
+                      <div className={`wa-media-wrap${pending ? ' is-sending' : ''}`}>
+                        <button
+                          type="button"
+                          className={`wa-file-card${pending ? ' is-sending' : ''}${
+                            message.sendStatus === 'failed' ? ' is-failed' : ''
+                          }`}
+                          disabled={mediaDownloadingId === message.id}
+                          onClick={() => {
+                            if (pending) {
+                              if (message.sendStatus === 'failed') {
+                                void retryPendingMessage(message);
+                              }
+                              return;
+                            }
+                            void handleOpenMedia(message);
+                          }}
+                        >
+                          <span className="wa-file-icon" aria-hidden="true">
+                            {fileExtLabel(
+                              message.attachment.name,
+                              message.attachment.mime,
+                            )}
+                          </span>
+                          <span className="wa-file-meta">
+                            <strong className="wa-file-name">
+                              {message.attachment.name || 'Document'}
+                            </strong>
+                            <small className="wa-file-sub">
+                              {pending
+                                ? message.sendStatus === 'failed'
+                                  ? 'Failed · tap to retry'
+                                  : message.sendStatus === 'uploading'
+                                    ? `Uploading ${Math.round(message.uploadProgress ?? 0)}%`
+                                    : 'Sending…'
+                                : mediaDownloadingId === message.id
+                                  ? 'Opening…'
+                                  : [
+                                      formatFileSize(message.attachment.size),
+                                      fileExtLabel(
+                                        message.attachment.name,
+                                        message.attachment.mime,
+                                      ),
+                                      'Tap to open',
+                                    ]
+                                      .filter(Boolean)
+                                      .join(' · ')}
+                            </small>
+                          </span>
+                        </button>
+                        {!pending ? (
+                          <button
+                            type="button"
+                            className="wa-media-download"
+                            aria-label="Download file"
+                            title="Download"
+                            disabled={mediaDownloadingId === message.id}
+                            onClick={() => void handleDownloadMedia(message)}
+                          >
+                            ↓
+                          </button>
+                        ) : null}
+                      </div>
                     ) : null}
                     {caption ? (
                       <p className="wa-text">
@@ -2343,35 +2694,74 @@ export function ThreadView() {
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 if (file) {
-                  void uploadAndSend(file);
+                  void uploadAndSend(file, 'image');
+                }
+              }}
+            />
+            <input
+              ref={docInputRef}
+              type="file"
+              accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.json,.rtf,.zip,.rar,.odt,.ods,.odp,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain,text/csv,application/json,application/zip"
+              hidden
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  void uploadAndSend(file, 'file');
                 }
               }}
             />
             <div className="composer-shell">
               {!editingMessage ? (
-                <button
-                  className="composer-attach"
-                  type="button"
-                  aria-label="Attach image"
-                  title="Attach image"
-                  disabled={uploading}
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  {uploading ? (
-                    <span className="composer-attach-busy">…</span>
-                  ) : (
-                    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-                      <path
-                        d="M14.5 5.5 7.8 12.2a3.2 3.2 0 1 0 4.5 4.5l7.2-7.2a4.8 4.8 0 0 0-6.8-6.8L5.5 10a1.2 1.2 0 0 0 1.7 1.7l7.2-7.2"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="1.8"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      />
-                    </svg>
-                  )}
-                </button>
+                <div className="composer-attach-wrap" ref={attachMenuRef}>
+                  <button
+                    className={`composer-attach${attachMenuOpen ? ' open' : ''}`}
+                    type="button"
+                    aria-label="Attach"
+                    title="Attach"
+                    aria-expanded={attachMenuOpen}
+                    disabled={uploading}
+                    onClick={() => setAttachMenuOpen((open) => !open)}
+                  >
+                    {uploading ? (
+                      <span className="composer-attach-busy">…</span>
+                    ) : (
+                      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                        <path
+                          d="M14.5 5.5 7.8 12.2a3.2 3.2 0 1 0 4.5 4.5l7.2-7.2a4.8 4.8 0 0 0-6.8-6.8L5.5 10a1.2 1.2 0 0 0 1.7 1.7l7.2-7.2"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    )}
+                  </button>
+                  {attachMenuOpen ? (
+                    <div className="composer-attach-menu" role="menu">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setAttachMenuOpen(false);
+                          fileInputRef.current?.click();
+                        }}
+                      >
+                        Photo
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setAttachMenuOpen(false);
+                          docInputRef.current?.click();
+                        }}
+                      >
+                        Document
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
               ) : null}
               <input
                 ref={composerInputRef}
@@ -2426,6 +2816,135 @@ export function ThreadView() {
       </form>
 
       <Modal
+        open={mediaOpen}
+        title="Media"
+        size="lg"
+        onClose={() => setMediaOpen(false)}
+      >
+        <div className="media-gallery">
+          <div className="media-gallery-tabs" role="tablist" aria-label="Media type">
+            {(
+              [
+                ['all', 'All'],
+                ['image', 'Images'],
+                ['file', 'Files'],
+                ['audio', 'Voice'],
+              ] as const
+            ).map(([kind, label]) => (
+              <button
+                key={kind}
+                type="button"
+                role="tab"
+                aria-selected={mediaKind === kind}
+                className={mediaKind === kind ? 'active' : ''}
+                onClick={() => {
+                  if (mediaKind === kind) {
+                    return;
+                  }
+                  setMediaKind(kind);
+                  setMediaItems([]);
+                  setMediaPage(1);
+                  setMediaHasMore(false);
+                  void loadMedia(1, kind, false);
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {mediaBusy && mediaItems.length === 0 ? (
+            <p className="muted">Loading media…</p>
+          ) : mediaItems.length === 0 ? (
+            <p className="muted">No media in this chat yet.</p>
+          ) : (
+            <ul className="media-gallery-list">
+              {mediaItems.map((item) => {
+                const kind = mediaKindOf(item);
+                const attachment = item.attachment!;
+                return (
+                  <li key={item.id} className={`media-gallery-item kind-${kind}`}>
+                    <button
+                      type="button"
+                      className="media-gallery-preview"
+                      onClick={() => {
+                        setMediaOpen(false);
+                        jumpToMessage(item.id);
+                      }}
+                      title="Show in chat"
+                    >
+                      {kind === 'image' ? (
+                        <img
+                          src={resolveMediaUrl(attachment.url)}
+                          alt={attachment.name || 'Image'}
+                          loading="lazy"
+                        />
+                      ) : (
+                        <span className="media-gallery-icon" aria-hidden="true">
+                          {kind === 'audio'
+                            ? '♪'
+                            : fileExtLabel(attachment.name, attachment.mime)}
+                        </span>
+                      )}
+                    </button>
+                    <div className="media-gallery-meta">
+                      <strong>
+                        {kind === 'image'
+                          ? attachment.name || 'Photo'
+                          : kind === 'audio'
+                            ? 'Voice note'
+                            : attachment.name || 'File'}
+                      </strong>
+                      <small>
+                        {[
+                          kind === 'image'
+                            ? 'Image'
+                            : kind === 'audio'
+                              ? 'Voice'
+                              : 'File',
+                          formatFileSize(attachment.size),
+                          clock(item.createdAt),
+                        ]
+                          .filter(Boolean)
+                          .join(' · ')}
+                      </small>
+                    </div>
+                    <button
+                      type="button"
+                      className="ghost media-gallery-download"
+                      disabled={mediaDownloadingId === item.id}
+                      onClick={() => void handleOpenMedia(item)}
+                    >
+                      {mediaDownloadingId === item.id ? '…' : 'Open'}
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost media-gallery-download"
+                      disabled={mediaDownloadingId === item.id}
+                      onClick={() => void handleDownloadMedia(item)}
+                    >
+                      {mediaDownloadingId === item.id ? '…' : 'Download'}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {mediaHasMore ? (
+            <button
+              className="ghost full"
+              type="button"
+              disabled={mediaBusy}
+              onClick={() => void loadMedia(mediaPage + 1, mediaKind, true)}
+            >
+              {mediaBusy ? 'Loading…' : 'Load more'}
+            </button>
+          ) : null}
+        </div>
+      </Modal>
+
+      <Modal
         open={Boolean(forwardMessage)}
         title="Forward message"
         size="lg"
@@ -2470,6 +2989,16 @@ export function ThreadView() {
               </button>
               <button className="ghost full" type="button" onClick={() => void toggleMute()}>
                 {conversation.muted ? 'Unmute conversation' : 'Mute conversation'}
+              </button>
+              <button
+                className="ghost full"
+                type="button"
+                onClick={() => {
+                  setDetails(false);
+                  openMedia('all');
+                }}
+              >
+                Media (photos, files, voice)
               </button>
               <button
                 className="ghost full"
@@ -2548,6 +3077,16 @@ export function ThreadView() {
               </button>
               <button className="ghost full" type="button" onClick={() => void toggleMute()}>
                 {conversation.muted ? 'Unmute conversation' : 'Mute conversation'}
+              </button>
+              <button
+                className="ghost full"
+                type="button"
+                onClick={() => {
+                  setDetails(false);
+                  openMedia('all');
+                }}
+              >
+                Media (photos, files, voice)
               </button>
               <button
                 className="ghost full"

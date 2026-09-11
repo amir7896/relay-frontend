@@ -68,6 +68,11 @@ function previewText(message: ChatMessage | null | undefined, me?: string) {
     const prefix = message.senderId === me ? 'You: ' : '';
     return `${prefix}Voice note`;
   }
+  if (message.type === 'file' || (message.attachment && message.type !== 'image')) {
+    const prefix = message.senderId === me ? 'You: ' : '';
+    const name = message.attachment?.name?.trim();
+    return `${prefix}${name || 'File'}`;
+  }
   if (!message.body) {
     return null;
   }
