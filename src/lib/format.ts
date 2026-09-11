@@ -48,6 +48,40 @@ export function clock(value: string): string {
   });
 }
 
+/** WhatsApp-style inbox timestamp (today → time, yesterday → Yesterday, else short date). */
+export function inboxTime(value: string | null | undefined): string {
+  if (!value) {
+    return '';
+  }
+  const then = new Date(value);
+  if (Number.isNaN(then.getTime())) {
+    return '';
+  }
+  const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startThen = new Date(then.getFullYear(), then.getMonth(), then.getDate());
+  const dayDiff = Math.round(
+    (startToday.getTime() - startThen.getTime()) / 86_400_000,
+  );
+  if (dayDiff === 0) {
+    return then.toLocaleTimeString(undefined, {
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  }
+  if (dayDiff === 1) {
+    return 'Yesterday';
+  }
+  if (dayDiff < 7) {
+    return then.toLocaleDateString(undefined, { weekday: 'short' });
+  }
+  return then.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: then.getFullYear() === now.getFullYear() ? undefined : 'numeric',
+  });
+}
+
 export function formatLastSeen(
   lastSeenAt: string | null,
   status: 'online' | 'offline',

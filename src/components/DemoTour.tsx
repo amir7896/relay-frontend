@@ -7,7 +7,7 @@ const steps = [
   {
     target: '.inbox',
     title: 'Your inbox',
-    body: 'All direct messages and groups live here. Pin, mute, and search chats.',
+    body: 'All direct messages and groups live here. Pin, mute, search, and install Relay as an app.',
   },
   {
     target: '.thread',
@@ -20,9 +20,9 @@ const steps = [
     body: 'Attach images, record voice notes, @mention teammates, and use smart reply chips.',
   },
   {
-    target: '.app-nav',
-    title: 'Admin tools',
-    body: 'Admins can open Analytics for live stats, audit logs, and workspace branding.',
+    target: '.side-nav-links',
+    title: 'Workspace navigation',
+    body: 'Jump between Messages, Profile, Blocked users, and admin tools like People and Analytics.',
   },
 ];
 

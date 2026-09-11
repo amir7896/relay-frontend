@@ -44,8 +44,8 @@ export function LandingPage() {
           <span>Reactions & replies</span>
           <span>Edit & forward</span>
           <span>Voice notes</span>
-          <span>Thread search</span>
-          <span>AI summarize</span>
+          <span>Global search</span>
+          <span>Installable PWA</span>
           <span>Admin analytics</span>
         </div>
       </section>

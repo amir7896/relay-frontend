@@ -10,7 +10,7 @@ export function EmptyThread() {
         <span className="empty-glyph" aria-hidden="true" />
         <h2>Your messages live here</h2>
         <p className="muted">
-          Pick a conversation from the sidebar, or start a new chat or group.
+          Pick a conversation from your inbox, or start a new chat or group.
         </p>
         <div className="empty-actions">
           <button className="btn" type="button" onClick={openNewChat}>

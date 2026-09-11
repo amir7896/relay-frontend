@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useOutletContext, useParams } from 'react-router-dom';
+import { useNavigate, useOutletContext, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../../api/client';
 import { getAccessToken } from '../../auth/session';
 import { useAuth } from '../../auth/AuthContext';
@@ -43,6 +43,7 @@ import type {
   Conversation,
   LinkPreview,
   Paginated,
+  ScheduledMessage,
   SeenResult,
 } from '../../api/types';
 import type { MessengerOutletContext } from './MessengerPage';
@@ -52,6 +53,28 @@ const EDIT_WINDOW_MS = 15 * 60 * 1000;
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'] as const;
 
 type VoicePhase = 'idle' | 'recording' | 'preview';
+
+function toDatetimeLocalValue(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function defaultScheduleLocalValue() {
+  return toDatetimeLocalValue(new Date(Date.now() + 5 * 60 * 1000));
+}
+
+function formatScheduleWhen(iso: string) {
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+}
 type MediaKindTab = 'all' | 'image' | 'file' | 'audio';
 
 function mediaKindOf(message: ChatMessage): 'image' | 'file' | 'audio' {
@@ -99,8 +122,27 @@ function normalizeMessage(message: ChatMessage): ChatMessage {
     mentions: message.mentions ?? [],
     linkPreview: message.linkPreview ?? null,
     editedAt: message.editedAt ?? null,
+    pinned: Boolean(message.pinned),
+    pinnedAt: message.pinnedAt ?? null,
+    pinnedByUserId: message.pinnedByUserId ?? null,
     forwarded: Boolean(message.forwarded),
+    expiresAt: message.expiresAt ?? null,
   };
+}
+
+const DISAPPEARING_OPTIONS: Array<{ value: number; label: string }> = [
+  { value: 0, label: 'Off' },
+  { value: 30, label: '30 seconds' },
+  { value: 60, label: '1 minute' },
+  { value: 3600, label: '1 hour' },
+  { value: 86_400, label: '24 hours' },
+  { value: 604_800, label: '7 days' },
+  { value: 7_776_000, label: '90 days' },
+];
+
+function disappearingLabel(seconds: number | undefined) {
+  const match = DISAPPEARING_OPTIONS.find((item) => item.value === (seconds ?? 0));
+  return match?.label ?? 'Off';
 }
 
 function upsertMessage(current: ChatMessage[], payload: ChatMessage): ChatMessage[] {
@@ -284,6 +326,8 @@ async function uploadFileWithProgress(
 
 export function ThreadView() {
   const { id = '' } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const focusMessageId = searchParams.get('focus');
   const { session } = useAuth();
   const me = session?.user.id;
   const navigate = useNavigate();
@@ -304,6 +348,8 @@ export function ThreadView() {
   const [reactPickerId, setReactPickerId] = useState<string | null>(null);
   const [forwardMessage, setForwardMessage] = useState<ChatMessage | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [pinnedMessages, setPinnedMessages] = useState<ChatMessage[]>([]);
+  const [pinnedBannerOpen, setPinnedBannerOpen] = useState(false);
   const [mediaOpen, setMediaOpen] = useState(false);
   const [mediaKind, setMediaKind] = useState<MediaKindTab>('all');
   const [mediaItems, setMediaItems] = useState<ChatMessage[]>([]);
@@ -317,6 +363,10 @@ export function ThreadView() {
   const [searchResults, setSearchResults] = useState<ChatMessage[]>([]);
   const [searchBusy, setSearchBusy] = useState(false);
   const [highlightId, setHighlightId] = useState<string | null>(null);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [scheduleAt, setScheduleAt] = useState(defaultScheduleLocalValue);
+  const [scheduledMessages, setScheduledMessages] = useState<ScheduledMessage[]>([]);
+  const [scheduleBusy, setScheduleBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -346,6 +396,15 @@ export function ThreadView() {
   const touchStartRef = useRef<{ x: number; y: number; id: string } | null>(null);
   const scroller = useRef<HTMLDivElement | null>(null);
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const scheduledMessagesRef = useRef(scheduledMessages);
+  scheduledMessagesRef.current = scheduledMessages;
+  const hasOlderRef = useRef(hasOlder);
+  hasOlderRef.current = hasOlder;
+  const messagePageRef = useRef(messagePage);
+  messagePageRef.current = messagePage;
+  const focusBusyRef = useRef(false);
   const { joinConversation, leaveConversation, subscribe, emit } = useChatSocket();
   const {
     phase: callPhase,
@@ -447,13 +506,52 @@ export function ThreadView() {
     return history;
   }
 
+  async function loadPinned() {
+    try {
+      const response = await api<ChatMessage[]>(
+        `/chat/conversations/${id}/pinned-messages`,
+      );
+      setPinnedMessages(response.data.map(normalizeMessage));
+    } catch {
+      setPinnedMessages([]);
+    }
+  }
+
+  async function loadScheduled() {
+    try {
+      const response = await api<ScheduledMessage[]>(
+        `/chat/conversations/${id}/scheduled-messages`,
+      );
+      setScheduledMessages(response.data.filter((item) => item.status === 'pending'));
+    } catch {
+      setScheduledMessages([]);
+    }
+  }
+
+  useEffect(() => {
+    if (scheduledMessages.length === 0 || !id) {
+      return;
+    }
+    void loadScheduled();
+    const timer = window.setInterval(() => {
+      void loadScheduled();
+    }, 8_000);
+    return () => window.clearInterval(timer);
+  }, [id, scheduledMessages.length]);
+
   async function load() {
     setLoading(true);
     setConversation(null);
     setMessages([]);
+    setPinnedMessages([]);
+    setPinnedBannerOpen(false);
+    setScheduledMessages([]);
+    setScheduleOpen(false);
     setSummary('');
     const conv = await api<Conversation>(`/chat/conversations/${id}`);
     await loadHistory(1, false);
+    void loadPinned();
+    void loadScheduled();
     setConversation({
       ...conv.data,
       muted: Boolean(conv.data.muted),
@@ -506,6 +604,8 @@ export function ThreadView() {
     setSearchOpen(false);
     setSearchQuery('');
     setSearchResults([]);
+    setPinnedMessages([]);
+    setPinnedBannerOpen(false);
     setMediaOpen(false);
     setMediaKind('all');
     setMediaItems([]);
@@ -533,7 +633,21 @@ export function ThreadView() {
         if (message.conversationId !== id) {
           return;
         }
-        setMessages((current) => consumeMatchingPending(current, message, me));
+        const normalized = normalizeMessage(message);
+        setMessages((current) => consumeMatchingPending(current, normalized, me));
+        setPinnedMessages((current) => {
+          const without = current.filter((item) => item.id !== normalized.id);
+          if (normalized.pinned && !normalized.deletedForEveryone) {
+            return [normalized, ...without].sort((a, b) =>
+              (b.pinnedAt ?? '').localeCompare(a.pinnedAt ?? ''),
+            );
+          }
+          return without;
+        });
+        // Scheduled delivery lands as a normal message — refresh pending list.
+        if (scheduledMessagesRef.current.length > 0) {
+          void loadScheduled();
+        }
         clearUnread(id);
         void api(`/chat/conversations/${id}/seen`, {
           method: 'POST',
@@ -547,11 +661,17 @@ export function ThreadView() {
         if (message.conversationId !== id) {
           return;
         }
+        const normalized = normalizeMessage(message);
         setMessages((current) =>
           current.map((item) =>
-            item.id === message.id ? normalizeMessage(message) : item,
+            item.id === normalized.id ? normalized : item,
           ),
         );
+        if (normalized.deletedForEveryone || !normalized.pinned) {
+          setPinnedMessages((current) =>
+            current.filter((item) => item.id !== normalized.id),
+          );
+        }
       }),
       subscribe('chat:typing', (payload) => {
         const event = payload as {
@@ -633,6 +753,10 @@ export function ThreadView() {
                   muted: current.muted,
                   pinned: current.pinned,
                   lastReadAt: current.lastReadAt,
+                  disappearingDurationSeconds:
+                    next.disappearingDurationSeconds ??
+                    current.disappearingDurationSeconds ??
+                    0,
                 }
               : next,
           );
@@ -881,6 +1005,83 @@ export function ThreadView() {
     setReplyTo(null);
     setPendingLinkPreview(null);
     void sendTyping(false);
+  }
+
+  async function scheduleSend() {
+    const body = composer.trim();
+    if (!body || editingMessage || scheduleBusy) {
+      return;
+    }
+    const when = new Date(scheduleAt);
+    if (Number.isNaN(when.getTime())) {
+      setActionError('Pick a valid date and time');
+      return;
+    }
+    if (when.getTime() < Date.now() + 55_000) {
+      setActionError('Schedule at least 1 minute from now');
+      return;
+    }
+    setScheduleBusy(true);
+    setActionError('');
+    try {
+      const mentionUserIds = extractMentionIds(body, mentionCandidates);
+      const payload: {
+        body: string;
+        type: string;
+        scheduledFor: string;
+        replyToMessageId?: string;
+        mentionUserIds?: string[];
+        linkPreview?: LinkPreview | null;
+      } = {
+        body,
+        type: 'text',
+        scheduledFor: when.toISOString(),
+        mentionUserIds,
+        linkPreview: pendingLinkPreview,
+      };
+      if (replyTo) {
+        payload.replyToMessageId = replyTo.id;
+      }
+      const response = await api<ScheduledMessage>(
+        `/chat/conversations/${id}/scheduled-messages`,
+        {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        },
+      );
+      setScheduledMessages((current) =>
+        [...current, response.data].sort(
+          (a, b) =>
+            new Date(a.scheduledFor).getTime() - new Date(b.scheduledFor).getTime(),
+        ),
+      );
+      setComposer('');
+      clearMessageDraft(id);
+      setReplyTo(null);
+      setPendingLinkPreview(null);
+      setScheduleOpen(false);
+      setScheduleAt(defaultScheduleLocalValue());
+      void sendTyping(false);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not schedule message');
+    } finally {
+      setScheduleBusy(false);
+    }
+  }
+
+  async function cancelScheduled(scheduledMessageId: string) {
+    try {
+      await api(`/chat/conversations/${id}/scheduled-messages/${scheduledMessageId}`, {
+        method: 'DELETE',
+      });
+      setScheduledMessages((current) =>
+        current.filter((item) => item.id !== scheduledMessageId),
+      );
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not cancel scheduled message',
+      );
+    }
   }
 
   async function summarizeThread() {
@@ -1321,6 +1522,32 @@ export function ThreadView() {
     }
   }
 
+  async function toggleMessagePin(message: ChatMessage) {
+    setMenuMessageId(null);
+    try {
+      const response = await api<ChatMessage>(
+        `/chat/conversations/${id}/messages/${message.id}/pin`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ pinned: !message.pinned }),
+        },
+      );
+      const normalized = normalizeMessage(response.data);
+      setMessages((current) => upsertMessage(current, normalized));
+      setPinnedMessages((current) => {
+        const without = current.filter((item) => item.id !== normalized.id);
+        if (normalized.pinned) {
+          return [normalized, ...without].sort((a, b) =>
+            (b.pinnedAt ?? '').localeCompare(a.pinnedAt ?? ''),
+          );
+        }
+        return without;
+      });
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not update pin');
+    }
+  }
+
   async function forwardTo(conversationId: string) {
     if (!forwardMessage) {
       return;
@@ -1431,6 +1658,33 @@ export function ThreadView() {
     }
   }
 
+  async function setDisappearing(durationSeconds: number) {
+    if (!conversation) {
+      return;
+    }
+    try {
+      const response = await api<Conversation>(
+        `/chat/conversations/${id}/disappearing`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ durationSeconds }),
+        },
+      );
+      setConversation({
+        ...response.data,
+        muted: Boolean(response.data.muted),
+        pinned: Boolean(response.data.pinned),
+        disappearingDurationSeconds:
+          response.data.disappearingDurationSeconds ?? 0,
+      });
+      void refreshInbox();
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not update disappearing messages',
+      );
+    }
+  }
+
   async function blockPeer() {
     if (!peer) {
       return;
@@ -1511,6 +1765,87 @@ export function ThreadView() {
     el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     window.setTimeout(() => setHighlightId(null), 1600);
   }
+
+  useEffect(() => {
+    if (!focusMessageId || loading || focusBusyRef.current) {
+      return;
+    }
+
+    const targetId = focusMessageId;
+    let cancelled = false;
+    focusBusyRef.current = true;
+
+    const clearFocusParam = () => {
+      setSearchParams(
+        (current) => {
+          const next = new URLSearchParams(current);
+          next.delete('focus');
+          return next;
+        },
+        { replace: true },
+      );
+    };
+
+    async function resolveFocus() {
+      try {
+        if (messagesRef.current.some((item) => item.id === targetId)) {
+          requestAnimationFrame(() => {
+            if (!cancelled) {
+              jumpToMessage(targetId);
+            }
+          });
+          return;
+        }
+
+        let page = messagePageRef.current;
+        let more = hasOlderRef.current;
+        let found = false;
+        const scrollerEl = scroller.current;
+
+        while (more && !cancelled && !found) {
+          setLoadingOlder(true);
+          const previousHeight = scrollerEl?.scrollHeight ?? 0;
+          page += 1;
+          const history = await api<Paginated<ChatMessage>>(
+            `/chat/conversations/${id}/messages?page=${page}&limit=80`,
+          );
+          const batch = [...history.data.items].reverse().map(normalizeMessage);
+          found = batch.some((item) => item.id === targetId);
+          setMessages((current) => [...batch, ...current]);
+          more = history.data.meta.hasNextPage;
+          setHasOlder(more);
+          setMessagePage(page);
+          await new Promise<void>((resolve) => {
+            requestAnimationFrame(() => {
+              if (scrollerEl) {
+                scrollerEl.scrollTop = scrollerEl.scrollHeight - previousHeight;
+              }
+              resolve();
+            });
+          });
+        }
+
+        if (!cancelled && found) {
+          await new Promise((resolve) => window.setTimeout(resolve, 100));
+          if (!cancelled) {
+            jumpToMessage(targetId);
+          }
+        }
+      } finally {
+        if (!cancelled) {
+          setLoadingOlder(false);
+          clearFocusParam();
+          focusBusyRef.current = false;
+        }
+      }
+    }
+
+    void resolveFocus();
+    return () => {
+      cancelled = true;
+      focusBusyRef.current = false;
+    };
+  }, [focusMessageId, loading, id, setSearchParams]);
 
   function startReply(message: ChatMessage) {
     if (message.deletedForEveryone || isPendingMessage(message)) {
@@ -1945,6 +2280,92 @@ export function ThreadView() {
         </button>
       ) : null}
 
+      {pinnedMessages.length > 0 ? (
+        <div className="pinned-banner">
+          <button
+            type="button"
+            className="pinned-banner-main"
+            onClick={() => {
+              if (pinnedMessages.length === 1) {
+                jumpToMessage(pinnedMessages[0].id);
+                return;
+              }
+              setPinnedBannerOpen((open) => !open);
+            }}
+          >
+            <span className="pinned-banner-icon" aria-hidden="true">
+              📌
+            </span>
+            <span className="pinned-banner-copy">
+              <strong>
+                {pinnedMessages.length === 1
+                  ? 'Pinned message'
+                  : `${pinnedMessages.length} pinned messages`}
+              </strong>
+              <small>
+                {replySnippet(pinnedMessages[0])}
+              </small>
+            </span>
+          </button>
+          {pinnedMessages.length === 1 ? (
+            <button
+              type="button"
+              className="ghost pinned-banner-unpin"
+              aria-label="Unpin message"
+              title="Unpin"
+              onClick={() => void toggleMessagePin(pinnedMessages[0])}
+            >
+              ×
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="ghost pinned-banner-unpin"
+              aria-expanded={pinnedBannerOpen}
+              aria-label={pinnedBannerOpen ? 'Hide pinned messages' : 'Show pinned messages'}
+              onClick={() => setPinnedBannerOpen((open) => !open)}
+            >
+              {pinnedBannerOpen ? '▴' : '▾'}
+            </button>
+          )}
+          {pinnedBannerOpen && pinnedMessages.length > 1 ? (
+            <ul className="pinned-banner-list">
+              {pinnedMessages.map((item) => (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPinnedBannerOpen(false);
+                      jumpToMessage(item.id);
+                    }}
+                  >
+                    <strong>{displayName(byUserId.get(item.senderId))}</strong>
+                    <span>{replySnippet(item)}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => void toggleMessagePin(item)}
+                  >
+                    Unpin
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+
+      {(conversation.disappearingDurationSeconds ?? 0) > 0 ? (
+        <div className="disappearing-banner" role="status">
+          <span aria-hidden="true">⌛</span>
+          <p>
+            Disappearing messages on · new messages vanish after{' '}
+            {disappearingLabel(conversation.disappearingDurationSeconds)}
+          </p>
+        </div>
+      ) : null}
+
       {searchOpen ? (
         <div className="search-panel">
           <input
@@ -2151,6 +2572,9 @@ export function ThreadView() {
                 ) : null}
                 {message.forwarded && !message.deletedForEveryone ? (
                   <span className="wa-forwarded">Forwarded</span>
+                ) : null}
+                {message.pinned && !message.deletedForEveryone ? (
+                  <span className="wa-pinned-label">📌 Pinned</span>
                 ) : null}
                 {message.replyTo ? (
                   <button
@@ -2384,6 +2808,14 @@ export function ThreadView() {
                     </button>
                   ) : null}
                   {message.editedAt ? <span className="wa-edited">edited</span> : null}
+                  {message.expiresAt && !message.deletedForEveryone ? (
+                    <span
+                      className="wa-expires"
+                      title={`Disappears ${new Date(message.expiresAt).toLocaleString()}`}
+                    >
+                      ⌛
+                    </span>
+                  ) : null}
                   <time dateTime={message.createdAt}>{clock(message.createdAt)}</time>
                   {mine ? (
                     <MessageTicks
@@ -2443,6 +2875,12 @@ export function ThreadView() {
                           }}
                         >
                           Forward
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void toggleMessagePin(message)}
+                        >
+                          {message.pinned ? 'Unpin' : 'Pin'}
                         </button>
                       </>
                     ) : null}
@@ -2553,6 +2991,58 @@ export function ThreadView() {
             </li>
           ))}
         </ul>
+      ) : null}
+
+      {scheduledMessages.length > 0 ? (
+        <div className="scheduled-panel">
+          <p className="scheduled-panel-title">Scheduled</p>
+          <ul className="scheduled-list">
+            {scheduledMessages.map((item) => (
+              <li key={item.id}>
+                <div>
+                  <strong>{formatScheduleWhen(item.scheduledFor)}</strong>
+                  <span>{item.body}</span>
+                </div>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => void cancelScheduled(item.id)}
+                >
+                  Cancel
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {scheduleOpen && !editingMessage ? (
+        <div className="schedule-composer">
+          <label>
+            Send later
+            <input
+              type="datetime-local"
+              value={scheduleAt}
+              min={toDatetimeLocalValue(new Date(Date.now() + 60_000))}
+              onChange={(event) => setScheduleAt(event.target.value)}
+            />
+          </label>
+          <button
+            type="button"
+            className="btn"
+            disabled={!composer.trim() || scheduleBusy}
+            onClick={() => void scheduleSend()}
+          >
+            {scheduleBusy ? 'Scheduling…' : 'Schedule'}
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => setScheduleOpen(false)}
+          >
+            Close
+          </button>
+        </div>
       ) : null}
 
       <form
@@ -2795,20 +3285,43 @@ export function ThreadView() {
                   </svg>
                 </button>
               ) : (
-                <button
-                  className="composer-send"
-                  type="submit"
-                  aria-label={editingMessage ? 'Save edit' : 'Send message'}
-                  title={editingMessage ? 'Save' : 'Send'}
-                  disabled={editingMessage ? !composer.trim() : !composer.trim()}
-                >
-                  <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-                    <path
-                      fill="currentColor"
-                      d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"
-                    />
-                  </svg>
-                </button>
+                <>
+                  {!editingMessage ? (
+                    <button
+                      className={`composer-schedule${scheduleOpen ? ' active' : ''}`}
+                      type="button"
+                      aria-label="Schedule message"
+                      title="Schedule message"
+                      aria-pressed={scheduleOpen}
+                      disabled={!composer.trim()}
+                      onClick={() => {
+                        setScheduleAt(defaultScheduleLocalValue());
+                        setScheduleOpen((open) => !open);
+                      }}
+                    >
+                      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                        <path
+                          fill="currentColor"
+                          d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 11h4v-2h-3V7h-2z"
+                        />
+                      </svg>
+                    </button>
+                  ) : null}
+                  <button
+                    className="composer-send"
+                    type="submit"
+                    aria-label={editingMessage ? 'Save edit' : 'Send message'}
+                    title={editingMessage ? 'Save' : 'Send'}
+                    disabled={editingMessage ? !composer.trim() : !composer.trim()}
+                  >
+                    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                      <path
+                        fill="currentColor"
+                        d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"
+                      />
+                    </svg>
+                  </button>
+                </>
               )}
             </div>
           </>
@@ -2990,6 +3503,21 @@ export function ThreadView() {
               <button className="ghost full" type="button" onClick={() => void toggleMute()}>
                 {conversation.muted ? 'Unmute conversation' : 'Mute conversation'}
               </button>
+              <label className="disappearing-field">
+                <span>Disappearing messages</span>
+                <select
+                  value={conversation.disappearingDurationSeconds ?? 0}
+                  onChange={(event) =>
+                    void setDisappearing(Number(event.target.value))
+                  }
+                >
+                  {DISAPPEARING_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <button
                 className="ghost full"
                 type="button"
@@ -3010,6 +3538,16 @@ export function ThreadView() {
               </button>
               <button className="danger full" type="button" onClick={() => void blockPeer()}>
                 Block user
+              </button>
+              <button
+                className="ghost full"
+                type="button"
+                onClick={() => {
+                  setDetails(false);
+                  navigate('/blocked');
+                }}
+              >
+                Manage blocked users
               </button>
             </div>
             {summary ? <pre className="thread-summary">{summary}</pre> : null}
@@ -3078,6 +3616,28 @@ export function ThreadView() {
               <button className="ghost full" type="button" onClick={() => void toggleMute()}>
                 {conversation.muted ? 'Unmute conversation' : 'Mute conversation'}
               </button>
+              {canManage ? (
+                <label className="disappearing-field">
+                  <span>Disappearing messages</span>
+                  <select
+                    value={conversation.disappearingDurationSeconds ?? 0}
+                    onChange={(event) =>
+                      void setDisappearing(Number(event.target.value))
+                    }
+                  >
+                    {DISAPPEARING_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                <p className="muted pad" style={{ margin: 0 }}>
+                  Disappearing messages:{' '}
+                  {disappearingLabel(conversation.disappearingDurationSeconds)}
+                </p>
+              )}
               <button
                 className="ghost full"
                 type="button"

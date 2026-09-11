@@ -8,6 +8,7 @@ import {
   getNotificationPermission,
   subscribeWebPush,
 } from '../lib/notifications';
+import { usePwaInstall } from '../hooks/usePwaInstall';
 import { resetDemoTour } from '../components/DemoTour';
 import type { UserProfile, WorkspaceSettings } from '../api/types';
 
@@ -31,6 +32,8 @@ export function ProfilePage() {
   const [busy, setBusy] = useState(false);
   const [notifyStatus, setNotifyStatus] = useState(() => getNotificationPermission());
   const [notifyHint, setNotifyHint] = useState('');
+  const [installHint, setInstallHint] = useState('');
+  const { canInstall, standalone, install } = usePwaInstall();
   const isAdmin = session?.user.role === 'admin';
   const [branding, setBranding] = useState<WorkspaceSettings | null>(null);
   const [brandingSaved, setBrandingSaved] = useState('');
@@ -381,6 +384,60 @@ export function ProfilePage() {
         </div>
       </section>
 
+      <section className="profile-sheet">
+        <header className="profile-sheet-head">
+          <h2>Install app</h2>
+          <p className="muted">
+            Add Relay to your home screen for a standalone window, faster launch, and offline shell.
+          </p>
+        </header>
+        <div className="profile-notify">
+          <div className="profile-notify-row">
+            <p className="profile-notify-status">
+              Status{' '}
+              <span
+                className={`notify-pill notify-pill-${
+                  standalone ? 'granted' : canInstall ? 'default' : 'denied'
+                }`}
+              >
+                {standalone ? 'Installed' : canInstall ? 'Available' : 'Not available'}
+              </span>
+            </p>
+            {canInstall ? (
+              <button
+                className="btn"
+                type="button"
+                onClick={() => {
+                  void install().then((outcome) => {
+                    if (outcome === 'accepted') {
+                      setInstallHint('Relay was added to this device.');
+                    } else if (outcome === 'dismissed') {
+                      setInstallHint('Install cancelled. You can try again anytime.');
+                    } else {
+                      setInstallHint(
+                        'Install is not available in this browser session. Use the browser menu → Install app.',
+                      );
+                    }
+                  });
+                }}
+              >
+                Install Relay
+              </button>
+            ) : null}
+          </div>
+          {installHint ? <p className="muted">{installHint}</p> : null}
+          {!canInstall && !standalone ? (
+            <p className="muted">
+              On supported browsers (Chrome / Edge on HTTPS or localhost), an install option appears
+              after the app loads. On iPhone, use Share → Add to Home Screen.
+            </p>
+          ) : null}
+          {standalone ? (
+            <p className="muted">You are already running Relay as an installed app.</p>
+          ) : null}
+        </div>
+      </section>
+
       {isAdmin && branding ? (
         <form className="profile-sheet" onSubmit={(event) => void saveBranding(event)}>
           <header className="profile-sheet-head profile-sheet-head-row">
@@ -502,6 +559,20 @@ export function ProfilePage() {
           </div>
         </section>
       ) : null}
+
+      <section className="profile-sheet profile-sheet-compact">
+        <header className="profile-sheet-head profile-sheet-head-row">
+          <div>
+            <h2>Blocked users</h2>
+            <p className="muted">
+              Review people you blocked and unblock them when you want to chat again.
+            </p>
+          </div>
+          <button className="btn ghost" type="button" onClick={() => navigate('/blocked')}>
+            Manage blocked
+          </button>
+        </header>
+      </section>
 
       <section className="profile-sheet profile-sheet-compact">
         <header className="profile-sheet-head profile-sheet-head-row">

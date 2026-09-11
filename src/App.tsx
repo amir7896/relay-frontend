@@ -12,6 +12,7 @@ import { LandingPage } from './pages/LandingPage';
 import { LoginPage } from './pages/LoginPage';
 import { PeoplePage } from './pages/PeoplePage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
+import { BlockedUsersPage } from './pages/BlockedUsersPage';
 import { ProfilePage } from './pages/ProfilePage';
 import { RegisterPage } from './pages/RegisterPage';
 import { ForgotPasswordPage } from './pages/ForgotPasswordPage';
@@ -42,6 +43,7 @@ export function App() {
                     <Route path=":id" element={<ThreadView />} />
                   </Route>
                   <Route path="/profile" element={<ProfilePage />} />
+                  <Route path="/blocked" element={<BlockedUsersPage />} />
                   <Route path="/people" element={<PeoplePage />} />
                   <Route path="/analytics" element={<AnalyticsPage />} />
                 </Route>
