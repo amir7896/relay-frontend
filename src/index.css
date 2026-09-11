@@ -1856,9 +1856,28 @@ html[data-theme='dark'] .wa-thread {
   color: var(--wa-tick-seen);
 }
 
+.wa-ticks.pending {
+  color: var(--wa-meta);
+}
+
+.wa-ticks.failed {
+  color: var(--danger, #e11d48);
+}
+
 .wa-ticks svg {
   display: block;
   max-width: none;
+}
+
+.msg-retry-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--danger, #e11d48);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0 4px;
 }
 
 .wa-typing {
@@ -1980,6 +1999,14 @@ html[data-theme='dark'] .wa-thread {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
+.msg-menu button.msg-menu-danger {
+  color: var(--danger);
+}
+
+.msg-menu button.msg-menu-danger:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
+
 .thread-tools {
   display: flex;
   align-items: center;
@@ -2073,6 +2100,22 @@ html[data-theme='dark'] .wa-thread {
   border-radius: 6px;
   overflow: hidden;
   max-width: 280px;
+  position: relative;
+}
+
+.wa-image-link.is-sending {
+  pointer-events: none;
+}
+
+.wa-image-send-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, #0b141a 45%, transparent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .wa-image {
@@ -3263,8 +3306,368 @@ body.nav-open {
   cursor: pointer;
 }
 
-.composer-voice.recording {
+.composer.voice-mode {
+  gap: 8px;
+}
+
+.voice-recorder {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  min-height: 42px;
+  padding: 4px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--danger, #e11d48) 10%, var(--bg-2));
+}
+
+.voice-recorder.preview {
+  background: color-mix(in srgb, var(--accent, #0d9488) 10%, var(--bg-2));
+}
+
+.voice-recorder-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+
+.voice-recorder-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--danger, #e11d48);
+  flex-shrink: 0;
+  animation: voice-pulse 1s ease-in-out infinite;
+}
+
+.voice-recorder-timer {
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  min-width: 2.5rem;
+}
+
+.voice-recorder-wave {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  overflow: hidden;
+}
+
+.voice-recorder-wave span {
+  display: block;
+  width: 3px;
+  height: 8px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--danger, #e11d48) 70%, var(--text));
+  animation: voice-bar 0.85s ease-in-out infinite alternate;
+}
+
+.voice-recorder-wave.static span {
+  animation: none;
+  background: color-mix(in srgb, var(--accent, #0d9488) 55%, var(--muted));
+}
+
+.voice-recorder-btn {
+  width: 40px;
+  height: 40px;
+  border: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.voice-recorder-btn.discard {
+  color: var(--danger, #e11d48);
+}
+
+.voice-recorder-btn.stop {
+  background: var(--danger, #e11d48);
+  color: #fff;
+}
+
+.voice-recorder-stop-icon {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+.voice-recorder-btn.play {
+  background: color-mix(in srgb, var(--accent, #0d9488) 18%, transparent);
+  color: var(--accent, #0d9488);
+  font-size: 12px;
+}
+
+.voice-recorder-btn.restart {
+  font-size: 20px;
+  color: var(--muted);
+}
+
+.voice-recorder-send {
+  height: 40px;
+  border-radius: 999px;
+  padding-inline: 16px;
+}
+
+@keyframes voice-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.85);
+  }
+}
+
+@keyframes voice-bar {
+  from {
+    height: 6px;
+  }
+  to {
+    height: 22px;
+  }
+}
+
+.voice-note {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: center;
+  width: min(280px, 100%);
+  margin: 2px 0 6px;
+  padding: 6px 4px 2px;
+}
+
+.voice-note-play {
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  box-shadow: none;
+  flex-shrink: 0;
+}
+
+.voice-note.theirs .voice-note-play {
+  background: color-mix(in srgb, var(--accent) 85%, #0b141a);
+  color: #042f2c;
+}
+
+.voice-note.mine .voice-note-play {
+  background: color-mix(in srgb, #ffffff 82%, var(--wa-mine));
+  color: #0b3d34;
+}
+
+html[data-theme='dark'] .voice-note.mine .voice-note-play {
+  background: color-mix(in srgb, #dff7ef 70%, transparent);
+  color: #06332b;
+}
+
+.voice-note-play:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.voice-note-play.sending {
+  opacity: 1;
+  background: transparent !important;
+  padding: 0;
+}
+
+.voice-note-send-ring {
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+}
+
+.voice-note-send-ring-inner {
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--wa-mine, #d9fdd3) 88%, #fff);
+}
+
+.voice-note.is-sending {
+  opacity: 0.95;
+}
+
+.voice-note.is-failed .voice-note-play {
+  background: color-mix(in srgb, var(--danger, #e11d48) 18%, transparent);
+  color: var(--danger, #e11d48);
+  opacity: 1;
+  cursor: pointer;
+}
+
+.voice-note-body {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.voice-note-scrub {
+  position: relative;
+  display: grid;
+  gap: 6px;
+  padding: 4px 2px 2px;
+  border-radius: 8px;
+  touch-action: none;
+  user-select: none;
+}
+
+.voice-note-scrub.is-seekable {
+  cursor: pointer;
+}
+
+.voice-note-scrub:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
+}
+
+.voice-note-wave {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 28px;
+  padding-inline: 2px;
+  pointer-events: none;
+}
+
+.voice-note-wave span {
+  flex: 1;
+  min-width: 2px;
+  border-radius: 99px;
+  background: color-mix(in srgb, currentColor 28%, transparent);
+  transition: background 0.15s ease;
+}
+
+.voice-note-wave span.is-played {
+  background: color-mix(in srgb, currentColor 78%, transparent);
+}
+
+.voice-note.mine {
+  color: var(--wa-mine-text);
+}
+
+.voice-note.theirs {
+  color: var(--wa-theirs-text);
+}
+
+.voice-note-track {
+  position: relative;
+  height: 3px;
+  border-radius: 99px;
+  background: color-mix(in srgb, currentColor 24%, transparent);
+  pointer-events: none;
+}
+
+.voice-note-track-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: color-mix(in srgb, currentColor 70%, transparent);
+}
+
+.voice-note-thumb {
+  position: absolute;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: currentColor;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--panel, #fff) 55%, transparent);
+}
+
+.voice-note-scrub.is-seekable:hover .voice-note-thumb,
+.voice-note-scrub.is-seekable:active .voice-note-thumb {
+  transform: translate(-50%, -50%) scale(1.15);
+}
+
+.voice-note-seek {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  appearance: none;
+  background: transparent;
+  height: 14px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.voice-note-seek::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 99px;
+  background: color-mix(in srgb, currentColor 24%, transparent);
+}
+
+.voice-note-seek::-webkit-slider-thumb {
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  margin-top: -4.5px;
+  border-radius: 50%;
+  background: currentColor;
+  border: 0;
+}
+
+.voice-note-seek::-moz-range-track {
+  height: 3px;
+  border-radius: 99px;
+  background: color-mix(in srgb, currentColor 24%, transparent);
+}
+
+.voice-note-seek::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: currentColor;
+  border: 0;
+}
+
+.voice-note-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  opacity: 0.8;
+  font-variant-numeric: tabular-nums;
+}
+
+.voice-note-error {
   color: var(--danger);
+  opacity: 1;
+}
+
+.voice-note.is-error .voice-note-wave span {
+  background: color-mix(in srgb, var(--danger) 35%, transparent);
 }
 
 .wa-audio {

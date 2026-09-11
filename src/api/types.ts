@@ -98,6 +98,10 @@ export type ChatMessage = {
   deletedForEveryone: boolean;
   seenBy: string[];
   createdAt: string;
+  /** Client-only: optimistic send state for attachments */
+  sendStatus?: 'uploading' | 'sending' | 'failed';
+  /** Client-only: 0–100 while uploading */
+  uploadProgress?: number;
 };
 
 export type Conversation = {

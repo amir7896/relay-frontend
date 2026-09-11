@@ -8,6 +8,10 @@ import { Modal } from '../../components/Modal';
 import { MessageTicks } from '../../components/MessageTicks';
 import { PeoplePicker } from '../../components/PeoplePicker';
 import {
+  resolveMediaUrl,
+  VoiceNotePlayer,
+} from '../../components/VoiceNotePlayer';
+import {
   clock,
   conversationTitle,
   displayName,
@@ -36,9 +40,18 @@ import type {
 } from '../../api/types';
 import type { MessengerOutletContext } from './MessengerPage';
 
-const DELETE_FOR_EVERYONE_MS = 60 * 60 * 1000;
+const DELETE_FOR_EVERYONE_MS = Number.POSITIVE_INFINITY;
 const EDIT_WINDOW_MS = 15 * 60 * 1000;
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'] as const;
+
+type VoicePhase = 'idle' | 'recording' | 'preview';
+
+function formatRecordingClock(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = totalSec % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
 
 function normalizeMessage(message: ChatMessage): ChatMessage {
   return {
@@ -61,6 +74,92 @@ function upsertMessage(current: ChatMessage[], payload: ChatMessage): ChatMessag
   const copy = [...current];
   copy[index] = next;
   return copy;
+}
+
+function isPendingMessage(message: ChatMessage): boolean {
+  return Boolean(message.sendStatus);
+}
+
+function revokeAttachmentBlob(message: ChatMessage) {
+  const url = message.attachment?.url;
+  if (url?.startsWith('blob:')) {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function replacePendingWithServer(
+  current: ChatMessage[],
+  pendingId: string,
+  serverMessage: ChatMessage,
+): ChatMessage[] {
+  const pending = current.find((item) => item.id === pendingId);
+  if (pending) {
+    revokeAttachmentBlob(pending);
+  }
+  const withoutPending = current.filter((item) => item.id !== pendingId);
+  return upsertMessage(withoutPending, serverMessage);
+}
+
+function consumeMatchingPending(
+  current: ChatMessage[],
+  serverMessage: ChatMessage,
+  myUserId: string | undefined,
+): ChatMessage[] {
+  if (!myUserId || serverMessage.senderId !== myUserId || isPendingMessage(serverMessage)) {
+    return upsertMessage(current, serverMessage);
+  }
+  const pendingIndex = current.findIndex(
+    (item) =>
+      item.sendStatus &&
+      item.sendStatus !== 'failed' &&
+      item.senderId === myUserId &&
+      item.type === serverMessage.type,
+  );
+  if (pendingIndex === -1) {
+    return upsertMessage(current, serverMessage);
+  }
+  return replacePendingWithServer(current, current[pendingIndex].id, serverMessage);
+}
+
+async function uploadFileWithProgress(
+  file: File,
+  onProgress: (percent: number) => void,
+): Promise<{ url: string; mime: string; name: string; size: number }> {
+  const token = getAccessToken();
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/chat/uploads');
+    if (token) {
+      xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    }
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) {
+        return;
+      }
+      onProgress(Math.round((event.loaded / event.total) * 100));
+    };
+    xhr.onload = () => {
+      try {
+        const payload = JSON.parse(xhr.responseText) as {
+          data?: { url: string; mime: string; name: string; size: number };
+          message?: string;
+        };
+        if (xhr.status >= 200 && xhr.status < 300 && payload.data) {
+          onProgress(100);
+          resolve(payload.data);
+          return;
+        }
+        reject(new Error(payload.message ?? 'Upload failed'));
+      } catch {
+        reject(new Error('Upload failed'));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Upload failed'));
+    xhr.onabort = () => reject(new Error('Upload cancelled'));
+    const form = new FormData();
+    form.append('file', file);
+    xhr.send(form);
+  });
 }
 
 export function ThreadView() {
@@ -96,10 +195,20 @@ export function ThreadView() {
   const [pendingLinkPreview, setPendingLinkPreview] = useState<LinkPreview | null>(null);
   const [summary, setSummary] = useState('');
   const [summaryBusy, setSummaryBusy] = useState(false);
-  const [recording, setRecording] = useState(false);
+  const [voicePhase, setVoicePhase] = useState<VoicePhase>('idle');
+  const [recordingMs, setRecordingMs] = useState(0);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewFile, setPreviewFile] = useState<File | null>(null);
+  const [previewPlaying, setPreviewPlaying] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const recordingStartedAtRef = useRef(0);
+  const discardOnStopRef = useRef(false);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+  const previewUrlRef = useRef<string | null>(null);
   const scroller = useRef<HTMLDivElement | null>(null);
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const { joinConversation, subscribe, emit } = useChatSocket();
@@ -232,6 +341,11 @@ export function ThreadView() {
     setSearchQuery('');
     setSearchResults([]);
     setHighlightId(null);
+    setMessages((current) => {
+      current.forEach(revokeAttachmentBlob);
+      return [];
+    });
+    resetVoiceSession();
     void load().catch((err: unknown) => {
       setLoading(false);
       setConversation(null);
@@ -247,7 +361,7 @@ export function ThreadView() {
         if (message.conversationId !== id) {
           return;
         }
-        setMessages((current) => upsertMessage(current, message));
+        setMessages((current) => consumeMatchingPending(current, message, me));
         clearUnread(id);
         void api(`/chat/conversations/${id}/seen`, {
           method: 'POST',
@@ -389,6 +503,21 @@ export function ThreadView() {
   }, [messages.length, typing]);
 
   useEffect(() => {
+    return () => {
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
+      }
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+      if (previewUrlRef.current) {
+        URL.revokeObjectURL(previewUrlRef.current);
+        previewUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
     if (!searchOpen || !searchQuery.trim()) {
       setSearchResults([]);
       return;
@@ -491,15 +620,67 @@ export function ThreadView() {
     setComposer(next);
   }
 
-  async function toggleRecording() {
-    if (recording) {
-      mediaRecorderRef.current?.stop();
-      setRecording(false);
-      return;
+  function clearRecordingTimer() {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current);
+      recordingTimerRef.current = null;
     }
+  }
+
+  function stopMediaStream() {
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+  }
+
+  function revokePreviewUrl() {
+    if (previewUrlRef.current) {
+      URL.revokeObjectURL(previewUrlRef.current);
+      previewUrlRef.current = null;
+    }
+    setPreviewUrl(null);
+  }
+
+  function resetVoiceSession() {
+    clearRecordingTimer();
+    stopMediaStream();
+    mediaRecorderRef.current = null;
+    audioChunksRef.current = [];
+    discardOnStopRef.current = false;
+    if (previewAudioRef.current) {
+      previewAudioRef.current.pause();
+      previewAudioRef.current.currentTime = 0;
+    }
+    revokePreviewUrl();
+    setPreviewFile(null);
+    setPreviewPlaying(false);
+    setRecordingMs(0);
+    setVoicePhase('idle');
+  }
+
+  async function startVoiceRecording() {
     try {
+      setActionError('');
+      revokePreviewUrl();
+      setPreviewFile(null);
+      setPreviewPlaying(false);
+      discardOnStopRef.current = false;
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
+      mediaStreamRef.current = stream;
+      const preferredMime = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus',
+        'audio/mp4',
+      ].find((type) =>
+        typeof MediaRecorder !== 'undefined' &&
+        typeof MediaRecorder.isTypeSupported === 'function'
+          ? MediaRecorder.isTypeSupported(type)
+          : false,
+      );
+      const recorder = preferredMime
+        ? new MediaRecorder(stream, { mimeType: preferredMime })
+        : new MediaRecorder(stream);
       audioChunksRef.current = [];
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
@@ -507,44 +688,185 @@ export function ThreadView() {
         }
       };
       recorder.onstop = () => {
-        stream.getTracks().forEach((track) => track.stop());
-        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-        const file = new File([blob], `voice-${Date.now()}.webm`, {
-          type: blob.type,
+        stopMediaStream();
+        clearRecordingTimer();
+        mediaRecorderRef.current = null;
+        if (discardOnStopRef.current) {
+          discardOnStopRef.current = false;
+          audioChunksRef.current = [];
+          setRecordingMs(0);
+          setVoicePhase('idle');
+          return;
+        }
+        const mimeType = (recorder.mimeType || 'audio/webm').split(';')[0];
+        const safeMime =
+          mimeType.startsWith('audio/') || mimeType === 'video/webm'
+            ? mimeType === 'video/webm'
+              ? 'audio/webm'
+              : mimeType
+            : 'audio/webm';
+        const blob = new Blob(audioChunksRef.current, { type: safeMime });
+        if (blob.size === 0) {
+          setVoicePhase('idle');
+          setRecordingMs(0);
+          setActionError('Recording was empty — try again');
+          return;
+        }
+        const extension = safeMime.includes('ogg')
+          ? 'ogg'
+          : safeMime.includes('mp4')
+            ? 'm4a'
+            : 'webm';
+        const file = new File([blob], `voice-${Date.now()}.${extension}`, {
+          type: safeMime,
         });
-        void uploadAndSend(file, 'audio');
+        const objectUrl = URL.createObjectURL(blob);
+        previewUrlRef.current = objectUrl;
+        setPreviewFile(file);
+        setPreviewUrl(objectUrl);
+        setVoicePhase('preview');
       };
       mediaRecorderRef.current = recorder;
-      recorder.start();
-      setRecording(true);
+      recorder.start(250);
+      recordingStartedAtRef.current = Date.now();
+      setRecordingMs(0);
+      clearRecordingTimer();
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingMs(Date.now() - recordingStartedAtRef.current);
+      }, 200);
+      setVoicePhase('recording');
     } catch {
+      resetVoiceSession();
       setActionError('Microphone access is required for voice notes');
     }
   }
 
+  function stopVoiceRecording() {
+    if (voicePhase !== 'recording') {
+      return;
+    }
+    discardOnStopRef.current = false;
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== 'inactive') {
+      recorder.stop();
+    }
+  }
+
+  function discardVoice() {
+    if (voicePhase === 'recording') {
+      discardOnStopRef.current = true;
+      const recorder = mediaRecorderRef.current;
+      if (recorder && recorder.state !== 'inactive') {
+        recorder.stop();
+      } else {
+        resetVoiceSession();
+      }
+      return;
+    }
+    resetVoiceSession();
+  }
+
+  async function restartVoiceRecording() {
+    resetVoiceSession();
+    await startVoiceRecording();
+  }
+
+  async function sendVoicePreview() {
+    if (!previewFile) {
+      return;
+    }
+    const file = previewFile;
+    resetVoiceSession();
+    await uploadAndSend(file, 'audio');
+  }
+
+  function togglePreviewPlayback() {
+    const audio = previewAudioRef.current;
+    if (!audio || !previewUrl) {
+      return;
+    }
+    if (previewPlaying) {
+      audio.pause();
+      setPreviewPlaying(false);
+      return;
+    }
+    void audio.play().then(() => setPreviewPlaying(true)).catch(() => {
+      setPreviewPlaying(false);
+    });
+  }
+
   async function uploadAndSend(file: File, kind: 'image' | 'audio' = 'image') {
+    if (!me) {
+      setActionError('You must be signed in to send media');
+      return;
+    }
+
+    const clientId =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? `local-${crypto.randomUUID()}`
+        : `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const localUrl = URL.createObjectURL(file);
+    const caption = composer.trim();
+    const replySnapshot = replyTo;
+    const pendingMessage: ChatMessage = {
+      id: clientId,
+      conversationId: id,
+      senderId: me,
+      body: caption || (kind === 'audio' ? '[Voice note]' : '[Image]'),
+      type: kind,
+      replyTo: replySnapshot
+        ? {
+            id: replySnapshot.id,
+            senderId: replySnapshot.senderId,
+            body: replySnapshot.deletedForEveryone
+              ? ''
+              : replySnapshot.body,
+            deletedForEveryone: replySnapshot.deletedForEveryone,
+          }
+        : null,
+      attachment: {
+        url: localUrl,
+        mime: file.type || (kind === 'audio' ? 'audio/webm' : 'image/jpeg'),
+        name: file.name,
+        size: file.size,
+      },
+      mentions: [],
+      linkPreview: null,
+      reactions: [],
+      editedAt: null,
+      forwarded: false,
+      deletedForEveryone: false,
+      seenBy: [],
+      createdAt: new Date().toISOString(),
+      sendStatus: 'uploading',
+      uploadProgress: 0,
+    };
+
+    setMessages((current) => [...current, pendingMessage]);
     setUploading(true);
     setActionError('');
+    setComposer('');
+    clearMessageDraft(id);
+    setReplyTo(null);
+    setEditingMessage(null);
+
+    const updatePending = (patch: Partial<ChatMessage>) => {
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === clientId ? { ...item, ...patch } : item,
+        ),
+      );
+    };
+
     try {
-      const form = new FormData();
-      form.append('file', file);
-      const token = getAccessToken();
-      const uploadResponse = await fetch('/api/chat/uploads', {
-        method: 'POST',
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
-        body: form,
+      const attachment = await uploadFileWithProgress(file, (percent) => {
+        updatePending({
+          sendStatus: 'uploading',
+          uploadProgress: percent,
+        });
       });
-      const uploadPayload = (await uploadResponse.json().catch(() => null)) as
-        | {
-            data?: { url: string; mime: string; name: string; size: number };
-            message?: string;
-          }
-        | null;
-      if (!uploadResponse.ok || !uploadPayload?.data) {
-        throw new Error(uploadPayload?.message ?? 'Upload failed');
-      }
-      const attachment = uploadPayload.data;
-      const caption = composer.trim();
+      updatePending({ sendStatus: 'sending', uploadProgress: 100 });
+
       const response = await api<ChatMessage>(`/chat/conversations/${id}/messages`, {
         method: 'POST',
         body: JSON.stringify({
@@ -554,21 +876,46 @@ export function ThreadView() {
           attachmentMime: attachment.mime,
           attachmentName: attachment.name,
           attachmentSize: attachment.size,
-          replyToMessageId: replyTo?.id,
+          replyToMessageId: replySnapshot?.id,
         }),
       });
-      setMessages((current) => upsertMessage(current, response.data));
-      setComposer('');
-      clearMessageDraft(id);
-      setReplyTo(null);
-      setEditingMessage(null);
+      setMessages((current) =>
+        replacePendingWithServer(current, clientId, response.data),
+      );
     } catch (err) {
+      updatePending({ sendStatus: 'failed', uploadProgress: 0 });
       setActionError(err instanceof Error ? err.message : 'Could not upload file');
     } finally {
       setUploading(false);
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
+    }
+  }
+
+  async function retryPendingMessage(message: ChatMessage) {
+    if (message.sendStatus !== 'failed' || !message.attachment) {
+      return;
+    }
+    try {
+      const response = await fetch(message.attachment.url);
+      const blob = await response.blob();
+      const file = new File([blob], message.attachment.name || 'voice.webm', {
+        type: message.attachment.mime || blob.type || 'audio/webm',
+      });
+      setMessages((current) => {
+        const pending = current.find((item) => item.id === message.id);
+        if (pending) {
+          revokeAttachmentBlob(pending);
+        }
+        return current.filter((item) => item.id !== message.id);
+      });
+      await uploadAndSend(
+        file,
+        message.type === 'audio' ? 'audio' : 'image',
+      );
+    } catch {
+      setActionError('Could not retry sending');
     }
   }
 
@@ -781,14 +1128,27 @@ export function ThreadView() {
   }
 
   function canDeleteForEveryone(message: ChatMessage) {
-    if (!me || message.senderId !== me || message.deletedForEveryone) {
+    if (
+      !me ||
+      message.senderId !== me ||
+      message.deletedForEveryone ||
+      isPendingMessage(message)
+    ) {
       return false;
+    }
+    if (!Number.isFinite(DELETE_FOR_EVERYONE_MS)) {
+      return true;
     }
     return Date.now() - new Date(message.createdAt).getTime() < DELETE_FOR_EVERYONE_MS;
   }
 
   function canEdit(message: ChatMessage) {
-    if (!me || message.senderId !== me || message.deletedForEveryone) {
+    if (
+      !me ||
+      message.senderId !== me ||
+      message.deletedForEveryone ||
+      isPendingMessage(message)
+    ) {
       return false;
     }
     return Date.now() - new Date(message.createdAt).getTime() < EDIT_WINDOW_MS;
@@ -923,20 +1283,25 @@ export function ThreadView() {
         ) : null}
         {messages.map((message) => {
           const mine = message.senderId === me;
+          const pending = isPendingMessage(message);
           const seen = Boolean(
-            mine && me && message.seenBy.some((userId) => userId !== me),
+            mine && me && !pending && message.seenBy.some((userId) => userId !== me),
           );
-          const menuOpen = menuMessageId === message.id;
+          const menuOpen = !pending && menuMessageId === message.id;
           const showImage =
             !message.deletedForEveryone &&
             message.attachment &&
             (message.type === 'image' ||
-              message.attachment.mime.startsWith('image/'));
+              message.attachment.mime.startsWith('image/')) &&
+            message.type !== 'audio';
           const showAudio =
             !message.deletedForEveryone &&
             message.attachment &&
             (message.type === 'audio' ||
-              message.attachment.mime.startsWith('audio/'));
+              message.attachment.mime.startsWith('audio/') ||
+              // Chrome sometimes records audio-only MediaRecorder blobs as video/webm
+              (message.type === 'audio' &&
+                message.attachment.mime.startsWith('video/')));
           const caption =
             message.body && !isPlaceholderBody(message.body) ? message.body : null;
           const bodyParts = caption
@@ -952,7 +1317,7 @@ export function ThreadView() {
               key={message.id}
               className={`${mine ? 'wa-row mine' : 'wa-row theirs'}${
                 highlightId === message.id ? ' highlight' : ''
-              }`}
+              }${pending ? ' is-pending' : ''}`}
               ref={(node) => {
                 if (node) {
                   messageRefs.current.set(message.id, node);
@@ -964,6 +1329,9 @@ export function ThreadView() {
               <div
                 className={mine ? 'wa-bubble mine' : 'wa-bubble theirs'}
                 onContextMenu={(event) => {
+                  if (pending) {
+                    return;
+                  }
                   event.preventDefault();
                   setMenuMessageId(message.id);
                   setReactPickerId(null);
@@ -997,25 +1365,45 @@ export function ThreadView() {
                   <>
                     {showImage && message.attachment ? (
                       <a
-                        className="wa-image-link"
-                        href={message.attachment.url}
+                        className={`wa-image-link${pending ? ' is-sending' : ''}`}
+                        href={resolveMediaUrl(message.attachment.url)}
                         target="_blank"
                         rel="noreferrer"
+                        onClick={(event) => {
+                          if (pending) {
+                            event.preventDefault();
+                          }
+                        }}
                       >
                         <img
                           className="wa-image"
-                          src={message.attachment.url}
+                          src={resolveMediaUrl(message.attachment.url)}
                           alt={message.attachment.name || 'Image'}
                           loading="lazy"
                         />
+                        {pending ? (
+                          <span className="wa-image-send-overlay">
+                            {message.sendStatus === 'failed'
+                              ? 'Failed'
+                              : message.sendStatus === 'uploading'
+                                ? `${Math.round(message.uploadProgress ?? 0)}%`
+                                : 'Sending…'}
+                          </span>
+                        ) : null}
                       </a>
                     ) : null}
                     {showAudio && message.attachment ? (
-                      <audio
-                        className="wa-audio"
-                        controls
-                        preload="metadata"
+                      <VoiceNotePlayer
                         src={message.attachment.url}
+                        mime={message.attachment.mime}
+                        mine={mine}
+                        sendStatus={message.sendStatus}
+                        uploadProgress={message.uploadProgress}
+                        onRetry={
+                          message.sendStatus === 'failed'
+                            ? () => void retryPendingMessage(message)
+                            : undefined
+                        }
                       />
                     ) : null}
                     {caption ? (
@@ -1052,7 +1440,9 @@ export function ThreadView() {
                     ) : null}
                   </>
                 )}
-                {!message.deletedForEveryone && message.reactions.length > 0 ? (
+                {!pending &&
+                !message.deletedForEveryone &&
+                message.reactions.length > 0 ? (
                   <div className="wa-reactions">
                     {message.reactions.map((reaction) => (
                       <button
@@ -1072,22 +1462,43 @@ export function ThreadView() {
                   </div>
                 ) : null}
                 <span className="wa-meta">
-                  <button
-                    className="msg-menu-btn"
-                    type="button"
-                    aria-label="Message actions"
-                    onClick={() => {
-                      setReactPickerId(null);
-                      setMenuMessageId((current) =>
-                        current === message.id ? null : message.id,
-                      );
-                    }}
-                  >
-                    ⋮
-                  </button>
+                  {!pending ? (
+                    <button
+                      className="msg-menu-btn"
+                      type="button"
+                      aria-label="Message actions"
+                      onClick={() => {
+                        setReactPickerId(null);
+                        setMenuMessageId((current) =>
+                          current === message.id ? null : message.id,
+                        );
+                      }}
+                    >
+                      ⋮
+                    </button>
+                  ) : message.sendStatus === 'failed' ? (
+                    <button
+                      className="msg-retry-btn"
+                      type="button"
+                      onClick={() => void retryPendingMessage(message)}
+                    >
+                      Retry
+                    </button>
+                  ) : null}
                   {message.editedAt ? <span className="wa-edited">edited</span> : null}
                   <time dateTime={message.createdAt}>{clock(message.createdAt)}</time>
-                  {mine ? <MessageTicks seen={seen} /> : null}
+                  {mine ? (
+                    <MessageTicks
+                      seen={seen}
+                      status={
+                        message.sendStatus === 'failed'
+                          ? 'failed'
+                          : message.sendStatus
+                            ? 'pending'
+                            : 'sent'
+                      }
+                    />
+                  ) : null}
                 </span>
                 {reactPickerId === message.id ? (
                   <div className="reaction-picker">
@@ -1142,10 +1553,14 @@ export function ThreadView() {
                       </>
                     ) : null}
                     <button type="button" onClick={() => void deleteMessage(message, false)}>
-                      Delete for me
+                      {mine ? 'Delete for me only' : 'Delete for me'}
                     </button>
                     {canDeleteForEveryone(message) ? (
-                      <button type="button" onClick={() => void deleteMessage(message, true)}>
+                      <button
+                        type="button"
+                        className="msg-menu-danger"
+                        onClick={() => void deleteMessage(message, true)}
+                      >
                         Delete for everyone
                       </button>
                     ) : null}
@@ -1225,73 +1640,202 @@ export function ThreadView() {
       ) : null}
 
       <form
-        className={`composer${editingMessage ? ' edit-mode' : ''}`}
-        onSubmit={(event) => void send(event)}
+        className={`composer${editingMessage ? ' edit-mode' : ''}${
+          voicePhase !== 'idle' ? ' voice-mode' : ''
+        }`}
+        onSubmit={(event) => {
+          if (voicePhase !== 'idle') {
+            event.preventDefault();
+            return;
+          }
+          void send(event);
+        }}
       >
-        {!editingMessage ? (
+        {voicePhase === 'recording' ? (
+          <div className="voice-recorder" role="status" aria-live="polite">
+            <button
+              type="button"
+              className="voice-recorder-btn discard"
+              aria-label="Discard recording"
+              title="Discard"
+              onClick={discardVoice}
+            >
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                <path
+                  d="M5 7h14M10 7V5h4v2m-6 3v8m4-8v8M7 7l1 12h8l1-12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+            <div className="voice-recorder-main">
+              <span className="voice-recorder-dot" aria-hidden="true" />
+              <span className="voice-recorder-timer">
+                {formatRecordingClock(recordingMs)}
+              </span>
+              <div className="voice-recorder-wave" aria-hidden="true">
+                {Array.from({ length: 28 }, (_, index) => (
+                  <span
+                    key={index}
+                    style={{ animationDelay: `${(index % 8) * 0.08}s` }}
+                  />
+                ))}
+              </div>
+            </div>
+            <button
+              type="button"
+              className="voice-recorder-btn stop"
+              aria-label="Stop recording"
+              title="Stop"
+              onClick={stopVoiceRecording}
+            >
+              <span className="voice-recorder-stop-icon" />
+            </button>
+          </div>
+        ) : voicePhase === 'preview' ? (
+          <div className="voice-recorder preview" role="group" aria-label="Voice note preview">
+            <button
+              type="button"
+              className="voice-recorder-btn discard"
+              aria-label="Discard voice note"
+              title="Discard"
+              onClick={discardVoice}
+            >
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                <path
+                  d="M5 7h14M10 7V5h4v2m-6 3v8m4-8v8M7 7l1 12h8l1-12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+            <button
+              type="button"
+              className="voice-recorder-btn play"
+              aria-label={previewPlaying ? 'Pause preview' : 'Play preview'}
+              title={previewPlaying ? 'Pause' : 'Play'}
+              onClick={togglePreviewPlayback}
+            >
+              {previewPlaying ? '❚❚' : '▶'}
+            </button>
+            {previewUrl ? (
+              <audio
+                ref={previewAudioRef}
+                src={previewUrl}
+                preload="metadata"
+                onEnded={() => setPreviewPlaying(false)}
+                onPause={() => setPreviewPlaying(false)}
+              />
+            ) : null}
+            <div className="voice-recorder-main">
+              <div className="voice-recorder-wave static" aria-hidden="true">
+                {Array.from({ length: 28 }, (_, index) => (
+                  <span
+                    key={index}
+                    style={{
+                      height: `${10 + ((index * 7) % 14)}px`,
+                    }}
+                  />
+                ))}
+              </div>
+              <span className="voice-recorder-timer">
+                {formatRecordingClock(recordingMs)}
+              </span>
+            </div>
+            <button
+              type="button"
+              className="voice-recorder-btn restart"
+              aria-label="Record again"
+              title="Record again"
+              onClick={() => void restartVoiceRecording()}
+            >
+              ↻
+            </button>
+            <button
+              type="button"
+              className="btn voice-recorder-send"
+              aria-label="Send voice note"
+              title="Send"
+              disabled={uploading || !previewFile}
+              onClick={() => void sendVoicePreview()}
+            >
+              {uploading ? '…' : 'Send'}
+            </button>
+          </div>
+        ) : (
           <>
+            {!editingMessage ? (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/gif,image/webp"
+                  hidden
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) {
+                      void uploadAndSend(file);
+                    }
+                  }}
+                />
+                <button
+                  className="composer-attach"
+                  type="button"
+                  aria-label="Attach image"
+                  title="Attach image"
+                  disabled={uploading}
+                  onClick={() => fileInputRef.current?.click()}
+                >
+                  {uploading ? (
+                    <span className="composer-attach-busy">…</span>
+                  ) : (
+                    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                      <path
+                        d="M14.5 5.5 7.8 12.2a3.2 3.2 0 1 0 4.5 4.5l7.2-7.2a4.8 4.8 0 0 0-6.8-6.8L5.5 10a1.2 1.2 0 0 0 1.7 1.7l7.2-7.2"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.8"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </svg>
+                  )}
+                </button>
+                <button
+                  className="composer-voice"
+                  type="button"
+                  aria-label="Record voice note"
+                  title="Record voice note"
+                  disabled={uploading}
+                  onClick={() => void startVoiceRecording()}
+                >
+                  🎙
+                </button>
+              </>
+            ) : null}
             <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/jpeg,image/png,image/gif,image/webp"
-              hidden
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) {
-                  void uploadAndSend(file);
-                }
-              }}
+              value={composer}
+              onChange={(event) => setComposer(event.target.value)}
+              onFocus={() => void sendTyping(true)}
+              onBlur={() => void sendTyping(false)}
+              placeholder={editingMessage ? 'Edit message' : 'Write a message'}
+              autoComplete="off"
             />
             <button
-              className="composer-attach"
-              type="button"
-              aria-label="Attach image"
-              title="Attach image"
-              disabled={uploading || recording}
-              onClick={() => fileInputRef.current?.click()}
+              className="btn"
+              type="submit"
+              disabled={editingMessage ? !composer.trim() : !composer.trim()}
             >
-              {uploading ? (
-                <span className="composer-attach-busy">…</span>
-              ) : (
-                <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-                  <path
-                    d="M14.5 5.5 7.8 12.2a3.2 3.2 0 1 0 4.5 4.5l7.2-7.2a4.8 4.8 0 0 0-6.8-6.8L5.5 10a1.2 1.2 0 0 0 1.7 1.7l7.2-7.2"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.8"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  />
-                </svg>
-              )}
-            </button>
-            <button
-              className={`composer-voice${recording ? ' recording' : ''}`}
-              type="button"
-              aria-label={recording ? 'Stop recording' : 'Record voice note'}
-              title={recording ? 'Stop recording' : 'Record voice note'}
-              disabled={uploading}
-              onClick={() => void toggleRecording()}
-            >
-              {recording ? '■' : '🎙'}
+              {editingMessage ? 'Save' : 'Send'}
             </button>
           </>
-        ) : null}
-        <input
-          value={composer}
-          onChange={(event) => setComposer(event.target.value)}
-          onFocus={() => void sendTyping(true)}
-          onBlur={() => void sendTyping(false)}
-          placeholder={editingMessage ? 'Edit message' : 'Write a message'}
-          autoComplete="off"
-        />
-        <button
-          className="btn"
-          type="submit"
-          disabled={editingMessage ? !composer.trim() : !composer.trim()}
-        >
-          {editingMessage ? 'Save' : 'Send'}
-        </button>
+        )}
       </form>
 
       <Modal
