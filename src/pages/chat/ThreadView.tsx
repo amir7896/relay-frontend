@@ -1,13 +1,15 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useOutletContext, useParams } from 'react-router-dom';
+import { Link, useNavigate, useOutletContext, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../../api/client';
 import { getAccessToken } from '../../auth/session';
 import { useAuth } from '../../auth/AuthContext';
 import { useChatSocket } from '../../chat/ChatSocketContext';
 import { useVoiceCall } from '../../calls/VoiceCallContext';
 import { Modal } from '../../components/Modal';
+import { useConfirm } from '../../components/ConfirmProvider';
 import { MessageTicks } from '../../components/MessageTicks';
 import { PeoplePicker } from '../../components/PeoplePicker';
+import { UserAvatar } from '../../components/UserAvatar';
 import {
   resolveMediaUrl,
   VoiceNotePlayer,
@@ -36,12 +38,14 @@ import {
   getMessageDraft,
   setMessageDraft,
 } from '../../lib/messageDrafts';
+import { downloadMedia, openMedia as openAttachmentMedia } from '../../lib/downloadMedia';
 import { useDirectory } from '../../people/useDirectory';
 import type {
   ChatMessage,
   Conversation,
   LinkPreview,
   Paginated,
+  ScheduledMessage,
   SeenResult,
 } from '../../api/types';
 import type { MessengerOutletContext } from './MessengerPage';
@@ -51,6 +55,59 @@ const EDIT_WINDOW_MS = 15 * 60 * 1000;
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏'] as const;
 
 type VoicePhase = 'idle' | 'recording' | 'preview';
+
+function toDatetimeLocalValue(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function defaultScheduleLocalValue() {
+  return toDatetimeLocalValue(new Date(Date.now() + 5 * 60 * 1000));
+}
+
+function formatScheduleWhen(iso: string) {
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
+}
+type MediaKindTab = 'all' | 'image' | 'file' | 'audio';
+
+function mediaKindOf(message: ChatMessage): 'image' | 'file' | 'audio' {
+  const mime = message.attachment?.mime ?? '';
+  if (
+    message.type === 'audio' ||
+    mime.startsWith('audio/') ||
+    (message.type === 'audio' && mime.startsWith('video/'))
+  ) {
+    return 'audio';
+  }
+  if (message.type === 'image' || mime.startsWith('image/')) {
+    return 'image';
+  }
+  return 'file';
+}
+
+function mediaDownloadName(message: ChatMessage): string {
+  const attachment = message.attachment;
+  if (attachment?.name?.trim()) {
+    return attachment.name.trim();
+  }
+  const kind = mediaKindOf(message);
+  if (kind === 'image') {
+    return 'photo.jpg';
+  }
+  if (kind === 'audio') {
+    return 'voice-note.webm';
+  }
+  return 'file';
+}
 
 function formatRecordingClock(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
@@ -67,8 +124,28 @@ function normalizeMessage(message: ChatMessage): ChatMessage {
     mentions: message.mentions ?? [],
     linkPreview: message.linkPreview ?? null,
     editedAt: message.editedAt ?? null,
+    pinned: Boolean(message.pinned),
+    pinnedAt: message.pinnedAt ?? null,
+    pinnedByUserId: message.pinnedByUserId ?? null,
     forwarded: Boolean(message.forwarded),
+    undelivered: Boolean(message.undelivered),
+    expiresAt: message.expiresAt ?? null,
   };
+}
+
+const DISAPPEARING_OPTIONS: Array<{ value: number; label: string }> = [
+  { value: 0, label: 'Off' },
+  { value: 30, label: '30 seconds' },
+  { value: 60, label: '1 minute' },
+  { value: 3600, label: '1 hour' },
+  { value: 86_400, label: '24 hours' },
+  { value: 604_800, label: '7 days' },
+  { value: 7_776_000, label: '90 days' },
+];
+
+function disappearingLabel(seconds: number | undefined) {
+  const match = DISAPPEARING_OPTIONS.find((item) => item.value === (seconds ?? 0));
+  return match?.label ?? 'Off';
 }
 
 function upsertMessage(current: ChatMessage[], payload: ChatMessage): ChatMessage[] {
@@ -106,16 +183,66 @@ function replySnippet(message: {
   if (mime.startsWith('audio/') || message.type === 'audio') {
     return 'Voice message';
   }
+  if (message.type === 'file' || message.attachment) {
+    return message.attachment?.name || 'File';
+  }
   if (message.type === 'call') {
     return 'Call';
   }
-  if (message.attachment) {
-    return message.attachment.name || 'Attachment';
-  }
-  if (message.type === 'image') {
-    return 'Photo';
-  }
   return body || 'Message';
+}
+
+function formatFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '';
+  }
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function fileKindFromMime(mime: string, name = ''): 'image' | 'audio' | 'file' {
+  if (mime.startsWith('image/')) {
+    return 'image';
+  }
+  if (mime.startsWith('audio/') || mime === 'video/webm') {
+    return 'audio';
+  }
+  const lower = name.toLowerCase();
+  if (/\.(jpe?g|png|gif|webp)$/.test(lower)) {
+    return 'image';
+  }
+  if (/\.(webm|ogg|mp3|m4a|wav)$/.test(lower)) {
+    return 'audio';
+  }
+  return 'file';
+}
+
+function fileExtLabel(name: string, mime: string): string {
+  const fromName = name.includes('.') ? name.split('.').pop()!.toUpperCase() : '';
+  if (fromName && fromName.length <= 5) {
+    return fromName;
+  }
+  if (mime === 'application/pdf') {
+    return 'PDF';
+  }
+  if (mime.includes('word') || mime.includes('document')) {
+    return 'DOC';
+  }
+  if (mime.includes('sheet') || mime.includes('excel')) {
+    return 'XLS';
+  }
+  if (mime.includes('presentation') || mime.includes('powerpoint')) {
+    return 'PPT';
+  }
+  if (mime.includes('zip') || mime.includes('rar')) {
+    return 'ZIP';
+  }
+  return 'FILE';
 }
 
 function revokeAttachmentBlob(message: ChatMessage) {
@@ -202,9 +329,12 @@ async function uploadFileWithProgress(
 
 export function ThreadView() {
   const { id = '' } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const focusMessageId = searchParams.get('focus');
   const { session } = useAuth();
   const me = session?.user.id;
   const navigate = useNavigate();
+  const confirmDialog = useConfirm();
   const { clearUnread, refreshInbox, conversations } =
     useOutletContext<MessengerOutletContext>();
   const { people, byUserId, ensureProfiles } = useDirectory();
@@ -222,13 +352,27 @@ export function ThreadView() {
   const [reactPickerId, setReactPickerId] = useState<string | null>(null);
   const [forwardMessage, setForwardMessage] = useState<ChatMessage | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
+  const [pinnedMessages, setPinnedMessages] = useState<ChatMessage[]>([]);
+  const [pinnedBannerOpen, setPinnedBannerOpen] = useState(false);
+  const [mediaOpen, setMediaOpen] = useState(false);
+  const [mediaKind, setMediaKind] = useState<MediaKindTab>('all');
+  const [mediaItems, setMediaItems] = useState<ChatMessage[]>([]);
+  const [mediaBusy, setMediaBusy] = useState(false);
+  const [mediaPage, setMediaPage] = useState(1);
+  const [mediaHasMore, setMediaHasMore] = useState(false);
+  const [mediaDownloadingId, setMediaDownloadingId] = useState<string | null>(null);
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
   const toolsMenuRef = useRef<HTMLDivElement | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<ChatMessage[]>([]);
   const [searchBusy, setSearchBusy] = useState(false);
   const [highlightId, setHighlightId] = useState<string | null>(null);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [scheduleAt, setScheduleAt] = useState(defaultScheduleLocalValue);
+  const [scheduledMessages, setScheduledMessages] = useState<ScheduledMessage[]>([]);
+  const [scheduleBusy, setScheduleBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasOlder, setHasOlder] = useState(false);
   const [messagePage, setMessagePage] = useState(1);
@@ -241,6 +385,8 @@ export function ThreadView() {
   const [previewFile, setPreviewFile] = useState<File | null>(null);
   const [previewPlaying, setPreviewPlaying] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const docInputRef = useRef<HTMLInputElement | null>(null);
+  const attachMenuRef = useRef<HTMLDivElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -254,6 +400,15 @@ export function ThreadView() {
   const touchStartRef = useRef<{ x: number; y: number; id: string } | null>(null);
   const scroller = useRef<HTMLDivElement | null>(null);
   const messageRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const scheduledMessagesRef = useRef(scheduledMessages);
+  scheduledMessagesRef.current = scheduledMessages;
+  const hasOlderRef = useRef(hasOlder);
+  hasOlderRef.current = hasOlder;
+  const messagePageRef = useRef(messagePage);
+  messagePageRef.current = messagePage;
+  const focusBusyRef = useRef(false);
   const { joinConversation, leaveConversation, subscribe, emit } = useChatSocket();
   const {
     phase: callPhase,
@@ -355,21 +510,65 @@ export function ThreadView() {
     return history;
   }
 
+  async function loadPinned() {
+    try {
+      const response = await api<ChatMessage[]>(
+        `/chat/conversations/${id}/pinned-messages`,
+      );
+      setPinnedMessages(response.data.map(normalizeMessage));
+    } catch {
+      setPinnedMessages([]);
+    }
+  }
+
+  async function loadScheduled() {
+    try {
+      const response = await api<ScheduledMessage[]>(
+        `/chat/conversations/${id}/scheduled-messages`,
+      );
+      setScheduledMessages(response.data.filter((item) => item.status === 'pending'));
+    } catch {
+      setScheduledMessages([]);
+    }
+  }
+
+  useEffect(() => {
+    if (scheduledMessages.length === 0 || !id) {
+      return;
+    }
+    void loadScheduled();
+    const timer = window.setInterval(() => {
+      void loadScheduled();
+    }, 8_000);
+    return () => window.clearInterval(timer);
+  }, [id, scheduledMessages.length]);
+
   async function load() {
     setLoading(true);
     setConversation(null);
     setMessages([]);
+    setPinnedMessages([]);
+    setPinnedBannerOpen(false);
+    setScheduledMessages([]);
+    setScheduleOpen(false);
     setSummary('');
     const conv = await api<Conversation>(`/chat/conversations/${id}`);
     await loadHistory(1, false);
+    void loadPinned();
+    void loadScheduled();
     setConversation({
       ...conv.data,
       muted: Boolean(conv.data.muted),
       pinned: Boolean(conv.data.pinned),
+      blockedByMe: Boolean(conv.data.blockedByMe),
+      blockedMe: Boolean(conv.data.blockedMe),
     });
     setLoading(false);
     clearUnread(id);
-    void ensureProfiles(conv.data.members.map((member) => member.userId));
+    void ensureProfiles(
+      conv.data.members.map((member) => member.userId),
+      { refresh: true },
+    );
     if (conv.data.type === 'group') {
       void refreshLobby(id);
     }
@@ -414,6 +613,14 @@ export function ThreadView() {
     setSearchOpen(false);
     setSearchQuery('');
     setSearchResults([]);
+    setPinnedMessages([]);
+    setPinnedBannerOpen(false);
+    setMediaOpen(false);
+    setMediaKind('all');
+    setMediaItems([]);
+    setMediaPage(1);
+    setMediaHasMore(false);
+    setMediaDownloadingId(null);
     setHighlightId(null);
     setMessages((current) => {
       current.forEach(revokeAttachmentBlob);
@@ -435,7 +642,21 @@ export function ThreadView() {
         if (message.conversationId !== id) {
           return;
         }
-        setMessages((current) => consumeMatchingPending(current, message, me));
+        const normalized = normalizeMessage(message);
+        setMessages((current) => consumeMatchingPending(current, normalized, me));
+        setPinnedMessages((current) => {
+          const without = current.filter((item) => item.id !== normalized.id);
+          if (normalized.pinned && !normalized.deletedForEveryone) {
+            return [normalized, ...without].sort((a, b) =>
+              (b.pinnedAt ?? '').localeCompare(a.pinnedAt ?? ''),
+            );
+          }
+          return without;
+        });
+        // Scheduled delivery lands as a normal message — refresh pending list.
+        if (scheduledMessagesRef.current.length > 0) {
+          void loadScheduled();
+        }
         clearUnread(id);
         void api(`/chat/conversations/${id}/seen`, {
           method: 'POST',
@@ -449,11 +670,17 @@ export function ThreadView() {
         if (message.conversationId !== id) {
           return;
         }
+        const normalized = normalizeMessage(message);
         setMessages((current) =>
           current.map((item) =>
-            item.id === message.id ? normalizeMessage(message) : item,
+            item.id === normalized.id ? normalized : item,
           ),
         );
+        if (normalized.deletedForEveryone || !normalized.pinned) {
+          setPinnedMessages((current) =>
+            current.filter((item) => item.id !== normalized.id),
+          );
+        }
       }),
       subscribe('chat:typing', (payload) => {
         const event = payload as {
@@ -535,6 +762,10 @@ export function ThreadView() {
                   muted: current.muted,
                   pinned: current.pinned,
                   lastReadAt: current.lastReadAt,
+                  disappearingDurationSeconds:
+                    next.disappearingDurationSeconds ??
+                    current.disappearingDurationSeconds ??
+                    0,
                 }
               : next,
           );
@@ -597,6 +828,31 @@ export function ThreadView() {
       window.removeEventListener('resize', onResize);
     };
   }, [toolsMenuOpen]);
+
+  useEffect(() => {
+    if (!attachMenuOpen) {
+      return;
+    }
+    const onPointerDown = (event: Event) => {
+      const root = attachMenuRef.current;
+      if (root && !root.contains(event.target as Node)) {
+        setAttachMenuOpen(false);
+      }
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setAttachMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('touchstart', onPointerDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('touchstart', onPointerDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [attachMenuOpen]);
 
   // Keep Join banner in sync if the socket ring was missed
   useEffect(() => {
@@ -760,6 +1016,83 @@ export function ThreadView() {
     void sendTyping(false);
   }
 
+  async function scheduleSend() {
+    const body = composer.trim();
+    if (!body || editingMessage || scheduleBusy) {
+      return;
+    }
+    const when = new Date(scheduleAt);
+    if (Number.isNaN(when.getTime())) {
+      setActionError('Pick a valid date and time');
+      return;
+    }
+    if (when.getTime() < Date.now() + 55_000) {
+      setActionError('Schedule at least 1 minute from now');
+      return;
+    }
+    setScheduleBusy(true);
+    setActionError('');
+    try {
+      const mentionUserIds = extractMentionIds(body, mentionCandidates);
+      const payload: {
+        body: string;
+        type: string;
+        scheduledFor: string;
+        replyToMessageId?: string;
+        mentionUserIds?: string[];
+        linkPreview?: LinkPreview | null;
+      } = {
+        body,
+        type: 'text',
+        scheduledFor: when.toISOString(),
+        mentionUserIds,
+        linkPreview: pendingLinkPreview,
+      };
+      if (replyTo) {
+        payload.replyToMessageId = replyTo.id;
+      }
+      const response = await api<ScheduledMessage>(
+        `/chat/conversations/${id}/scheduled-messages`,
+        {
+          method: 'POST',
+          body: JSON.stringify(payload),
+        },
+      );
+      setScheduledMessages((current) =>
+        [...current, response.data].sort(
+          (a, b) =>
+            new Date(a.scheduledFor).getTime() - new Date(b.scheduledFor).getTime(),
+        ),
+      );
+      setComposer('');
+      clearMessageDraft(id);
+      setReplyTo(null);
+      setPendingLinkPreview(null);
+      setScheduleOpen(false);
+      setScheduleAt(defaultScheduleLocalValue());
+      void sendTyping(false);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not schedule message');
+    } finally {
+      setScheduleBusy(false);
+    }
+  }
+
+  async function cancelScheduled(scheduledMessageId: string) {
+    try {
+      await api(`/chat/conversations/${id}/scheduled-messages/${scheduledMessageId}`, {
+        method: 'DELETE',
+      });
+      setScheduledMessages((current) =>
+        current.filter((item) => item.id !== scheduledMessageId),
+      );
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not cancel scheduled message',
+      );
+    }
+  }
+
   async function summarizeThread() {
     setSummaryBusy(true);
     try {
@@ -772,6 +1105,74 @@ export function ThreadView() {
       setActionError(err instanceof Error ? err.message : 'Could not summarize thread');
     } finally {
       setSummaryBusy(false);
+    }
+  }
+
+  async function loadMedia(page = 1, kind: MediaKindTab = mediaKind, append = false) {
+    if (!id) {
+      return;
+    }
+    setMediaBusy(true);
+    try {
+      const response = await api<Paginated<ChatMessage>>(
+        `/chat/conversations/${id}/media?page=${page}&limit=40&kind=${kind}`,
+      );
+      const items = response.data.items
+        .map(normalizeMessage)
+        .filter((item) => item.attachment && !item.deletedForEveryone);
+      setMediaItems((current) => (append ? [...current, ...items] : items));
+      setMediaPage(page);
+      setMediaHasMore(Boolean(response.data.meta.hasNextPage));
+    } catch (err) {
+      if (!append) {
+        setMediaItems([]);
+      }
+      setActionError(err instanceof Error ? err.message : 'Could not load media');
+    } finally {
+      setMediaBusy(false);
+    }
+  }
+
+  function openMedia(kind: MediaKindTab = 'all') {
+    setToolsMenuOpen(false);
+    setSearchOpen(false);
+    setMediaKind(kind);
+    setMediaOpen(true);
+    setMediaItems([]);
+    setMediaPage(1);
+    setMediaHasMore(false);
+    void loadMedia(1, kind, false);
+  }
+
+  async function handleDownloadMedia(message: ChatMessage) {
+    if (!message.attachment?.url) {
+      return;
+    }
+    setMediaDownloadingId(message.id);
+    try {
+      await downloadMedia(message.attachment.url, mediaDownloadName(message), {
+        conversationId: id,
+        messageId: message.id,
+        mime: message.attachment.mime,
+      });
+    } finally {
+      setMediaDownloadingId(null);
+    }
+  }
+
+  async function handleOpenMedia(message: ChatMessage) {
+    if (!message.attachment?.url || isPendingMessage(message)) {
+      return;
+    }
+    setMediaDownloadingId(message.id);
+    try {
+      await openAttachmentMedia(message.attachment.url, mediaDownloadName(message), {
+        conversationId: id,
+        messageId: message.id,
+        mime: message.attachment.mime,
+      });
+    } finally {
+      setMediaDownloadingId(null);
     }
   }
 
@@ -959,11 +1360,23 @@ export function ThreadView() {
     });
   }
 
-  async function uploadAndSend(file: File, kind: 'image' | 'audio' = 'image') {
+  async function uploadAndSend(
+    file: File,
+    kind?: 'image' | 'audio' | 'file',
+  ) {
     if (!me) {
       setActionError('You must be signed in to send media');
       return;
     }
+
+    const resolvedKind: 'image' | 'audio' | 'file' =
+      kind === 'audio'
+        ? 'audio'
+        : kind === 'image'
+          ? 'image'
+          : kind === 'file'
+            ? 'file'
+            : fileKindFromMime(file.type, file.name);
 
     const clientId =
       typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -972,12 +1385,18 @@ export function ThreadView() {
     const localUrl = URL.createObjectURL(file);
     const caption = composer.trim();
     const replySnapshot = replyTo;
+    const placeholder =
+      resolvedKind === 'audio'
+        ? '[Voice note]'
+        : resolvedKind === 'file'
+          ? '[File]'
+          : '[Image]';
     const pendingMessage: ChatMessage = {
       id: clientId,
       conversationId: id,
       senderId: me,
-      body: caption || (kind === 'audio' ? '[Voice note]' : '[Image]'),
-      type: kind,
+      body: caption || placeholder,
+      type: resolvedKind,
       replyTo: replySnapshot
         ? {
             id: replySnapshot.id,
@@ -989,7 +1408,13 @@ export function ThreadView() {
         : null,
       attachment: {
         url: localUrl,
-        mime: file.type || (kind === 'audio' ? 'audio/webm' : 'image/jpeg'),
+        mime:
+          file.type ||
+          (resolvedKind === 'audio'
+            ? 'audio/webm'
+            : resolvedKind === 'file'
+              ? 'application/octet-stream'
+              : 'image/jpeg'),
         name: file.name,
         size: file.size,
       },
@@ -1007,6 +1432,7 @@ export function ThreadView() {
 
     setMessages((current) => [...current, pendingMessage]);
     setUploading(true);
+    setAttachMenuOpen(false);
     setActionError('');
     setComposer('');
     clearMessageDraft(id);
@@ -1034,7 +1460,7 @@ export function ThreadView() {
         method: 'POST',
         body: JSON.stringify({
           body: caption || undefined,
-          type: kind === 'audio' ? 'audio' : 'image',
+          type: resolvedKind,
           attachmentUrl: attachment.url,
           attachmentMime: attachment.mime,
           attachmentName: attachment.name,
@@ -1053,6 +1479,9 @@ export function ThreadView() {
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
+      if (docInputRef.current) {
+        docInputRef.current.value = '';
+      }
     }
   }
 
@@ -1063,8 +1492,8 @@ export function ThreadView() {
     try {
       const response = await fetch(message.attachment.url);
       const blob = await response.blob();
-      const file = new File([blob], message.attachment.name || 'voice.webm', {
-        type: message.attachment.mime || blob.type || 'audio/webm',
+      const file = new File([blob], message.attachment.name || 'attachment', {
+        type: message.attachment.mime || blob.type || 'application/octet-stream',
       });
       setMessages((current) => {
         const pending = current.find((item) => item.id === message.id);
@@ -1073,10 +1502,13 @@ export function ThreadView() {
         }
         return current.filter((item) => item.id !== message.id);
       });
-      await uploadAndSend(
-        file,
-        message.type === 'audio' ? 'audio' : 'image',
-      );
+      const kind =
+        message.type === 'audio'
+          ? 'audio'
+          : message.type === 'file'
+            ? 'file'
+            : fileKindFromMime(file.type, file.name);
+      await uploadAndSend(file, kind);
     } catch {
       setActionError('Could not retry sending');
     }
@@ -1096,6 +1528,32 @@ export function ThreadView() {
       setMessages((current) => upsertMessage(current, response.data));
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not update reaction');
+    }
+  }
+
+  async function toggleMessagePin(message: ChatMessage) {
+    setMenuMessageId(null);
+    try {
+      const response = await api<ChatMessage>(
+        `/chat/conversations/${id}/messages/${message.id}/pin`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ pinned: !message.pinned }),
+        },
+      );
+      const normalized = normalizeMessage(response.data);
+      setMessages((current) => upsertMessage(current, normalized));
+      setPinnedMessages((current) => {
+        const without = current.filter((item) => item.id !== normalized.id);
+        if (normalized.pinned) {
+          return [normalized, ...without].sort((a, b) =>
+            (b.pinnedAt ?? '').localeCompare(a.pinnedAt ?? ''),
+          );
+        }
+        return without;
+      });
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not update pin');
     }
   }
 
@@ -1209,11 +1667,45 @@ export function ThreadView() {
     }
   }
 
+  async function setDisappearing(durationSeconds: number) {
+    if (!conversation) {
+      return;
+    }
+    try {
+      const response = await api<Conversation>(
+        `/chat/conversations/${id}/disappearing`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ durationSeconds }),
+        },
+      );
+      setConversation({
+        ...response.data,
+        muted: Boolean(response.data.muted),
+        pinned: Boolean(response.data.pinned),
+        disappearingDurationSeconds:
+          response.data.disappearingDurationSeconds ?? 0,
+      });
+      void refreshInbox();
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not update disappearing messages',
+      );
+    }
+  }
+
   async function blockPeer() {
     if (!peer) {
       return;
     }
-    if (!window.confirm('Block this user? They will not be able to message you.')) {
+    const ok = await confirmDialog({
+      title: 'Block user',
+      message: 'Block this user? They will not be able to message you.',
+      confirmLabel: 'Block',
+      cancelLabel: 'Cancel',
+      danger: true,
+    });
+    if (!ok) {
       return;
     }
     try {
@@ -1222,10 +1714,39 @@ export function ThreadView() {
         body: JSON.stringify({ userId: peer.userId }),
       });
       setDetails(false);
-      navigate('/chat');
+      setConversation((current) =>
+        current
+          ? { ...current, blockedByMe: true, blockedMe: Boolean(current.blockedMe) }
+          : current,
+      );
       void refreshInbox();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not block user');
+    }
+  }
+
+  async function unblockPeer() {
+    if (!peer) {
+      return;
+    }
+    const label = displayName(byUserId.get(peer.userId));
+    const ok = await confirmDialog({
+      title: 'Unblock user',
+      message: `Unblock ${label}? They will be able to message you again.`,
+      confirmLabel: 'Unblock',
+      cancelLabel: 'Cancel',
+    });
+    if (!ok) {
+      return;
+    }
+    try {
+      await api(`/chat/blocks/${peer.userId}`, { method: 'DELETE' });
+      setConversation((current) =>
+        current ? { ...current, blockedByMe: false } : current,
+      );
+      void refreshInbox();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not unblock user');
     }
   }
 
@@ -1267,11 +1788,14 @@ export function ThreadView() {
   }
 
   async function deleteGroup() {
-    if (
-      !window.confirm(
-        'Delete this group for everyone? This cannot be undone.',
-      )
-    ) {
+    const ok = await confirmDialog({
+      title: 'Delete group',
+      message: 'Delete this group for everyone? This cannot be undone.',
+      confirmLabel: 'Delete',
+      cancelLabel: 'Cancel',
+      danger: true,
+    });
+    if (!ok) {
       return;
     }
     try {
@@ -1289,6 +1813,87 @@ export function ThreadView() {
     el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     window.setTimeout(() => setHighlightId(null), 1600);
   }
+
+  useEffect(() => {
+    if (!focusMessageId || loading || focusBusyRef.current) {
+      return;
+    }
+
+    const targetId = focusMessageId;
+    let cancelled = false;
+    focusBusyRef.current = true;
+
+    const clearFocusParam = () => {
+      setSearchParams(
+        (current) => {
+          const next = new URLSearchParams(current);
+          next.delete('focus');
+          return next;
+        },
+        { replace: true },
+      );
+    };
+
+    async function resolveFocus() {
+      try {
+        if (messagesRef.current.some((item) => item.id === targetId)) {
+          requestAnimationFrame(() => {
+            if (!cancelled) {
+              jumpToMessage(targetId);
+            }
+          });
+          return;
+        }
+
+        let page = messagePageRef.current;
+        let more = hasOlderRef.current;
+        let found = false;
+        const scrollerEl = scroller.current;
+
+        while (more && !cancelled && !found) {
+          setLoadingOlder(true);
+          const previousHeight = scrollerEl?.scrollHeight ?? 0;
+          page += 1;
+          const history = await api<Paginated<ChatMessage>>(
+            `/chat/conversations/${id}/messages?page=${page}&limit=80`,
+          );
+          const batch = [...history.data.items].reverse().map(normalizeMessage);
+          found = batch.some((item) => item.id === targetId);
+          setMessages((current) => [...batch, ...current]);
+          more = history.data.meta.hasNextPage;
+          setHasOlder(more);
+          setMessagePage(page);
+          await new Promise<void>((resolve) => {
+            requestAnimationFrame(() => {
+              if (scrollerEl) {
+                scrollerEl.scrollTop = scrollerEl.scrollHeight - previousHeight;
+              }
+              resolve();
+            });
+          });
+        }
+
+        if (!cancelled && found) {
+          await new Promise((resolve) => window.setTimeout(resolve, 100));
+          if (!cancelled) {
+            jumpToMessage(targetId);
+          }
+        }
+      } finally {
+        if (!cancelled) {
+          setLoadingOlder(false);
+          clearFocusParam();
+          focusBusyRef.current = false;
+        }
+      }
+    }
+
+    void resolveFocus();
+    return () => {
+      cancelled = true;
+      focusBusyRef.current = false;
+    };
+  }, [focusMessageId, loading, id, setSearchParams]);
 
   function startReply(message: ChatMessage) {
     if (message.deletedForEveryone || isPendingMessage(message)) {
@@ -1387,16 +1992,41 @@ export function ThreadView() {
       <header className="thread-head">
         <div className="thread-head-main">
           <button
-            className="ghost icon-btn thread-back"
+            className="ghost thread-tool-btn thread-back"
             type="button"
             aria-label="Back to messages"
+            title="Back to messages"
             onClick={() => navigate('/chat')}
           >
-            ←
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"
+              />
+            </svg>
           </button>
+          <UserAvatar
+            profile={
+              conversation.type === 'private' && peer
+                ? byUserId.get(peer.userId)
+                : null
+            }
+            name={title}
+            size="sm"
+            className="thread-head-avatar"
+          />
           <div>
             <h2>
-              {conversation.pinned ? <span className="pin-badge" title="Pinned">📌</span> : null}
+              {conversation.pinned ? (
+                <span className="pin-badge" title="Pinned" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" width="12" height="12">
+                    <path
+                      fill="currentColor"
+                      d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2zm-1.5 2h-5L11 12.5V4h2v8.5l1.5 1.5z"
+                    />
+                  </svg>
+                </span>
+              ) : null}
               {title}
               {conversation.muted ? <span className="mute-pill">Muted</span> : null}
             </h2>
@@ -1484,6 +2114,27 @@ export function ThreadView() {
 
           <div className="thread-tools-secondary">
             <button
+              className={`ghost thread-tool-btn${mediaOpen ? ' active' : ''}`}
+              type="button"
+              aria-label="Media"
+              title="Media"
+              aria-pressed={mediaOpen}
+              onClick={() => {
+                if (mediaOpen) {
+                  setMediaOpen(false);
+                } else {
+                  openMedia('all');
+                }
+              }}
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M4 4h7v7H4V4zm9 0h7v7h-7V4zM4 13h7v7H4v-7zm9 0h7v7h-7v-7z"
+                />
+              </svg>
+            </button>
+            <button
               className={`ghost thread-tool-btn${searchOpen ? ' active' : ''}`}
               type="button"
               aria-label="Search messages"
@@ -1491,6 +2142,7 @@ export function ThreadView() {
               aria-pressed={searchOpen}
               onClick={() => {
                 setToolsMenuOpen(false);
+                setMediaOpen(false);
                 setSearchOpen((open) => !open);
               }}
             >
@@ -1587,8 +2239,16 @@ export function ThreadView() {
               <button
                 type="button"
                 role="menuitem"
+                onClick={() => openMedia('all')}
+              >
+                Media
+              </button>
+              <button
+                type="button"
+                role="menuitem"
                 onClick={() => {
                   setToolsMenuOpen(false);
+                  setMediaOpen(false);
                   setSearchOpen(true);
                 }}
               >
@@ -1693,6 +2353,92 @@ export function ThreadView() {
         </button>
       ) : null}
 
+      {pinnedMessages.length > 0 ? (
+        <div className="pinned-banner">
+          <button
+            type="button"
+            className="pinned-banner-main"
+            onClick={() => {
+              if (pinnedMessages.length === 1) {
+                jumpToMessage(pinnedMessages[0].id);
+                return;
+              }
+              setPinnedBannerOpen((open) => !open);
+            }}
+          >
+            <span className="pinned-banner-icon" aria-hidden="true">
+              📌
+            </span>
+            <span className="pinned-banner-copy">
+              <strong>
+                {pinnedMessages.length === 1
+                  ? 'Pinned message'
+                  : `${pinnedMessages.length} pinned messages`}
+              </strong>
+              <small>
+                {replySnippet(pinnedMessages[0])}
+              </small>
+            </span>
+          </button>
+          {pinnedMessages.length === 1 ? (
+            <button
+              type="button"
+              className="ghost pinned-banner-unpin"
+              aria-label="Unpin message"
+              title="Unpin"
+              onClick={() => void toggleMessagePin(pinnedMessages[0])}
+            >
+              ×
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="ghost pinned-banner-unpin"
+              aria-expanded={pinnedBannerOpen}
+              aria-label={pinnedBannerOpen ? 'Hide pinned messages' : 'Show pinned messages'}
+              onClick={() => setPinnedBannerOpen((open) => !open)}
+            >
+              {pinnedBannerOpen ? '▴' : '▾'}
+            </button>
+          )}
+          {pinnedBannerOpen && pinnedMessages.length > 1 ? (
+            <ul className="pinned-banner-list">
+              {pinnedMessages.map((item) => (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPinnedBannerOpen(false);
+                      jumpToMessage(item.id);
+                    }}
+                  >
+                    <strong>{displayName(byUserId.get(item.senderId))}</strong>
+                    <span>{replySnippet(item)}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => void toggleMessagePin(item)}
+                  >
+                    Unpin
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+
+      {(conversation.disappearingDurationSeconds ?? 0) > 0 ? (
+        <div className="disappearing-banner" role="status">
+          <span aria-hidden="true">⌛</span>
+          <p>
+            Disappearing messages on · new messages vanish after{' '}
+            {disappearingLabel(conversation.disappearingDurationSeconds)}
+          </p>
+        </div>
+      ) : null}
+
       {searchOpen ? (
         <div className="search-panel">
           <input
@@ -1789,7 +2535,8 @@ export function ThreadView() {
             message.attachment &&
             (message.type === 'image' ||
               message.attachment.mime.startsWith('image/')) &&
-            message.type !== 'audio';
+            message.type !== 'audio' &&
+            message.type !== 'file';
           const showAudio =
             !message.deletedForEveryone &&
             message.attachment &&
@@ -1798,6 +2545,12 @@ export function ThreadView() {
               // Chrome sometimes records audio-only MediaRecorder blobs as video/webm
               (message.type === 'audio' &&
                 message.attachment.mime.startsWith('video/')));
+          const showFile =
+            !message.deletedForEveryone &&
+            message.attachment &&
+            !showImage &&
+            !showAudio &&
+            (message.type === 'file' || Boolean(message.attachment.url));
           const caption =
             message.body && !isPlaceholderBody(message.body) ? message.body : null;
           const bodyParts = caption
@@ -1873,6 +2626,14 @@ export function ThreadView() {
                 touchStartRef.current = null;
               }}
             >
+              {!mine ? (
+                <UserAvatar
+                  profile={byUserId.get(message.senderId)}
+                  name={displayName(byUserId.get(message.senderId))}
+                  size="sm"
+                  className="wa-msg-avatar"
+                />
+              ) : null}
               <div className={`wa-msg${mine ? ' mine' : ' theirs'}`}>
               <div
                 className={mine ? 'wa-bubble mine' : 'wa-bubble theirs'}
@@ -1892,6 +2653,9 @@ export function ThreadView() {
                 ) : null}
                 {message.forwarded && !message.deletedForEveryone ? (
                   <span className="wa-forwarded">Forwarded</span>
+                ) : null}
+                {message.pinned && !message.deletedForEveryone ? (
+                  <span className="wa-pinned-label">📌 Pinned</span>
                 ) : null}
                 {message.replyTo ? (
                   <button
@@ -1916,47 +2680,139 @@ export function ThreadView() {
                 ) : (
                   <>
                     {showImage && message.attachment ? (
-                      <a
-                        className={`wa-image-link${pending ? ' is-sending' : ''}`}
-                        href={resolveMediaUrl(message.attachment.url)}
-                        target="_blank"
-                        rel="noreferrer"
-                        onClick={(event) => {
-                          if (pending) {
-                            event.preventDefault();
-                          }
-                        }}
-                      >
-                        <img
-                          className="wa-image"
-                          src={resolveMediaUrl(message.attachment.url)}
-                          alt={message.attachment.name || 'Image'}
-                          loading="lazy"
-                        />
-                        {pending ? (
-                          <span className="wa-image-send-overlay">
-                            {message.sendStatus === 'failed'
-                              ? 'Failed'
-                              : message.sendStatus === 'uploading'
-                                ? `${Math.round(message.uploadProgress ?? 0)}%`
-                                : 'Sending…'}
-                          </span>
+                      <div className={`wa-media-wrap${pending ? ' is-sending' : ''}`}>
+                        <a
+                          className="wa-image-link"
+                          href={resolveMediaUrl(message.attachment.url)}
+                          target="_blank"
+                          rel="noreferrer"
+                          onClick={(event) => {
+                            if (pending) {
+                              event.preventDefault();
+                            }
+                          }}
+                        >
+                          <img
+                            className="wa-image"
+                            src={resolveMediaUrl(message.attachment.url)}
+                            alt={message.attachment.name || 'Image'}
+                            loading="lazy"
+                          />
+                          {pending ? (
+                            <span className="wa-image-send-overlay">
+                              {message.sendStatus === 'failed'
+                                ? 'Failed'
+                                : message.sendStatus === 'uploading'
+                                  ? `${Math.round(message.uploadProgress ?? 0)}%`
+                                  : 'Sending…'}
+                            </span>
+                          ) : null}
+                        </a>
+                        {!pending ? (
+                          <button
+                            type="button"
+                            className="wa-media-download"
+                            aria-label="Download image"
+                            title="Download"
+                            disabled={mediaDownloadingId === message.id}
+                            onClick={() => void handleDownloadMedia(message)}
+                          >
+                            ↓
+                          </button>
                         ) : null}
-                      </a>
+                      </div>
                     ) : null}
                     {showAudio && message.attachment ? (
-                      <VoiceNotePlayer
-                        src={message.attachment.url}
-                        mime={message.attachment.mime}
-                        mine={mine}
-                        sendStatus={message.sendStatus}
-                        uploadProgress={message.uploadProgress}
-                        onRetry={
-                          message.sendStatus === 'failed'
-                            ? () => void retryPendingMessage(message)
-                            : undefined
-                        }
-                      />
+                      <div className="wa-media-wrap audio">
+                        <VoiceNotePlayer
+                          src={message.attachment.url}
+                          mime={message.attachment.mime}
+                          mine={mine}
+                          sendStatus={message.sendStatus}
+                          uploadProgress={message.uploadProgress}
+                          onRetry={
+                            message.sendStatus === 'failed'
+                              ? () => void retryPendingMessage(message)
+                              : undefined
+                          }
+                        />
+                        {!pending ? (
+                          <button
+                            type="button"
+                            className="wa-media-download"
+                            aria-label="Download voice note"
+                            title="Download"
+                            disabled={mediaDownloadingId === message.id}
+                            onClick={() => void handleDownloadMedia(message)}
+                          >
+                            ↓
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {showFile && message.attachment ? (
+                      <div className={`wa-media-wrap${pending ? ' is-sending' : ''}`}>
+                        <button
+                          type="button"
+                          className={`wa-file-card${pending ? ' is-sending' : ''}${
+                            message.sendStatus === 'failed' ? ' is-failed' : ''
+                          }`}
+                          disabled={mediaDownloadingId === message.id}
+                          onClick={() => {
+                            if (pending) {
+                              if (message.sendStatus === 'failed') {
+                                void retryPendingMessage(message);
+                              }
+                              return;
+                            }
+                            void handleOpenMedia(message);
+                          }}
+                        >
+                          <span className="wa-file-icon" aria-hidden="true">
+                            {fileExtLabel(
+                              message.attachment.name,
+                              message.attachment.mime,
+                            )}
+                          </span>
+                          <span className="wa-file-meta">
+                            <strong className="wa-file-name">
+                              {message.attachment.name || 'Document'}
+                            </strong>
+                            <small className="wa-file-sub">
+                              {pending
+                                ? message.sendStatus === 'failed'
+                                  ? 'Failed · tap to retry'
+                                  : message.sendStatus === 'uploading'
+                                    ? `Uploading ${Math.round(message.uploadProgress ?? 0)}%`
+                                    : 'Sending…'
+                                : mediaDownloadingId === message.id
+                                  ? 'Opening…'
+                                  : [
+                                      formatFileSize(message.attachment.size),
+                                      fileExtLabel(
+                                        message.attachment.name,
+                                        message.attachment.mime,
+                                      ),
+                                      'Tap to open',
+                                    ]
+                                      .filter(Boolean)
+                                      .join(' · ')}
+                            </small>
+                          </span>
+                        </button>
+                        {!pending ? (
+                          <button
+                            type="button"
+                            className="wa-media-download"
+                            aria-label="Download file"
+                            title="Download"
+                            disabled={mediaDownloadingId === message.id}
+                            onClick={() => void handleDownloadMedia(message)}
+                          >
+                            ↓
+                          </button>
+                        ) : null}
+                      </div>
                     ) : null}
                     {caption ? (
                       <p className="wa-text">
@@ -2033,10 +2889,19 @@ export function ThreadView() {
                     </button>
                   ) : null}
                   {message.editedAt ? <span className="wa-edited">edited</span> : null}
+                  {message.expiresAt && !message.deletedForEveryone ? (
+                    <span
+                      className="wa-expires"
+                      title={`Disappears ${new Date(message.expiresAt).toLocaleString()}`}
+                    >
+                      ⌛
+                    </span>
+                  ) : null}
                   <time dateTime={message.createdAt}>{clock(message.createdAt)}</time>
                   {mine ? (
                     <MessageTicks
                       seen={seen}
+                      undelivered={Boolean(message.undelivered)}
                       status={
                         message.sendStatus === 'failed'
                           ? 'failed'
@@ -2092,6 +2957,12 @@ export function ThreadView() {
                           }}
                         >
                           Forward
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void toggleMessagePin(message)}
+                        >
+                          {message.pinned ? 'Unpin' : 'Pin'}
                         </button>
                       </>
                     ) : null}
@@ -2204,6 +3075,78 @@ export function ThreadView() {
         </ul>
       ) : null}
 
+      {scheduledMessages.length > 0 ? (
+        <div className="scheduled-panel">
+          <p className="scheduled-panel-title">Scheduled</p>
+          <ul className="scheduled-list">
+            {scheduledMessages.map((item) => (
+              <li key={item.id}>
+                <div>
+                  <strong>{formatScheduleWhen(item.scheduledFor)}</strong>
+                  <span>{item.body}</span>
+                </div>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => void cancelScheduled(item.id)}
+                >
+                  Cancel
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {scheduleOpen && !editingMessage && !conversation.blockedMe ? (
+        <div className="schedule-composer">
+          <label>
+            Send later
+            <input
+              type="datetime-local"
+              value={scheduleAt}
+              min={toDatetimeLocalValue(new Date(Date.now() + 60_000))}
+              onChange={(event) => setScheduleAt(event.target.value)}
+            />
+          </label>
+          <button
+            type="button"
+            className="btn"
+            disabled={!composer.trim() || scheduleBusy}
+            onClick={() => void scheduleSend()}
+          >
+            {scheduleBusy ? 'Scheduling…' : 'Schedule'}
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => setScheduleOpen(false)}
+          >
+            Close
+          </button>
+        </div>
+      ) : null}
+
+      {conversation.type === 'private' && conversation.blockedByMe ? (
+        <div className="blocked-chat-banner" role="status">
+          <p>
+            You blocked this contact. Tap unblock to allow messaging again. You
+            can still send messages; they will not be delivered.
+          </p>
+          <button className="btn" type="button" onClick={() => void unblockPeer()}>
+            Unblock
+          </button>
+        </div>
+      ) : null}
+
+      {conversation.type === 'private' && conversation.blockedMe ? (
+        <div className="blocked-chat-composer" role="status">
+          <p>You can&apos;t message this contact.</p>
+          <Link className="ghost" to="/blocked">
+            Manage blocked users
+          </Link>
+        </div>
+      ) : (
       <form
         className={`composer${editingMessage ? ' edit-mode' : ''}${
           voicePhase !== 'idle' ? ' voice-mode' : ''
@@ -2343,35 +3286,74 @@ export function ThreadView() {
               onChange={(event) => {
                 const file = event.target.files?.[0];
                 if (file) {
-                  void uploadAndSend(file);
+                  void uploadAndSend(file, 'image');
+                }
+              }}
+            />
+            <input
+              ref={docInputRef}
+              type="file"
+              accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.json,.rtf,.zip,.rar,.odt,.ods,.odp,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/plain,text/csv,application/json,application/zip"
+              hidden
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  void uploadAndSend(file, 'file');
                 }
               }}
             />
             <div className="composer-shell">
               {!editingMessage ? (
-                <button
-                  className="composer-attach"
-                  type="button"
-                  aria-label="Attach image"
-                  title="Attach image"
-                  disabled={uploading}
-                  onClick={() => fileInputRef.current?.click()}
-                >
-                  {uploading ? (
-                    <span className="composer-attach-busy">…</span>
-                  ) : (
-                    <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-                      <path
-                        d="M14.5 5.5 7.8 12.2a3.2 3.2 0 1 0 4.5 4.5l7.2-7.2a4.8 4.8 0 0 0-6.8-6.8L5.5 10a1.2 1.2 0 0 0 1.7 1.7l7.2-7.2"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="1.8"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      />
-                    </svg>
-                  )}
-                </button>
+                <div className="composer-attach-wrap" ref={attachMenuRef}>
+                  <button
+                    className={`composer-attach${attachMenuOpen ? ' open' : ''}`}
+                    type="button"
+                    aria-label="Attach"
+                    title="Attach"
+                    aria-expanded={attachMenuOpen}
+                    disabled={uploading}
+                    onClick={() => setAttachMenuOpen((open) => !open)}
+                  >
+                    {uploading ? (
+                      <span className="composer-attach-busy">…</span>
+                    ) : (
+                      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                        <path
+                          d="M14.5 5.5 7.8 12.2a3.2 3.2 0 1 0 4.5 4.5l7.2-7.2a4.8 4.8 0 0 0-6.8-6.8L5.5 10a1.2 1.2 0 0 0 1.7 1.7l7.2-7.2"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="1.8"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    )}
+                  </button>
+                  {attachMenuOpen ? (
+                    <div className="composer-attach-menu" role="menu">
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setAttachMenuOpen(false);
+                          fileInputRef.current?.click();
+                        }}
+                      >
+                        Photo
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setAttachMenuOpen(false);
+                          docInputRef.current?.click();
+                        }}
+                      >
+                        Document
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
               ) : null}
               <input
                 ref={composerInputRef}
@@ -2405,25 +3387,178 @@ export function ThreadView() {
                   </svg>
                 </button>
               ) : (
-                <button
-                  className="composer-send"
-                  type="submit"
-                  aria-label={editingMessage ? 'Save edit' : 'Send message'}
-                  title={editingMessage ? 'Save' : 'Send'}
-                  disabled={editingMessage ? !composer.trim() : !composer.trim()}
-                >
-                  <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-                    <path
-                      fill="currentColor"
-                      d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"
-                    />
-                  </svg>
-                </button>
+                <>
+                  {!editingMessage ? (
+                    <button
+                      className={`composer-schedule${scheduleOpen ? ' active' : ''}`}
+                      type="button"
+                      aria-label="Schedule message"
+                      title="Schedule message"
+                      aria-pressed={scheduleOpen}
+                      disabled={!composer.trim()}
+                      onClick={() => {
+                        setScheduleAt(defaultScheduleLocalValue());
+                        setScheduleOpen((open) => !open);
+                      }}
+                    >
+                      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                        <path
+                          fill="currentColor"
+                          d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 11h4v-2h-3V7h-2z"
+                        />
+                      </svg>
+                    </button>
+                  ) : null}
+                  <button
+                    className="composer-send"
+                    type="submit"
+                    aria-label={editingMessage ? 'Save edit' : 'Send message'}
+                    title={editingMessage ? 'Save' : 'Send'}
+                    disabled={editingMessage ? !composer.trim() : !composer.trim()}
+                  >
+                    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                      <path
+                        fill="currentColor"
+                        d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"
+                      />
+                    </svg>
+                  </button>
+                </>
               )}
             </div>
           </>
         )}
       </form>
+      )}
+
+      <Modal
+        open={mediaOpen}
+        title="Media"
+        size="lg"
+        onClose={() => setMediaOpen(false)}
+      >
+        <div className="media-gallery">
+          <div className="media-gallery-tabs" role="tablist" aria-label="Media type">
+            {(
+              [
+                ['all', 'All'],
+                ['image', 'Images'],
+                ['file', 'Files'],
+                ['audio', 'Voice'],
+              ] as const
+            ).map(([kind, label]) => (
+              <button
+                key={kind}
+                type="button"
+                role="tab"
+                aria-selected={mediaKind === kind}
+                className={mediaKind === kind ? 'active' : ''}
+                onClick={() => {
+                  if (mediaKind === kind) {
+                    return;
+                  }
+                  setMediaKind(kind);
+                  setMediaItems([]);
+                  setMediaPage(1);
+                  setMediaHasMore(false);
+                  void loadMedia(1, kind, false);
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {mediaBusy && mediaItems.length === 0 ? (
+            <p className="muted">Loading media…</p>
+          ) : mediaItems.length === 0 ? (
+            <p className="muted">No media in this chat yet.</p>
+          ) : (
+            <ul className="media-gallery-list">
+              {mediaItems.map((item) => {
+                const kind = mediaKindOf(item);
+                const attachment = item.attachment!;
+                return (
+                  <li key={item.id} className={`media-gallery-item kind-${kind}`}>
+                    <button
+                      type="button"
+                      className="media-gallery-preview"
+                      onClick={() => {
+                        setMediaOpen(false);
+                        jumpToMessage(item.id);
+                      }}
+                      title="Show in chat"
+                    >
+                      {kind === 'image' ? (
+                        <img
+                          src={resolveMediaUrl(attachment.url)}
+                          alt={attachment.name || 'Image'}
+                          loading="lazy"
+                        />
+                      ) : (
+                        <span className="media-gallery-icon" aria-hidden="true">
+                          {kind === 'audio'
+                            ? '♪'
+                            : fileExtLabel(attachment.name, attachment.mime)}
+                        </span>
+                      )}
+                    </button>
+                    <div className="media-gallery-meta">
+                      <strong>
+                        {kind === 'image'
+                          ? attachment.name || 'Photo'
+                          : kind === 'audio'
+                            ? 'Voice note'
+                            : attachment.name || 'File'}
+                      </strong>
+                      <small>
+                        {[
+                          kind === 'image'
+                            ? 'Image'
+                            : kind === 'audio'
+                              ? 'Voice'
+                              : 'File',
+                          formatFileSize(attachment.size),
+                          clock(item.createdAt),
+                        ]
+                          .filter(Boolean)
+                          .join(' · ')}
+                      </small>
+                    </div>
+                    <button
+                      type="button"
+                      className="ghost media-gallery-download"
+                      disabled={mediaDownloadingId === item.id}
+                      onClick={() => void handleOpenMedia(item)}
+                    >
+                      {mediaDownloadingId === item.id ? '…' : 'Open'}
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost media-gallery-download"
+                      disabled={mediaDownloadingId === item.id}
+                      onClick={() => void handleDownloadMedia(item)}
+                    >
+                      {mediaDownloadingId === item.id ? '…' : 'Download'}
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {mediaHasMore ? (
+            <button
+              className="ghost full"
+              type="button"
+              disabled={mediaBusy}
+              onClick={() => void loadMedia(mediaPage + 1, mediaKind, true)}
+            >
+              {mediaBusy ? 'Loading…' : 'Load more'}
+            </button>
+          ) : null}
+        </div>
+      </Modal>
 
       <Modal
         open={Boolean(forwardMessage)}
@@ -2471,6 +3606,31 @@ export function ThreadView() {
               <button className="ghost full" type="button" onClick={() => void toggleMute()}>
                 {conversation.muted ? 'Unmute conversation' : 'Mute conversation'}
               </button>
+              <label className="disappearing-field">
+                <span>Disappearing messages</span>
+                <select
+                  value={conversation.disappearingDurationSeconds ?? 0}
+                  onChange={(event) =>
+                    void setDisappearing(Number(event.target.value))
+                  }
+                >
+                  {DISAPPEARING_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                className="ghost full"
+                type="button"
+                onClick={() => {
+                  setDetails(false);
+                  openMedia('all');
+                }}
+              >
+                Media (photos, files, voice)
+              </button>
               <button
                 className="ghost full"
                 type="button"
@@ -2479,8 +3639,24 @@ export function ThreadView() {
               >
                 {summaryBusy ? 'Summarizing…' : 'Summarize thread (AI)'}
               </button>
-              <button className="danger full" type="button" onClick={() => void blockPeer()}>
-                Block user
+              {conversation.blockedByMe ? (
+                <button className="btn full" type="button" onClick={() => void unblockPeer()}>
+                  Unblock user
+                </button>
+              ) : (
+                <button className="danger full" type="button" onClick={() => void blockPeer()}>
+                  Block user
+                </button>
+              )}
+              <button
+                className="ghost full"
+                type="button"
+                onClick={() => {
+                  setDetails(false);
+                  navigate('/blocked');
+                }}
+              >
+                Manage blocked users
               </button>
             </div>
             {summary ? <pre className="thread-summary">{summary}</pre> : null}
@@ -2548,6 +3724,38 @@ export function ThreadView() {
               </button>
               <button className="ghost full" type="button" onClick={() => void toggleMute()}>
                 {conversation.muted ? 'Unmute conversation' : 'Mute conversation'}
+              </button>
+              {canManage ? (
+                <label className="disappearing-field">
+                  <span>Disappearing messages</span>
+                  <select
+                    value={conversation.disappearingDurationSeconds ?? 0}
+                    onChange={(event) =>
+                      void setDisappearing(Number(event.target.value))
+                    }
+                  >
+                    {DISAPPEARING_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                <p className="muted pad" style={{ margin: 0 }}>
+                  Disappearing messages:{' '}
+                  {disappearingLabel(conversation.disappearingDurationSeconds)}
+                </p>
+              )}
+              <button
+                className="ghost full"
+                type="button"
+                onClick={() => {
+                  setDetails(false);
+                  openMedia('all');
+                }}
+              >
+                Media (photos, files, voice)
               </button>
               <button
                 className="ghost full"

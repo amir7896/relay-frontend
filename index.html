@@ -2,7 +2,18 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b1211" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f4fbf9" media="(prefers-color-scheme: light)" />
+    <meta name="description" content="Relay — realtime messaging for teams. Chats, calls, and files." />
+    <meta name="application-name" content="Relay" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Relay" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <title>Relay — messages</title>
     <script>
       (function () {
@@ -15,6 +26,11 @@
                 ? 'light'
                 : 'dark';
           document.documentElement.setAttribute('data-theme', theme);
+          var metaTheme = document.querySelectorAll('meta[name="theme-color"]');
+          var color = theme === 'light' ? '#f4fbf9' : '#0b1211';
+          metaTheme.forEach(function (node) {
+            node.setAttribute('content', color);
+          });
         } catch (e) {
           document.documentElement.setAttribute('data-theme', 'dark');
         }

@@ -27,6 +27,7 @@ export function SiteFooter() {
           <Link to="/register">Create account</Link>
           <Link to="/chat">Messages</Link>
           <Link to="/profile">Profile</Link>
+          <Link to="/blocked">Blocked users</Link>
         </div>
         <div>
           <h3>Company</h3>

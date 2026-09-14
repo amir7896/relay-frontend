@@ -2,11 +2,13 @@ import { FormEvent, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
+import { useConfirm } from '../components/ConfirmProvider';
 import type { Conversation, Paginated, UserProfile } from '../api/types';
 
 export function PeoplePage() {
   const { session } = useAuth();
   const navigate = useNavigate();
+  const askConfirm = useConfirm();
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [search, setSearch] = useState('');
   const [error, setError] = useState('');
@@ -58,7 +60,14 @@ export function PeoplePage() {
   }
 
   async function deactivate(user: UserProfile) {
-    if (!window.confirm(`Deactivate ${user.firstName} ${user.lastName}?`)) {
+    const ok = await askConfirm({
+      title: 'Deactivate user',
+      message: `Deactivate ${user.firstName} ${user.lastName}? They will no longer be able to sign in.`,
+      confirmLabel: 'Deactivate',
+      cancelLabel: 'Cancel',
+      danger: true,
+    });
+    if (!ok) {
       return;
     }
     await api(`/users/${user.id}`, { method: 'DELETE' });

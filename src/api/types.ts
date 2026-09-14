@@ -95,14 +95,46 @@ export type ChatMessage = {
   linkPreview: LinkPreview | null;
   reactions: MessageReaction[];
   editedAt: string | null;
+  pinned?: boolean;
+  pinnedAt?: string | null;
+  pinnedByUserId?: string | null;
   forwarded: boolean;
   deletedForEveryone: boolean;
   seenBy: string[];
+  undelivered?: boolean;
+  expiresAt?: string | null;
   createdAt: string;
   /** Client-only: optimistic send state for attachments */
   sendStatus?: 'uploading' | 'sending' | 'failed';
   /** Client-only: 0–100 while uploading */
   uploadProgress?: number;
+};
+
+export type GlobalSearchHit = {
+  message: ChatMessage;
+  conversation: {
+    id: string;
+    type: 'private' | 'group';
+    name: string | null;
+    members: Array<{ userId: string }>;
+  };
+};
+
+export type ScheduledMessage = {
+  id: string;
+  conversationId: string;
+  senderId: string;
+  body: string;
+  type: string;
+  replyToMessageId: string | null;
+  attachment: MessageAttachment | null;
+  mentions: string[];
+  linkPreview: LinkPreview | null;
+  scheduledFor: string;
+  status: 'pending' | 'sending' | 'sent' | 'cancelled' | 'failed';
+  sentMessageId: string | null;
+  error: string | null;
+  createdAt: string;
 };
 
 export type Conversation = {
@@ -115,6 +147,9 @@ export type Conversation = {
   lastReadAt: string | null;
   muted: boolean;
   pinned: boolean;
+  disappearingDurationSeconds?: number;
+  blockedByMe?: boolean;
+  blockedMe?: boolean;
   unreadCount: number;
   members: ConversationMember[];
   createdAt: string;
