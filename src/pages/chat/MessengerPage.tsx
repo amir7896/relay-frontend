@@ -9,12 +9,12 @@ import {
   conversationTitle,
   displayName,
   inboxTime,
-  initials,
   otherMember,
 } from '../../lib/format';
 import { notify, subscribeWebPush, shouldShowNotificationBanner, dismissNotificationPrompt } from '../../lib/notifications';
 import { usePwaInstall } from '../../hooks/usePwaInstall';
 import { useDirectory } from '../../people/useDirectory';
+import { UserAvatar } from '../../components/UserAvatar';
 import type { ChatMessage, Conversation, GlobalSearchHit, Paginated, UserProfile } from '../../api/types';
 
 export type MessengerOutletContext = {
@@ -103,6 +103,8 @@ function normalizeConversation(item: Conversation): Conversation {
     ...item,
     muted: Boolean(item.muted),
     pinned: Boolean(item.pinned),
+    blockedByMe: Boolean(item.blockedByMe),
+    blockedMe: Boolean(item.blockedMe),
     lastMessage: item.lastMessage
       ? {
           ...item.lastMessage,
@@ -112,6 +114,7 @@ function normalizeConversation(item: Conversation): Conversation {
           linkPreview: item.lastMessage.linkPreview ?? null,
           editedAt: item.lastMessage.editedAt ?? null,
           forwarded: Boolean(item.lastMessage.forwarded),
+          undelivered: Boolean(item.lastMessage.undelivered),
         }
       : null,
   };
@@ -128,7 +131,8 @@ export function MessengerPage() {
   const me = session?.user.id;
   const meRef = useRef(me);
   meRef.current = me;
-  const { people, byUserId, error: directoryError, ensureProfiles } = useDirectory();
+  const { people, byUserId, error: directoryError, ensureProfiles, refreshDirectory } =
+    useDirectory();
   const [items, setItems] = useState<Conversation[]>([]);
   const [query, setQuery] = useState('');
   const [messageHits, setMessageHits] = useState<GlobalSearchHit[]>([]);
@@ -394,6 +398,10 @@ export function MessengerPage() {
   }, [applyInboxMessage, leaveConversation, navigate, subscribe]);
 
   useEffect(() => {
+    void refreshDirectory();
+  }, [refreshDirectory]);
+
+  useEffect(() => {
     const memberIds = items.flatMap((item) =>
       item.members.map((member) => member.userId),
     );
@@ -572,13 +580,13 @@ export function MessengerPage() {
             <h1>Chats</h1>
             <div className="inbox-head-actions">
               <button
-                className="ghost icon-btn"
+                className="inbox-action-btn"
                 type="button"
                 aria-label="New chat"
                 title="New chat"
                 onClick={outletContext.openNewChat}
               >
-                <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path
                     fill="currentColor"
                     d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zm-2 12H6v-2h12zm0-3H6V9h12zm0-3H6V6h12z"
@@ -586,13 +594,13 @@ export function MessengerPage() {
                 </svg>
               </button>
               <button
-                className="ghost icon-btn"
+                className="inbox-action-btn"
                 type="button"
                 aria-label="New group"
                 title="New group"
                 onClick={outletContext.openNewGroup}
               >
-                <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path
                     fill="currentColor"
                     d="M16 11c1.7 0 3-1.3 3-3s-1.3-3-3-3-3 1.3-3 3 1.3 3 3 3zm-8 0c1.7 0 3-1.3 3-3S9.7 5 8 5 5 6.3 5 8s1.3 3 3 3zm0 2c-2.3 0-7 1.2-7 3.5V19h14v-2.5C15 14.2 10.3 13 8 13zm8 0c-.3 0-.6 0-.9.1 1 0.7 1.9 1.6 1.9 3.4V19h6v-2.5c0-2.3-4.7-3.5-7-3.5z"
@@ -674,29 +682,28 @@ export function MessengerPage() {
                 to={`/chat/${item.id}`}
               >
                 <span className="chat-avatar-wrap">
-                  <span className="avatar sm">{initials(avatarLabel)}</span>
+                  <UserAvatar
+                    profile={item.type === 'group' ? null : peerProfile}
+                    name={avatarLabel}
+                    size="sm"
+                  />
                   <span className={online ? 'presence on' : 'presence'} />
                 </span>
                 <span className="chat-row-main">
-                  <span className="chat-row-top">
+                  <span className="chat-row-copy">
                     <strong className="chat-row-title">
                       {item.pinned ? (
                         <span className="pin-badge" title="Pinned" aria-hidden="true">
-                          📌
+                          <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path
+                              fill="currentColor"
+                              d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2zm-1.5 2h-5L11 12.5V4h2v8.5l1.5 1.5z"
+                            />
+                          </svg>
                         </span>
                       ) : null}
                       {title}
                     </strong>
-                    {timeLabel ? (
-                      <time
-                        className={`chat-row-time${unread ? ' unread-time' : ''}`}
-                        dateTime={item.lastMessageAt ?? undefined}
-                      >
-                        {timeLabel}
-                      </time>
-                    ) : null}
-                  </span>
-                  <span className="chat-row-bottom">
                     <small className="chat-row-preview">
                       {item.muted ? (
                         <span className="chat-mute-icon" title="Muted" aria-label="Muted">
@@ -705,15 +712,34 @@ export function MessengerPage() {
                       ) : null}
                       {preview}
                     </small>
+                  </span>
+                  <span className="chat-row-meta">
+                    {timeLabel ? (
+                      <time
+                        className={`chat-row-time${unread ? ' unread-time' : ''}`}
+                        dateTime={item.lastMessageAt ?? undefined}
+                      >
+                        {timeLabel}
+                      </time>
+                    ) : (
+                      <span className="chat-row-time chat-row-time-spacer" aria-hidden="true">
+                        &nbsp;
+                      </span>
+                    )}
                     <span className="chat-row-trailing">
                       <button
-                        className="ghost pin-toggle"
+                        className={`pin-toggle${item.pinned ? ' is-pinned' : ''}`}
                         type="button"
                         title={item.pinned ? 'Unpin chat' : 'Pin chat'}
                         aria-label={item.pinned ? 'Unpin chat' : 'Pin chat'}
                         onClick={(event) => void togglePin(event, item)}
                       >
-                        {item.pinned ? 'Unpin' : 'Pin'}
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path
+                            fill="currentColor"
+                            d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2zm-1.5 2h-5L11 12.5V4h2v8.5l1.5 1.5z"
+                          />
+                        </svg>
                       </button>
                       {unread > 0 ? (
                         <span className={`unread${item.muted ? ' quiet' : ''}`}>
@@ -736,6 +762,13 @@ export function MessengerPage() {
                 const title = hitConversationTitle(hit, me, byUserId);
                 const snippet = messageSnippet(hit.message, me);
                 const timeLabel = inboxTime(hit.message.createdAt);
+                const hitPeer =
+                  hit.conversation.type === 'private'
+                    ? hit.conversation.members.find((member) => member.userId !== me)
+                    : undefined;
+                const hitProfile = hitPeer
+                  ? byUserId.get(hitPeer.userId)
+                  : byUserId.get(hit.message.senderId);
                 return (
                   <button
                     key={hit.message.id}
@@ -746,7 +779,11 @@ export function MessengerPage() {
                     }}
                   >
                     <span className="chat-avatar-wrap">
-                      <span className="avatar sm">{initials(title)}</span>
+                      <UserAvatar
+                        profile={hit.conversation.type === 'group' ? null : hitProfile}
+                        name={title}
+                        size="sm"
+                      />
                     </span>
                     <span className="chat-row-main">
                       <span className="chat-row-top">

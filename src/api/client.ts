@@ -16,7 +16,12 @@ export async function api<T>(
   init: RequestInit = {},
 ): Promise<ApiEnvelope<T>> {
   const headers = new Headers(init.headers);
-  if (!headers.has('Content-Type') && init.body) {
+  // FormData must set its own multipart boundary — never force JSON here.
+  if (
+    !headers.has('Content-Type') &&
+    init.body &&
+    !(init.body instanceof FormData)
+  ) {
     headers.set('Content-Type', 'application/json');
   }
   // ngrok free tier interstitial otherwise breaks JSON /api responses

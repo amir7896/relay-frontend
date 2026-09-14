@@ -1,13 +1,15 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate, useOutletContext, useParams, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useOutletContext, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../../api/client';
 import { getAccessToken } from '../../auth/session';
 import { useAuth } from '../../auth/AuthContext';
 import { useChatSocket } from '../../chat/ChatSocketContext';
 import { useVoiceCall } from '../../calls/VoiceCallContext';
 import { Modal } from '../../components/Modal';
+import { useConfirm } from '../../components/ConfirmProvider';
 import { MessageTicks } from '../../components/MessageTicks';
 import { PeoplePicker } from '../../components/PeoplePicker';
+import { UserAvatar } from '../../components/UserAvatar';
 import {
   resolveMediaUrl,
   VoiceNotePlayer,
@@ -126,6 +128,7 @@ function normalizeMessage(message: ChatMessage): ChatMessage {
     pinnedAt: message.pinnedAt ?? null,
     pinnedByUserId: message.pinnedByUserId ?? null,
     forwarded: Boolean(message.forwarded),
+    undelivered: Boolean(message.undelivered),
     expiresAt: message.expiresAt ?? null,
   };
 }
@@ -331,6 +334,7 @@ export function ThreadView() {
   const { session } = useAuth();
   const me = session?.user.id;
   const navigate = useNavigate();
+  const confirmDialog = useConfirm();
   const { clearUnread, refreshInbox, conversations } =
     useOutletContext<MessengerOutletContext>();
   const { people, byUserId, ensureProfiles } = useDirectory();
@@ -556,10 +560,15 @@ export function ThreadView() {
       ...conv.data,
       muted: Boolean(conv.data.muted),
       pinned: Boolean(conv.data.pinned),
+      blockedByMe: Boolean(conv.data.blockedByMe),
+      blockedMe: Boolean(conv.data.blockedMe),
     });
     setLoading(false);
     clearUnread(id);
-    void ensureProfiles(conv.data.members.map((member) => member.userId));
+    void ensureProfiles(
+      conv.data.members.map((member) => member.userId),
+      { refresh: true },
+    );
     if (conv.data.type === 'group') {
       void refreshLobby(id);
     }
@@ -1689,7 +1698,14 @@ export function ThreadView() {
     if (!peer) {
       return;
     }
-    if (!window.confirm('Block this user? They will not be able to message you.')) {
+    const ok = await confirmDialog({
+      title: 'Block user',
+      message: 'Block this user? They will not be able to message you.',
+      confirmLabel: 'Block',
+      cancelLabel: 'Cancel',
+      danger: true,
+    });
+    if (!ok) {
       return;
     }
     try {
@@ -1698,10 +1714,39 @@ export function ThreadView() {
         body: JSON.stringify({ userId: peer.userId }),
       });
       setDetails(false);
-      navigate('/chat');
+      setConversation((current) =>
+        current
+          ? { ...current, blockedByMe: true, blockedMe: Boolean(current.blockedMe) }
+          : current,
+      );
       void refreshInbox();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not block user');
+    }
+  }
+
+  async function unblockPeer() {
+    if (!peer) {
+      return;
+    }
+    const label = displayName(byUserId.get(peer.userId));
+    const ok = await confirmDialog({
+      title: 'Unblock user',
+      message: `Unblock ${label}? They will be able to message you again.`,
+      confirmLabel: 'Unblock',
+      cancelLabel: 'Cancel',
+    });
+    if (!ok) {
+      return;
+    }
+    try {
+      await api(`/chat/blocks/${peer.userId}`, { method: 'DELETE' });
+      setConversation((current) =>
+        current ? { ...current, blockedByMe: false } : current,
+      );
+      void refreshInbox();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not unblock user');
     }
   }
 
@@ -1743,11 +1788,14 @@ export function ThreadView() {
   }
 
   async function deleteGroup() {
-    if (
-      !window.confirm(
-        'Delete this group for everyone? This cannot be undone.',
-      )
-    ) {
+    const ok = await confirmDialog({
+      title: 'Delete group',
+      message: 'Delete this group for everyone? This cannot be undone.',
+      confirmLabel: 'Delete',
+      cancelLabel: 'Cancel',
+      danger: true,
+    });
+    if (!ok) {
       return;
     }
     try {
@@ -1944,16 +1992,41 @@ export function ThreadView() {
       <header className="thread-head">
         <div className="thread-head-main">
           <button
-            className="ghost icon-btn thread-back"
+            className="ghost thread-tool-btn thread-back"
             type="button"
             aria-label="Back to messages"
+            title="Back to messages"
             onClick={() => navigate('/chat')}
           >
-            ←
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path
+                fill="currentColor"
+                d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"
+              />
+            </svg>
           </button>
+          <UserAvatar
+            profile={
+              conversation.type === 'private' && peer
+                ? byUserId.get(peer.userId)
+                : null
+            }
+            name={title}
+            size="sm"
+            className="thread-head-avatar"
+          />
           <div>
             <h2>
-              {conversation.pinned ? <span className="pin-badge" title="Pinned">📌</span> : null}
+              {conversation.pinned ? (
+                <span className="pin-badge" title="Pinned" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" width="12" height="12">
+                    <path
+                      fill="currentColor"
+                      d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2zm-1.5 2h-5L11 12.5V4h2v8.5l1.5 1.5z"
+                    />
+                  </svg>
+                </span>
+              ) : null}
               {title}
               {conversation.muted ? <span className="mute-pill">Muted</span> : null}
             </h2>
@@ -2553,6 +2626,14 @@ export function ThreadView() {
                 touchStartRef.current = null;
               }}
             >
+              {!mine ? (
+                <UserAvatar
+                  profile={byUserId.get(message.senderId)}
+                  name={displayName(byUserId.get(message.senderId))}
+                  size="sm"
+                  className="wa-msg-avatar"
+                />
+              ) : null}
               <div className={`wa-msg${mine ? ' mine' : ' theirs'}`}>
               <div
                 className={mine ? 'wa-bubble mine' : 'wa-bubble theirs'}
@@ -2820,6 +2901,7 @@ export function ThreadView() {
                   {mine ? (
                     <MessageTicks
                       seen={seen}
+                      undelivered={Boolean(message.undelivered)}
                       status={
                         message.sendStatus === 'failed'
                           ? 'failed'
@@ -3016,7 +3098,7 @@ export function ThreadView() {
         </div>
       ) : null}
 
-      {scheduleOpen && !editingMessage ? (
+      {scheduleOpen && !editingMessage && !conversation.blockedMe ? (
         <div className="schedule-composer">
           <label>
             Send later
@@ -3045,6 +3127,26 @@ export function ThreadView() {
         </div>
       ) : null}
 
+      {conversation.type === 'private' && conversation.blockedByMe ? (
+        <div className="blocked-chat-banner" role="status">
+          <p>
+            You blocked this contact. Tap unblock to allow messaging again. You
+            can still send messages; they will not be delivered.
+          </p>
+          <button className="btn" type="button" onClick={() => void unblockPeer()}>
+            Unblock
+          </button>
+        </div>
+      ) : null}
+
+      {conversation.type === 'private' && conversation.blockedMe ? (
+        <div className="blocked-chat-composer" role="status">
+          <p>You can&apos;t message this contact.</p>
+          <Link className="ghost" to="/blocked">
+            Manage blocked users
+          </Link>
+        </div>
+      ) : (
       <form
         className={`composer${editingMessage ? ' edit-mode' : ''}${
           voicePhase !== 'idle' ? ' voice-mode' : ''
@@ -3327,6 +3429,7 @@ export function ThreadView() {
           </>
         )}
       </form>
+      )}
 
       <Modal
         open={mediaOpen}
@@ -3536,9 +3639,15 @@ export function ThreadView() {
               >
                 {summaryBusy ? 'Summarizing…' : 'Summarize thread (AI)'}
               </button>
-              <button className="danger full" type="button" onClick={() => void blockPeer()}>
-                Block user
-              </button>
+              {conversation.blockedByMe ? (
+                <button className="btn full" type="button" onClick={() => void unblockPeer()}>
+                  Unblock user
+                </button>
+              ) : (
+                <button className="danger full" type="button" onClick={() => void blockPeer()}>
+                  Block user
+                </button>
+              )}
               <button
                 className="ghost full"
                 type="button"

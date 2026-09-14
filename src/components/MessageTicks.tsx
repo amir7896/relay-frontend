@@ -1,9 +1,11 @@
 /** WhatsApp-style delivery/read ticks for your own messages. */
 export function MessageTicks({
   seen,
+  undelivered = false,
   status = 'sent',
 }: {
   seen: boolean;
+  undelivered?: boolean;
   status?: 'pending' | 'failed' | 'sent';
 }) {
   if (status === 'pending') {
@@ -55,8 +57,21 @@ export function MessageTicks({
     );
   }
 
+  if (undelivered) {
+    return (
+      <span className="wa-ticks single" aria-label="Sent">
+        <svg viewBox="0 0 12 11" width="12" height="11" aria-hidden="true">
+          <path
+            d="M10.2 0.8 4.1 7.3 1.7 4.8 0.5 6.05l3.6 3.75L11.45 2.05z"
+            fill="currentColor"
+          />
+        </svg>
+      </span>
+    );
+  }
+
   return (
-    <span className={seen ? 'wa-ticks seen' : 'wa-ticks'} aria-label={seen ? 'Seen' : 'Sent'}>
+    <span className={seen ? 'wa-ticks seen' : 'wa-ticks'} aria-label={seen ? 'Seen' : 'Delivered'}>
       <svg viewBox="0 0 16 11" width="16" height="11" aria-hidden="true">
         <path
           d="M11.07 0.8 5.8 6.4 4.13 4.7 2.9 5.95l2.9 2.95L12.3 2.05z"

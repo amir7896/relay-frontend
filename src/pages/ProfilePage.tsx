@@ -1,8 +1,9 @@
-import { FormEvent, useEffect, useState } from 'react';
+import { FormEvent, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
 import { PasswordInput } from '../components/PasswordInput';
+import { resolveMediaUrl } from '../components/VoiceNotePlayer';
 import { initials } from '../lib/format';
 import {
   getNotificationPermission,
@@ -40,10 +41,16 @@ export function ProfilePage() {
   const [invites, setInvites] = useState<WorkspaceInvite[]>([]);
   const [inviteUrl, setInviteUrl] = useState('');
   const [inviteBusy, setInviteBusy] = useState(false);
+  const [avatarDraft, setAvatarDraft] = useState<string | null>(null);
+  const [avatarUploading, setAvatarUploading] = useState(false);
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     void api<UserProfile>('/users/me')
-      .then((response) => setProfile(response.data))
+      .then((response) => {
+        setProfile(response.data);
+        setAvatarDraft(response.data.avatar ?? null);
+      })
       .catch((err: unknown) => {
         setError(err instanceof Error ? err.message : 'Could not load profile');
       });
@@ -147,19 +154,90 @@ export function ProfilePage() {
     }
   }
 
+  async function uploadAvatar(file: File) {
+    if (!file.type.startsWith('image/')) {
+      setError('Please choose an image file (JPEG, PNG, GIF, or WebP).');
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      setError('Image must be 10MB or smaller.');
+      return;
+    }
+
+    setError('');
+    setSaved('');
+    setAvatarUploading(true);
+    const previewUrl = URL.createObjectURL(file);
+    setAvatarDraft(previewUrl);
+    try {
+      const body = new FormData();
+      body.append('file', file);
+      const response = await api<
+        UserProfile & {
+          upload?: { url?: string; key?: string; provider?: string };
+        }
+      >('/users/me/avatar', {
+        method: 'POST',
+        body,
+      });
+      const nextAvatar =
+        response.data.avatar?.trim() ||
+        response.data.upload?.url?.trim() ||
+        null;
+      if (!nextAvatar) {
+        throw new Error('Upload succeeded but no photo URL was returned');
+      }
+      // Confirm the URL was persisted (survives refresh).
+      const confirmed = await api<UserProfile>('/users/me');
+      const savedAvatar = confirmed.data.avatar?.trim() || nextAvatar;
+      setProfile(confirmed.data);
+      setAvatarDraft(savedAvatar);
+      setSaved('Profile photo saved to Cloudinary');
+    } catch (err) {
+      setAvatarDraft(profile?.avatar ?? null);
+      setError(err instanceof Error ? err.message : 'Could not upload photo');
+    } finally {
+      URL.revokeObjectURL(previewUrl);
+      setAvatarUploading(false);
+      if (avatarInputRef.current) {
+        avatarInputRef.current.value = '';
+      }
+    }
+  }
+
+  async function removeAvatar() {
+    setError('');
+    setSaved('');
+    setAvatarUploading(true);
+    try {
+      const response = await api<UserProfile>('/users/me', {
+        method: 'PATCH',
+        body: JSON.stringify({ avatar: '' }),
+      });
+      setProfile(response.data);
+      setAvatarDraft(response.data.avatar ?? null);
+      setSaved('Profile photo removed');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not remove photo');
+    } finally {
+      setAvatarUploading(false);
+    }
+  }
+
   async function saveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError('');
     setSaved('');
     setBusy(true);
     const form = new FormData(event.currentTarget);
-    const body: Record<string, string | boolean> = {};
-    for (const key of ['firstName', 'lastName', 'phone', 'bio', 'avatar', 'dateOfBirth']) {
+    const body: Record<string, string | boolean | null> = {};
+    for (const key of ['firstName', 'lastName', 'phone', 'bio', 'dateOfBirth']) {
       const value = String(form.get(key) ?? '').trim();
       if (value) {
         body[key] = value;
       }
     }
+    // Photo is saved via POST /users/me/avatar — never clear it from this form.
     body.showLastSeen = form.get('showLastSeen') === 'on';
     try {
       const response = await api<UserProfile>('/users/me', {
@@ -167,6 +245,7 @@ export function ProfilePage() {
         body: JSON.stringify(body),
       });
       setProfile(response.data);
+      setAvatarDraft(response.data.avatar ?? null);
       setSaved('Profile saved');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not save');
@@ -199,7 +278,7 @@ export function ProfilePage() {
   const name = profile
     ? `${profile.firstName} ${profile.lastName}`.trim()
     : session?.user.email ?? 'You';
-  const avatarUrl = profile?.avatar?.trim() || '';
+  const avatarUrl = resolveMediaUrl((avatarDraft ?? profile?.avatar ?? '').trim());
   const notifyLabel =
     notifyStatus === 'granted'
       ? 'Allowed'
@@ -218,6 +297,47 @@ export function ProfilePage() {
           ) : (
             <div className="avatar xl profile-avatar-fallback">{initials(name)}</div>
           )}
+          <input
+            ref={avatarInputRef}
+            type="file"
+            accept="image/jpeg,image/png,image/gif,image/webp"
+            className="sr-only"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) {
+                void uploadAvatar(file);
+              }
+            }}
+          />
+          <button
+            className="profile-avatar-edit"
+            type="button"
+            disabled={avatarUploading || busy}
+            aria-label={avatarUploading ? 'Uploading photo' : 'Upload profile photo'}
+            title={avatarUploading ? 'Uploading…' : 'Upload profile photo'}
+            onClick={() => avatarInputRef.current?.click()}
+          >
+            {avatarUploading ? (
+              <span className="profile-avatar-edit-busy">…</span>
+            ) : (
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm4 18H6V4h7v5h5v11zM8 13h8v2H8v-2zm0 4h5v2H8v-2z"
+                />
+              </svg>
+            )}
+          </button>
+          {avatarDraft && !avatarDraft.startsWith('blob:') ? (
+            <button
+              className="profile-avatar-remove"
+              type="button"
+              disabled={avatarUploading || busy}
+              onClick={() => void removeAvatar()}
+            >
+              Remove photo
+            </button>
+          ) : null}
         </div>
         <div className="profile-hero-copy">
           <p className="eyebrow">Your account</p>
@@ -308,20 +428,6 @@ export function ProfilePage() {
                 rows={3}
                 defaultValue={profile?.bio ?? ''}
                 placeholder="A short line about you"
-              />
-            </span>
-          </label>
-          <label className="profile-field profile-field-span">
-            <span className="profile-field-icon" aria-hidden="true">
-              <ImageIcon />
-            </span>
-            <span className="profile-field-body">
-              <span className="profile-field-label">Avatar URL</span>
-              <input
-                name="avatar"
-                defaultValue={profile?.avatar ?? ''}
-                placeholder="https://…"
-                autoComplete="off"
               />
             </span>
           </label>
@@ -659,16 +765,6 @@ function InfoIcon() {
     <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8">
       <circle cx="12" cy="12" r="8" />
       <path d="M12 11v5M12 8.2h.01" strokeLinecap="round" />
-    </svg>
-  );
-}
-
-function ImageIcon() {
-  return (
-    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8">
-      <rect x="4" y="5" width="16" height="14" rx="2" />
-      <circle cx="9" cy="10" r="1.5" />
-      <path d="M7 17l4-4 3 3 3-4 3 5" strokeLinejoin="round" />
     </svg>
   );
 }

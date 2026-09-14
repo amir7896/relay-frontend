@@ -1,4 +1,5 @@
-import { type ReactNode } from 'react';
+import { type ReactNode, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 
 export function Modal({
   open,
@@ -13,11 +14,32 @@ export function Modal({
   onClose: () => void;
   size?: 'md' | 'lg';
 }) {
-  if (!open) {
+  useEffect(() => {
+    if (!open) {
+      return;
+    }
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        onClose();
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open, onClose]);
+
+  if (!open || typeof document === 'undefined') {
     return null;
   }
 
-  return (
+  return createPortal(
     <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div
         className={size === 'lg' ? 'modal modal-lg' : 'modal'}
@@ -39,6 +61,7 @@ export function Modal({
         </div>
         <div className="modal-body">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

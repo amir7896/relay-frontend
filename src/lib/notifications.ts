@@ -66,12 +66,31 @@ export async function registerServiceWorker(): Promise<ServiceWorkerRegistration
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
     return null;
   }
+
+  // Dev: never register — old SW caches would hide Vite HMR updates.
+  if (import.meta.env.DEV) {
+    try {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((reg) => reg.unregister()));
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((key) => caches.delete(key)));
+      }
+    } catch {
+      // Ignore cleanup failures
+    }
+    return null;
+  }
+
   try {
-    return await navigator.serviceWorker.register('/sw.js');
+    const registration = await navigator.serviceWorker.register('/sw.js');
+    void registration.update();
+    return registration;
   } catch {
     return null;
   }
 }
+
 
 function applicationServerKey(value: string): ArrayBuffer {
   const padding = '='.repeat((4 - (value.length % 4)) % 4);

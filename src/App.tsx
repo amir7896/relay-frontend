@@ -2,6 +2,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 import { AuthProvider } from './auth/AuthContext';
 import { ThemeProvider } from './theme/ThemeContext';
 import { WorkspaceProvider } from './theme/WorkspaceContext';
+import { ConfirmProvider } from './components/ConfirmProvider';
 import { AppShell } from './components/AppShell';
 import { GuestLayout } from './components/GuestLayout';
 import { Protected } from './components/Protected';
@@ -26,32 +27,34 @@ export function App() {
       <WorkspaceProvider>
         <AuthProvider>
           <BrowserRouter>
-            <Routes>
-              <Route element={<GuestLayout />}>
-                <Route path="/" element={<LandingPage />} />
-                <Route path="/login" element={<LoginPage />} />
-                <Route path="/register" element={<RegisterPage />} />
-                <Route path="/forgot-password" element={<ForgotPasswordPage />} />
-                <Route path="/reset-password" element={<ResetPasswordPage />} />
-                <Route path="/verify-email" element={<VerifyEmailPage />} />
-                <Route path="/invite/:token" element={<InviteAcceptPage />} />
-              </Route>
-              <Route element={<Protected />}>
-                <Route element={<AppShell />}>
-                  <Route path="/chat" element={<MessengerPage />}>
-                    <Route index element={<EmptyThread />} />
-                    <Route path=":id" element={<ThreadView />} />
-                  </Route>
-                  <Route path="/profile" element={<ProfilePage />} />
-                  <Route path="/blocked" element={<BlockedUsersPage />} />
-                  <Route path="/people" element={<PeoplePage />} />
-                  <Route path="/analytics" element={<AnalyticsPage />} />
+            <ConfirmProvider>
+              <Routes>
+                <Route element={<GuestLayout />}>
+                  <Route path="/" element={<LandingPage />} />
+                  <Route path="/login" element={<LoginPage />} />
+                  <Route path="/register" element={<RegisterPage />} />
+                  <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+                  <Route path="/reset-password" element={<ResetPasswordPage />} />
+                  <Route path="/verify-email" element={<VerifyEmailPage />} />
+                  <Route path="/invite/:token" element={<InviteAcceptPage />} />
                 </Route>
-              </Route>
-              <Route path="/auth/login" element={<Navigate to="/login" replace />} />
-              <Route path="/auth/register" element={<Navigate to="/register" replace />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Routes>
+                <Route element={<Protected />}>
+                  <Route element={<AppShell />}>
+                    <Route path="/chat" element={<MessengerPage />}>
+                      <Route index element={<EmptyThread />} />
+                      <Route path=":id" element={<ThreadView />} />
+                    </Route>
+                    <Route path="/profile" element={<ProfilePage />} />
+                    <Route path="/blocked" element={<BlockedUsersPage />} />
+                    <Route path="/people" element={<PeoplePage />} />
+                    <Route path="/analytics" element={<AnalyticsPage />} />
+                  </Route>
+                </Route>
+                <Route path="/auth/login" element={<Navigate to="/login" replace />} />
+                <Route path="/auth/register" element={<Navigate to="/register" replace />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Routes>
+            </ConfirmProvider>
           </BrowserRouter>
         </AuthProvider>
       </WorkspaceProvider>

@@ -15,7 +15,11 @@ type DirectoryContextValue = {
   people: UserProfile[];
   byUserId: Map<string, UserProfile>;
   error: string;
-  ensureProfiles: (userIds: string[]) => Promise<void>;
+  refreshDirectory: () => Promise<void>;
+  ensureProfiles: (
+    userIds: string[],
+    options?: { refresh?: boolean },
+  ) => Promise<void>;
 };
 
 const DirectoryContext = createContext<DirectoryContextValue | null>(null);
@@ -26,18 +30,21 @@ export function DirectoryProvider({ children }: { children: ReactNode }) {
   const [people, setPeople] = useState<UserProfile[]>([]);
   const [error, setError] = useState('');
 
-  useEffect(() => {
-    void api<Paginated<UserProfile>>(
-      '/users/directory?page=1&limit=100&sortBy=firstName&order=ASC',
-    )
-      .then((response) => {
-        setPeople(response.data.items);
-        setError('');
-      })
-      .catch((err: unknown) => {
-        setError(err instanceof Error ? err.message : 'Could not load people');
-      });
+  const refreshDirectory = useCallback(async () => {
+    try {
+      const response = await api<Paginated<UserProfile>>(
+        '/users/directory?page=1&limit=100&sortBy=firstName&order=ASC',
+      );
+      setPeople(response.data.items);
+      setError('');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Could not load people');
+    }
   }, []);
+
+  useEffect(() => {
+    void refreshDirectory();
+  }, [refreshDirectory]);
 
   const byUserId = useMemo(() => {
     const map = new Map<string, UserProfile>();
@@ -48,10 +55,12 @@ export function DirectoryProvider({ children }: { children: ReactNode }) {
   }, [people]);
 
   const ensureProfiles = useCallback(
-    async (userIds: string[]) => {
-      const missing = [...new Set(userIds)].filter(
-        (userId) => userId && !byUserId.has(userId),
-      );
+    async (userIds: string[], options?: { refresh?: boolean }) => {
+      const missing = [...new Set(userIds)].filter((userId) => {
+        if (!userId) return false;
+        if (options?.refresh) return true;
+        return !byUserId.has(userId);
+      });
       if (missing.length === 0) {
         return;
       }
@@ -89,8 +98,14 @@ export function DirectoryProvider({ children }: { children: ReactNode }) {
   );
 
   const value = useMemo(
-    () => ({ people: others, byUserId, error, ensureProfiles }),
-    [others, byUserId, error, ensureProfiles],
+    () => ({
+      people: others,
+      byUserId,
+      error,
+      refreshDirectory,
+      ensureProfiles,
+    }),
+    [others, byUserId, error, refreshDirectory, ensureProfiles],
   );
 
   return (

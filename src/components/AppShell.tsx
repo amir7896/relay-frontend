@@ -1,7 +1,10 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { api } from '../api/client';
+import type { UserProfile } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
 import { initials } from '../lib/format';
+import { resolveMediaUrl } from './VoiceNotePlayer';
 import { DirectoryProvider } from '../people/DirectoryContext';
 import { ChatSocketProvider } from '../chat/ChatSocketContext';
 import { VoiceCallProvider } from '../calls/VoiceCallContext';
@@ -9,7 +12,6 @@ import { DemoTour } from './DemoTour';
 import { ThemeToggle } from './ThemeToggle';
 import { VoiceCallOverlay } from './VoiceCallOverlay';
 import { useWorkspace } from '../theme/WorkspaceContext';
-import { api } from '../api/client';
 
 type NavItem = {
   to: string;
@@ -91,6 +93,7 @@ export function AppShell() {
   const [verifyMessage, setVerifyMessage] = useState('');
   const [debugVerifyUrl, setDebugVerifyUrl] = useState('');
   const [verifyBusy, setVerifyBusy] = useState(false);
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const isAdmin = session?.user.role === 'admin';
   const workspace = useWorkspace();
   const email = session?.user.email ?? '';
@@ -106,6 +109,26 @@ export function AppShell() {
     document.body.classList.toggle('nav-open', menuOpen);
     return () => document.body.classList.remove('nav-open');
   }, [menuOpen]);
+
+  useEffect(() => {
+    if (!session?.user.id) {
+      setAvatarUrl(null);
+      return;
+    }
+    let cancelled = false;
+    void api<UserProfile>('/users/me')
+      .then((response) => {
+        if (cancelled) return;
+        const url = response.data.avatar?.trim();
+        setAvatarUrl(url ? resolveMediaUrl(url) : null);
+      })
+      .catch(() => {
+        if (!cancelled) setAvatarUrl(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.user.id, location.pathname]);
 
   async function onLogout() {
     await logout();
@@ -158,7 +181,11 @@ export function AppShell() {
 
         <div className="side-nav-footer">
           <div className="side-nav-user" title={email}>
-            <div className="avatar sm">{initials(handle)}</div>
+            {avatarUrl ? (
+              <img className="avatar sm" src={avatarUrl} alt="" />
+            ) : (
+              <div className="avatar sm">{initials(handle)}</div>
+            )}
             <div className="side-nav-user-meta">
               <strong>{handle}</strong>
               <span className="role-chip">{isAdmin ? 'Admin' : 'Member'}</span>

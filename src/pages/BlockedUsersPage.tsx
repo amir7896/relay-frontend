@@ -2,12 +2,14 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
 import type { BlockView } from '../api/types';
+import { useConfirm } from '../components/ConfirmProvider';
 import { displayName, initials } from '../lib/format';
 import { useDirectory } from '../people/useDirectory';
 import { resolveMediaUrl } from '../components/VoiceNotePlayer';
 
 export function BlockedUsersPage() {
   const { byUserId, ensureProfiles } = useDirectory();
+  const askConfirm = useConfirm();
   const [blocks, setBlocks] = useState<BlockView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -59,7 +61,13 @@ export function BlockedUsersPage() {
   async function unblock(userId: string) {
     const person = byUserId.get(userId);
     const label = displayName(person);
-    if (!window.confirm(`Unblock ${label}? They will be able to message you again.`)) {
+    const ok = await askConfirm({
+      title: 'Unblock user',
+      message: `Unblock ${label}? They will be able to message you again.`,
+      confirmLabel: 'Unblock',
+      cancelLabel: 'Cancel',
+    });
+    if (!ok) {
       return;
     }
     setBusyId(userId);

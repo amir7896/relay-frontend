@@ -101,6 +101,7 @@ export type ChatMessage = {
   forwarded: boolean;
   deletedForEveryone: boolean;
   seenBy: string[];
+  undelivered?: boolean;
   expiresAt?: string | null;
   createdAt: string;
   /** Client-only: optimistic send state for attachments */
@@ -147,6 +148,8 @@ export type Conversation = {
   muted: boolean;
   pinned: boolean;
   disappearingDurationSeconds?: number;
+  blockedByMe?: boolean;
+  blockedMe?: boolean;
   unreadCount: number;
   members: ConversationMember[];
   createdAt: string;
