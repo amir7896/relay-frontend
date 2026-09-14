@@ -17,7 +17,7 @@ const steps = [
   {
     target: '.composer',
     title: 'Rich composer',
-    body: 'Attach images, record voice notes, @mention teammates, and use smart reply chips.',
+    body: 'Attach images, documents, voice notes, @mentions, and polls. Save important messages from the ⋮ menu.',
   },
   {
     target: '.side-nav-links',

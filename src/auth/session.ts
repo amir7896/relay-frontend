@@ -1,3 +1,5 @@
+import type { OrganizationView } from '../api/types';
+
 const SESSION_KEY = 'ms-frontend-session';
 
 export type Session = {
@@ -9,6 +11,8 @@ export type Session = {
     role: string;
     isEmailVerified?: boolean;
   };
+  organizations: OrganizationView[];
+  activeOrganizationId: string | null;
 };
 
 export function getSession(): Session | null {
@@ -17,7 +21,18 @@ export function getSession(): Session | null {
     return null;
   }
   try {
-    return JSON.parse(raw) as Session;
+    const parsed = JSON.parse(raw) as Partial<Session>;
+    if (!parsed?.accessToken || !parsed?.refreshToken || !parsed?.user) {
+      localStorage.removeItem(SESSION_KEY);
+      return null;
+    }
+    return {
+      accessToken: parsed.accessToken,
+      refreshToken: parsed.refreshToken,
+      user: parsed.user,
+      organizations: Array.isArray(parsed.organizations) ? parsed.organizations : [],
+      activeOrganizationId: parsed.activeOrganizationId ?? null,
+    };
   } catch {
     localStorage.removeItem(SESSION_KEY);
     return null;

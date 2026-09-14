@@ -2,11 +2,12 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
 } from 'react';
-import { api } from '../api/client';
+import { api, refreshSession } from '../api/client';
 import type { AuthResult } from '../api/types';
 import { clearSession, getSession, setSession, type Session } from './session';
 
@@ -23,6 +24,8 @@ type AuthContextValue = {
   login: (email: string, password: string) => Promise<void>;
   register: (input: RegisterInput) => Promise<void>;
   logout: () => Promise<void>;
+  /** Persist session to localStorage and React state together. */
+  replaceSession: (next: Session | null) => void;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -37,6 +40,8 @@ function toSession(result: AuthResult): Session {
       role: result.user.role,
       isEmailVerified: result.user.isEmailVerified,
     },
+    organizations: result.organizations ?? [],
+    activeOrganizationId: result.activeOrganizationId ?? null,
   };
 }
 
@@ -47,6 +52,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const next = toSession(result);
     setSession(next);
     setSessionState(next);
+  }, []);
+
+  useEffect(() => {
+    const current = getSession();
+    if (!current?.refreshToken) {
+      return;
+    }
+    if (current.activeOrganizationId && current.organizations.length > 0) {
+      return;
+    }
+    void refreshSession().then((ok) => {
+      if (ok) {
+        setSessionState(getSession());
+      }
+    });
   }, []);
 
   const login = useCallback(
@@ -87,9 +107,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setSessionState(null);
   }, []);
 
+  const replaceSession = useCallback((next: Session | null) => {
+    if (!next) {
+      clearSession();
+      setSessionState(null);
+      return;
+    }
+    setSession(next);
+    setSessionState(next);
+  }, []);
+
   const value = useMemo(
-    () => ({ session, login, register, logout }),
-    [session, login, register, logout],
+    () => ({ session, login, register, logout, replaceSession }),
+    [session, login, register, logout, replaceSession],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

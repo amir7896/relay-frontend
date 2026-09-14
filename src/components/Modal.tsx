@@ -7,12 +7,14 @@ export function Modal({
   children,
   onClose,
   size = 'md',
+  className = '',
 }: {
   open: boolean;
   title: string;
   children: ReactNode;
   onClose: () => void;
   size?: 'md' | 'lg';
+  className?: string;
 }) {
   useEffect(() => {
     if (!open) {
@@ -42,7 +44,9 @@ export function Modal({
   return createPortal(
     <div className="modal-backdrop" onClick={onClose} role="presentation">
       <div
-        className={size === 'lg' ? 'modal modal-lg' : 'modal'}
+        className={[size === 'lg' ? 'modal modal-lg' : 'modal', className]
+          .filter(Boolean)
+          .join(' ')}
         role="dialog"
         aria-modal="true"
         aria-labelledby="modal-title"

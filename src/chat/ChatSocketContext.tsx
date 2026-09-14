@@ -10,7 +10,7 @@ import {
 } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import { useAuth } from '../auth/AuthContext';
-import { getAccessToken } from '../auth/session';
+import { getAccessToken, getSession } from '../auth/session';
 
 type SocketListener = (...args: unknown[]) => void;
 
@@ -51,7 +51,10 @@ export function ChatSocketProvider({ children }: { children: ReactNode }) {
     }
 
     const socket = io('/chat', {
-      auth: { token },
+      auth: {
+        token,
+        organizationId: getSession()?.activeOrganizationId ?? undefined,
+      },
       transports: ['websocket', 'polling'],
       extraHeaders: {
         'ngrok-skip-browser-warning': 'true',
@@ -97,7 +100,7 @@ export function ChatSocketProvider({ children }: { children: ReactNode }) {
       socketRef.current = null;
       setConnected(false);
     };
-  }, [attachAllListeners, session?.user.id]);
+  }, [attachAllListeners, session?.user.id, session?.activeOrganizationId]);
 
   const joinConversation = useCallback((conversationId: string) => {
     activeConversationRef.current = conversationId;

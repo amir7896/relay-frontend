@@ -15,6 +15,7 @@ import { notify, subscribeWebPush, shouldShowNotificationBanner, dismissNotifica
 import { usePwaInstall } from '../../hooks/usePwaInstall';
 import { useDirectory } from '../../people/useDirectory';
 import { UserAvatar } from '../../components/UserAvatar';
+import { useOrganization } from '../../organizations/OrganizationContext';
 import type { ChatMessage, Conversation, GlobalSearchHit, Paginated, UserProfile } from '../../api/types';
 
 export type MessengerOutletContext = {
@@ -77,6 +78,11 @@ function previewText(message: ChatMessage | null | undefined, me?: string) {
       return 'Call';
     }
   }
+  if (message.type === 'poll' || message.poll) {
+    const prefix = message.senderId === me ? 'You: ' : '';
+    const question = message.poll?.question || message.body || 'Poll';
+    return `${prefix}📊 ${question.length > 48 ? `${question.slice(0, 48)}…` : question}`;
+  }
   if (message.attachment && message.type === 'image') {
     const prefix = message.senderId === me ? 'You: ' : '';
     return `${prefix}Photo`;
@@ -105,6 +111,8 @@ function normalizeConversation(item: Conversation): Conversation {
     pinned: Boolean(item.pinned),
     blockedByMe: Boolean(item.blockedByMe),
     blockedMe: Boolean(item.blockedMe),
+    hasUnreadMention: Boolean(item.hasUnreadMention),
+    firstUnreadMentionMessageId: item.firstUnreadMentionMessageId ?? null,
     lastMessage: item.lastMessage
       ? {
           ...item.lastMessage,
@@ -112,6 +120,7 @@ function normalizeConversation(item: Conversation): Conversation {
           attachment: item.lastMessage.attachment ?? null,
           mentions: item.lastMessage.mentions ?? [],
           linkPreview: item.lastMessage.linkPreview ?? null,
+          poll: item.lastMessage.poll ?? null,
           editedAt: item.lastMessage.editedAt ?? null,
           forwarded: Boolean(item.lastMessage.forwarded),
           undelivered: Boolean(item.lastMessage.undelivered),
@@ -122,8 +131,9 @@ function normalizeConversation(item: Conversation): Conversation {
 
 export function MessengerPage() {
   const { session } = useAuth();
+  const { organizations, activeOrganizationId } = useOrganization();
   const navigate = useNavigate();
-  const threadMatch = useMatch('/chat/:id');
+  const threadMatch = useMatch({ path: '/chat/:id', end: false });
   const activeConversationId = threadMatch?.params.id;
   const hasThread = Boolean(activeConversationId);
   const activeIdRef = useRef(activeConversationId);
@@ -131,6 +141,10 @@ export function MessengerPage() {
   const me = session?.user.id;
   const meRef = useRef(me);
   meRef.current = me;
+  const activeOrg =
+    organizations.find((org) => org.id === activeOrganizationId) ??
+    organizations[0];
+  const openedGeneralRef = useRef(false);
   const { people, byUserId, error: directoryError, ensureProfiles, refreshDirectory } =
     useDirectory();
   const [items, setItems] = useState<Conversation[]>([]);
@@ -157,8 +171,14 @@ export function MessengerPage() {
   const clearUnread = useCallback((conversationId: string) => {
     setItems((current) =>
       current.map((item) =>
-        item.id === conversationId && item.unreadCount > 0
-          ? { ...item, unreadCount: 0 }
+        item.id === conversationId &&
+        (item.unreadCount > 0 || item.hasUnreadMention)
+          ? {
+              ...item,
+              unreadCount: 0,
+              hasUnreadMention: false,
+              firstUnreadMentionMessageId: null,
+            }
           : item,
       ),
     );
@@ -174,7 +194,12 @@ export function MessengerPage() {
         response.data.items.map((item) => {
           const normalized = normalizeConversation(item);
           return item.id === activeId
-            ? { ...normalized, unreadCount: 0 }
+            ? {
+                ...normalized,
+                unreadCount: 0,
+                hasUnreadMention: false,
+                firstUnreadMentionMessageId: null,
+              }
             : normalized;
         }),
       );
@@ -200,12 +225,15 @@ export function MessengerPage() {
       last.id === message.id ||
       messageTime >= lastTime;
     const isBrandNew = Boolean(existing && (!last || last.id !== message.id));
+    const mentionsMe =
+      Boolean(selfId) && (message.mentions ?? []).includes(selfId!);
+    // Slack-style: muted chats stay quiet unless you were @mentioned.
     const shouldNotify =
       Boolean(existing) &&
       fromOther &&
       isBrandNew &&
       isLatestUpdate &&
-      !existing?.muted;
+      (!existing?.muted || mentionsMe);
 
     setItems((current) => {
       const index = current.findIndex((item) => item.id === message.conversationId);
@@ -231,12 +259,24 @@ export function MessengerPage() {
             ? 0
             : row.unreadCount
           : row.unreadCount + 1;
+      const hasUnreadMention = isActive
+        ? false
+        : fromOther && mentionsMe && rowIsBrandNew
+          ? true
+          : row.hasUnreadMention;
+      const firstUnreadMentionMessageId = isActive
+        ? null
+        : fromOther && mentionsMe && rowIsBrandNew
+          ? row.firstUnreadMentionMessageId ?? message.id
+          : row.firstUnreadMentionMessageId ?? null;
 
       const updated: Conversation = {
         ...row,
         lastMessageAt: message.createdAt,
         lastMessage: message,
         unreadCount,
+        hasUnreadMention,
+        firstUnreadMentionMessageId,
       };
       const without = current.filter((_, i) => i !== index);
       if (row.pinned) {
@@ -261,13 +301,19 @@ export function MessengerPage() {
     if (!inactiveOrHidden) {
       return;
     }
-    const title = existing
+    const chatTitle = existing
       ? conversationTitle(existing, selfId, byUserIdRef.current)
       : 'New message';
-    const body =
+    const title = mentionsMe ? `${chatTitle} · mentioned you` : chatTitle;
+    const preview =
       message.attachment && message.type === 'image'
         ? 'Sent a photo'
         : message.body || 'New message';
+    const body = mentionsMe
+      ? preview.startsWith('@')
+        ? preview
+        : `Mention: ${preview}`
+      : preview;
     notify({
       title,
       body: body.length > 120 ? `${body.slice(0, 120)}…` : body,
@@ -357,6 +403,8 @@ export function MessengerPage() {
             const incoming: Conversation = {
               ...conversation,
               unreadCount: 0,
+              hasUnreadMention: false,
+              firstUnreadMentionMessageId: null,
               muted: false,
               pinned: false,
               lastReadAt: null,
@@ -367,6 +415,8 @@ export function MessengerPage() {
           const updated: Conversation = {
             ...conversation,
             unreadCount: existing.unreadCount,
+            hasUnreadMention: existing.hasUnreadMention,
+            firstUnreadMentionMessageId: existing.firstUnreadMentionMessageId,
             muted: existing.muted,
             pinned: existing.pinned,
             lastReadAt: existing.lastReadAt,
@@ -417,6 +467,35 @@ export function MessengerPage() {
       conversationTitle(item, me, byUserId).toLowerCase().includes(term),
     );
   }, [items, query, me, byUserId]);
+
+  const channels = useMemo(
+    () => filtered.filter((item) => item.type === 'group'),
+    [filtered],
+  );
+  const directs = useMemo(
+    () => filtered.filter((item) => item.type === 'private'),
+    [filtered],
+  );
+
+  useEffect(() => {
+    openedGeneralRef.current = false;
+  }, [activeOrganizationId]);
+
+  useEffect(() => {
+    if (hasThread || openedGeneralRef.current || items.length === 0) {
+      return;
+    }
+    const general = items.find(
+      (item) =>
+        item.type === 'group' &&
+        (item.name?.trim().toLowerCase() === 'general' ||
+          item.name?.trim().toLowerCase() === '#general'),
+    );
+    if (general) {
+      openedGeneralRef.current = true;
+      navigate(`/chat/${general.id}`, { replace: true });
+    }
+  }, [hasThread, items, navigate]);
 
   useEffect(() => {
     const term = query.trim();
@@ -475,6 +554,125 @@ export function MessengerPage() {
     refreshInbox: load,
     conversations: items,
   };
+
+  function renderConversationRow(item: Conversation) {
+    const title = conversationTitle(item, me, byUserId);
+    const peer = otherMember(item, me);
+    const peerProfile = peer ? byUserId.get(peer.userId) : undefined;
+    const avatarLabel =
+      item.type === 'group' ? title : displayName(peerProfile);
+    const online =
+      item.type === 'group'
+        ? item.members.some(
+            (member) => member.status === 'online' && member.userId !== me,
+          )
+        : peer?.status === 'online';
+    const preview =
+      previewText(item.lastMessage, me) ??
+      (item.type === 'group' ? 'Channel' : 'Direct message');
+    const timeLabel = inboxTime(item.lastMessageAt);
+    const unread =
+      item.id !== activeConversationId && item.unreadCount > 0
+        ? item.unreadCount
+        : 0;
+    const mentionUnread =
+      item.id !== activeConversationId && Boolean(item.hasUnreadMention);
+    const isChannel = item.type === 'group';
+
+    return (
+      <NavLink
+        key={item.id}
+        className={`chat-row${isChannel ? ' channel-row' : ''}${
+          item.muted ? ' muted-chat' : ''
+        }${item.pinned ? ' pinned-chat' : ''}${
+          unread || mentionUnread ? ' has-unread' : ''
+        }${mentionUnread ? ' has-mention' : ''}`}
+        to={`/chat/${item.id}`}
+      >
+        <span className="chat-avatar-wrap">
+          {isChannel ? (
+            <span className="channel-hash" aria-hidden="true">
+              #
+            </span>
+          ) : (
+            <UserAvatar profile={peerProfile} name={avatarLabel} size="sm" />
+          )}
+          {!isChannel ? (
+            <span className={online ? 'presence on' : 'presence'} />
+          ) : null}
+        </span>
+        <span className="chat-row-main">
+          <span className="chat-row-copy">
+            <strong className="chat-row-title">
+              {item.pinned ? (
+                <span className="pin-badge" title="Pinned" aria-hidden="true">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2zm-1.5 2h-5L11 12.5V4h2v8.5l1.5 1.5z"
+                    />
+                  </svg>
+                </span>
+              ) : null}
+              {isChannel ? title.replace(/^#/, '') : title}
+            </strong>
+            <small className="chat-row-preview">
+              {item.muted ? (
+                <span className="chat-mute-icon" title="Muted" aria-label="Muted">
+                  🔇
+                </span>
+              ) : null}
+              {preview}
+            </small>
+          </span>
+          <span className="chat-row-meta">
+            {timeLabel ? (
+              <time
+                className={`chat-row-time${unread ? ' unread-time' : ''}`}
+                dateTime={item.lastMessageAt ?? undefined}
+              >
+                {timeLabel}
+              </time>
+            ) : (
+              <span className="chat-row-time chat-row-time-spacer" aria-hidden="true">
+                &nbsp;
+              </span>
+            )}
+            <span className="chat-row-trailing">
+              <button
+                className={`pin-toggle${item.pinned ? ' is-pinned' : ''}`}
+                type="button"
+                title={item.pinned ? 'Unpin' : 'Pin'}
+                aria-label={item.pinned ? 'Unpin' : 'Pin'}
+                onClick={(event) => void togglePin(event, item)}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2zm-1.5 2h-5L11 12.5V4h2v8.5l1.5 1.5z"
+                  />
+                </svg>
+              </button>
+              {mentionUnread ? (
+                <span
+                  className={`mention-badge${item.muted ? ' quiet' : ''}`}
+                  title="You were mentioned"
+                  aria-label="Unread mention"
+                >
+                  @
+                </span>
+              ) : null}
+              {unread > 0 ? (
+                <span className={`unread${item.muted ? ' quiet' : ''}`}>
+                  {unread > 99 ? '99+' : unread}
+                </span>
+              ) : null}
+            </span>
+          </span>
+        </span>
+      </NavLink>
+    );
+  }
 
   async function togglePin(event: MouseEvent, item: Conversation) {
     event.preventDefault();
@@ -549,8 +747,8 @@ export function MessengerPage() {
 
   async function startGroup(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (groupMembers.length === 0) {
-      setModalError('Add at least one person to the group');
+    if (!groupName.trim()) {
+      setModalError('Channel name is required');
       return;
     }
     setBusy(true);
@@ -558,7 +756,10 @@ export function MessengerPage() {
     try {
       const response = await api<Conversation>('/chat/groups', {
         method: 'POST',
-        body: JSON.stringify({ name: groupName.trim(), memberIds: groupMembers }),
+        body: JSON.stringify({
+          name: groupName.trim().replace(/^#/, ''),
+          memberIds: groupMembers,
+        }),
       });
       setGroupOpen(false);
       setGroupName('');
@@ -566,24 +767,27 @@ export function MessengerPage() {
       await load();
       navigate(`/chat/${response.data.id}`);
     } catch (err) {
-      setModalError(err instanceof Error ? err.message : 'Could not create group');
+      setModalError(err instanceof Error ? err.message : 'Could not create channel');
     } finally {
       setBusy(false);
     }
   }
 
   return (
-    <div className={hasThread ? 'messenger has-thread' : 'messenger'}>
+    <div className={hasThread ? 'messenger has-thread slack-messenger' : 'messenger slack-messenger'}>
       <aside className="inbox">
         <div className="inbox-head">
           <div className="inbox-head-top">
-            <h1>Chats</h1>
+            <div className="inbox-workspace">
+              <h1>{activeOrg?.name ?? 'Workspace'}</h1>
+              <p className="muted inbox-workspace-sub">Channels &amp; messages</p>
+            </div>
             <div className="inbox-head-actions">
               <button
                 className="inbox-action-btn"
                 type="button"
-                aria-label="New chat"
-                title="New chat"
+                aria-label="New direct message"
+                title="New direct message"
                 onClick={outletContext.openNewChat}
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -596,14 +800,14 @@ export function MessengerPage() {
               <button
                 className="inbox-action-btn"
                 type="button"
-                aria-label="New group"
-                title="New group"
+                aria-label="Create a channel"
+                title="Create a channel"
                 onClick={outletContext.openNewGroup}
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path
                     fill="currentColor"
-                    d="M16 11c1.7 0 3-1.3 3-3s-1.3-3-3-3-3 1.3-3 3 1.3 3 3 3zm-8 0c1.7 0 3-1.3 3-3S9.7 5 8 5 5 6.3 5 8s1.3 3 3 3zm0 2c-2.3 0-7 1.2-7 3.5V19h14v-2.5C15 14.2 10.3 13 8 13zm8 0c-.3 0-.6 0-.9.1 1 0.7 1.9 1.6 1.9 3.4V19h6v-2.5c0-2.3-4.7-3.5-7-3.5z"
+                    d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z"
                   />
                 </svg>
               </button>
@@ -614,8 +818,8 @@ export function MessengerPage() {
               className="inbox-search"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search chats and messages"
-              aria-label="Search chats and messages"
+              placeholder="Search channels and messages"
+              aria-label="Search channels and messages"
             />
           </div>
         </div>
@@ -650,108 +854,52 @@ export function MessengerPage() {
           </div>
         ) : null}
         <div className="inbox-list">
-          {query.trim() ? (
-            <p className="inbox-section-label">Chats</p>
+          <div className="inbox-section-head">
+            <p className="inbox-section-label">Channels</p>
+            <button
+              type="button"
+              className="inbox-section-add"
+              aria-label="Create a channel"
+              title="Create a channel"
+              onClick={outletContext.openNewGroup}
+            >
+              +
+            </button>
+          </div>
+          {channels.map((item) => renderConversationRow(item))}
+          {channels.length === 0 && !query.trim() ? (
+            <button
+              type="button"
+              className="inbox-empty-link"
+              onClick={outletContext.openNewGroup}
+            >
+              Create a channel
+            </button>
           ) : null}
-          {filtered.map((item) => {
-            const title = conversationTitle(item, me, byUserId);
-            const peer = otherMember(item, me);
-            const peerProfile = peer ? byUserId.get(peer.userId) : undefined;
-            const avatarLabel =
-              item.type === 'group' ? title : displayName(peerProfile);
-            const online =
-              item.type === 'group'
-                ? item.members.some(
-                    (member) => member.status === 'online' && member.userId !== me,
-                  )
-                : peer?.status === 'online';
-            const preview =
-              previewText(item.lastMessage, me) ??
-              (item.type === 'group' ? 'Group' : 'Direct');
-            const timeLabel = inboxTime(item.lastMessageAt);
-            const unread =
-              item.id !== activeConversationId && item.unreadCount > 0
-                ? item.unreadCount
-                : 0;
-            return (
-              <NavLink
-                key={item.id}
-                className={`chat-row${item.muted ? ' muted-chat' : ''}${
-                  item.pinned ? ' pinned-chat' : ''
-                }${unread ? ' has-unread' : ''}`}
-                to={`/chat/${item.id}`}
-              >
-                <span className="chat-avatar-wrap">
-                  <UserAvatar
-                    profile={item.type === 'group' ? null : peerProfile}
-                    name={avatarLabel}
-                    size="sm"
-                  />
-                  <span className={online ? 'presence on' : 'presence'} />
-                </span>
-                <span className="chat-row-main">
-                  <span className="chat-row-copy">
-                    <strong className="chat-row-title">
-                      {item.pinned ? (
-                        <span className="pin-badge" title="Pinned" aria-hidden="true">
-                          <svg viewBox="0 0 24 24" aria-hidden="true">
-                            <path
-                              fill="currentColor"
-                              d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2zm-1.5 2h-5L11 12.5V4h2v8.5l1.5 1.5z"
-                            />
-                          </svg>
-                        </span>
-                      ) : null}
-                      {title}
-                    </strong>
-                    <small className="chat-row-preview">
-                      {item.muted ? (
-                        <span className="chat-mute-icon" title="Muted" aria-label="Muted">
-                          🔇
-                        </span>
-                      ) : null}
-                      {preview}
-                    </small>
-                  </span>
-                  <span className="chat-row-meta">
-                    {timeLabel ? (
-                      <time
-                        className={`chat-row-time${unread ? ' unread-time' : ''}`}
-                        dateTime={item.lastMessageAt ?? undefined}
-                      >
-                        {timeLabel}
-                      </time>
-                    ) : (
-                      <span className="chat-row-time chat-row-time-spacer" aria-hidden="true">
-                        &nbsp;
-                      </span>
-                    )}
-                    <span className="chat-row-trailing">
-                      <button
-                        className={`pin-toggle${item.pinned ? ' is-pinned' : ''}`}
-                        type="button"
-                        title={item.pinned ? 'Unpin chat' : 'Pin chat'}
-                        aria-label={item.pinned ? 'Unpin chat' : 'Pin chat'}
-                        onClick={(event) => void togglePin(event, item)}
-                      >
-                        <svg viewBox="0 0 24 24" aria-hidden="true">
-                          <path
-                            fill="currentColor"
-                            d="M16 12V4h1V2H7v2h1v8l-2 2v2h5.2v6h1.6v-6H18v-2l-2-2zm-1.5 2h-5L11 12.5V4h2v8.5l1.5 1.5z"
-                          />
-                        </svg>
-                      </button>
-                      {unread > 0 ? (
-                        <span className={`unread${item.muted ? ' quiet' : ''}`}>
-                          {unread > 99 ? '99+' : unread}
-                        </span>
-                      ) : null}
-                    </span>
-                  </span>
-                </span>
-              </NavLink>
-            );
-          })}
+
+          <div className="inbox-section-head">
+            <p className="inbox-section-label">Direct messages</p>
+            <button
+              type="button"
+              className="inbox-section-add"
+              aria-label="New direct message"
+              title="New direct message"
+              onClick={outletContext.openNewChat}
+            >
+              +
+            </button>
+          </div>
+          {directs.map((item) => renderConversationRow(item))}
+          {directs.length === 0 && !query.trim() ? (
+            <button
+              type="button"
+              className="inbox-empty-link"
+              onClick={outletContext.openNewChat}
+            >
+              Message a teammate
+            </button>
+          ) : null}
+
           {query.trim().length >= 2 ? (
             <>
               <p className="inbox-section-label">
@@ -809,18 +957,9 @@ export function MessengerPage() {
               ) : null}
             </>
           ) : null}
-          {filtered.length === 0 && !(query.trim().length >= 2 && (messageHits.length > 0 || messageSearchBusy)) ? (
+          {filtered.length === 0 && query.trim() && !(query.trim().length >= 2 && (messageHits.length > 0 || messageSearchBusy)) ? (
             <div className="inbox-empty">
-              <p className="muted">
-                {query.trim()
-                  ? 'No chats match that search.'
-                  : 'No conversations yet. Start with a direct message or a group.'}
-              </p>
-              {!query.trim() ? (
-                <button className="btn" type="button" onClick={outletContext.openNewChat}>
-                  Start a chat
-                </button>
-              ) : null}
+              <p className="muted">No channels or DMs match that search.</p>
             </div>
           ) : null}
         </div>
@@ -829,7 +968,7 @@ export function MessengerPage() {
 
       <Modal
         open={dmOpen}
-        title="New chat"
+        title="New direct message"
         size="lg"
         onClose={() => {
           setDmOpen(false);
@@ -837,7 +976,7 @@ export function MessengerPage() {
         }}
       >
         <p className="muted modal-lead">
-          Pick someone from the workspace to start a private thread.
+          Pick someone from the workspace to start a private conversation.
         </p>
         {modalError ? <p className="error">{modalError}</p> : null}
         <PeoplePicker
@@ -853,7 +992,7 @@ export function MessengerPage() {
 
       <Modal
         open={groupOpen}
-        title="New group"
+        title="Create a channel"
         size="lg"
         onClose={() => {
           setGroupOpen(false);
@@ -863,19 +1002,19 @@ export function MessengerPage() {
       >
         <form className="modal-form" onSubmit={(event) => void startGroup(event)}>
           <label>
-            Group name
+            Channel name
             <input
               value={groupName}
               onChange={(event) => setGroupName(event.target.value)}
               required
               maxLength={120}
-              placeholder="Launch team"
+              placeholder="product-launch"
             />
           </label>
           <div className="modal-section">
             <p className="muted">
               {groupMembers.length === 0
-                ? 'Select people to add'
+                ? 'Optional — add people now, or invite later'
                 : `${groupMembers.length} selected`}
             </p>
             <PeoplePicker
@@ -889,9 +1028,9 @@ export function MessengerPage() {
           <button
             className="btn full"
             type="submit"
-            disabled={busy || groupMembers.length === 0 || !groupName.trim()}
+            disabled={busy || !groupName.trim()}
           >
-            Create group
+            Create channel
           </button>
         </form>
       </Modal>

@@ -1,6 +1,7 @@
 import { FormEvent, useState } from 'react';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
+import { getSession } from '../auth/session';
 import { PasswordInput } from '../components/PasswordInput';
 import {
   hasFieldErrors,
@@ -13,16 +14,22 @@ export function LoginPage() {
   const { login } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const inviteToken = searchParams.get('inviteToken');
   const [error, setError] = useState('');
   const [fieldErrors, setFieldErrors] = useState<FieldErrors<keyof LoginFields>>(
     {},
   );
   const [busy, setBusy] = useState(false);
+  const fromRaw = (location.state as { from?: string } | null)?.from;
   const from =
-    (location.state as { from?: string } | null)?.from &&
-    String((location.state as { from: string }).from).startsWith('/')
-      ? (location.state as { from: string }).from
-      : '/chat';
+    inviteToken
+      ? `/invite/${inviteToken}`
+      : fromRaw &&
+          String(fromRaw).startsWith('/') &&
+          fromRaw !== '/onboarding'
+        ? String(fromRaw)
+        : '/chat';
 
   function clearField(field: keyof LoginFields) {
     setFieldErrors((current) => {
@@ -48,7 +55,13 @@ export function LoginPage() {
     setBusy(true);
     try {
       await login(fields.email.trim().toLowerCase(), fields.password);
-      navigate(from, { replace: true });
+      const next = getSession();
+      navigate(
+        next?.organizations.length && next.activeOrganizationId
+          ? from
+          : '/onboarding',
+        { replace: true },
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not sign in');
     } finally {

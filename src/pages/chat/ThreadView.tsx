@@ -8,7 +8,6 @@ import { useVoiceCall } from '../../calls/VoiceCallContext';
 import { Modal } from '../../components/Modal';
 import { useConfirm } from '../../components/ConfirmProvider';
 import { MessageTicks } from '../../components/MessageTicks';
-import { PeoplePicker } from '../../components/PeoplePicker';
 import { UserAvatar } from '../../components/UserAvatar';
 import {
   resolveMediaUrl,
@@ -44,6 +43,7 @@ import type {
   ChatMessage,
   Conversation,
   LinkPreview,
+  MessageBookmark,
   Paginated,
   ScheduledMessage,
   SeenResult,
@@ -123,6 +123,7 @@ function normalizeMessage(message: ChatMessage): ChatMessage {
     attachment: message.attachment ?? null,
     mentions: message.mentions ?? [],
     linkPreview: message.linkPreview ?? null,
+    poll: message.poll ?? null,
     editedAt: message.editedAt ?? null,
     pinned: Boolean(message.pinned),
     pinnedAt: message.pinnedAt ?? null,
@@ -188,6 +189,9 @@ function replySnippet(message: {
   }
   if (message.type === 'call') {
     return 'Call';
+  }
+  if (message.type === 'poll') {
+    return body || 'Poll';
   }
   return body || 'Message';
 }
@@ -337,14 +341,13 @@ export function ThreadView() {
   const confirmDialog = useConfirm();
   const { clearUnread, refreshInbox, conversations } =
     useOutletContext<MessengerOutletContext>();
-  const { people, byUserId, ensureProfiles } = useDirectory();
+  const { byUserId, ensureProfiles } = useDirectory();
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [typing, setTyping] = useState('');
   const [error, setError] = useState('');
   const [actionError, setActionError] = useState('');
   const [loading, setLoading] = useState(true);
-  const [details, setDetails] = useState(false);
   const [composer, setComposer] = useState('');
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [editingMessage, setEditingMessage] = useState<ChatMessage | null>(null);
@@ -354,6 +357,8 @@ export function ThreadView() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [pinnedMessages, setPinnedMessages] = useState<ChatMessage[]>([]);
   const [pinnedBannerOpen, setPinnedBannerOpen] = useState(false);
+  const [mentionJumpId, setMentionJumpId] = useState<string | null>(null);
+  const [mentionBannerDismissed, setMentionBannerDismissed] = useState(false);
   const [mediaOpen, setMediaOpen] = useState(false);
   const [mediaKind, setMediaKind] = useState<MediaKindTab>('all');
   const [mediaItems, setMediaItems] = useState<ChatMessage[]>([]);
@@ -368,6 +373,15 @@ export function ThreadView() {
   const [searchBusy, setSearchBusy] = useState(false);
   const [highlightId, setHighlightId] = useState<string | null>(null);
   const [scheduleOpen, setScheduleOpen] = useState(false);
+  const [pollOpen, setPollOpen] = useState(false);
+  const [pollQuestion, setPollQuestion] = useState('');
+  const [pollOptions, setPollOptions] = useState(['', '']);
+  const [pollAllowMultiple, setPollAllowMultiple] = useState(false);
+  const [pollBusy, setPollBusy] = useState(false);
+  const [bookmarkedIds, setBookmarkedIds] = useState<Set<string>>(new Set());
+  const [savedOpen, setSavedOpen] = useState(false);
+  const [savedItems, setSavedItems] = useState<MessageBookmark[]>([]);
+  const [savedBusy, setSavedBusy] = useState(false);
   const [scheduleAt, setScheduleAt] = useState(defaultScheduleLocalValue);
   const [scheduledMessages, setScheduledMessages] = useState<ScheduledMessage[]>([]);
   const [scheduleBusy, setScheduleBusy] = useState(false);
@@ -377,8 +391,6 @@ export function ThreadView() {
   const [hasOlder, setHasOlder] = useState(false);
   const [messagePage, setMessagePage] = useState(1);
   const [pendingLinkPreview, setPendingLinkPreview] = useState<LinkPreview | null>(null);
-  const [summary, setSummary] = useState('');
-  const [summaryBusy, setSummaryBusy] = useState(false);
   const [voicePhase, setVoicePhase] = useState<VoicePhase>('idle');
   const [recordingMs, setRecordingMs] = useState(0);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -470,11 +482,6 @@ export function ThreadView() {
     }
     return formatLastSeen(peer.lastSeenAt, peer.status);
   }, [conversation, typing, groupOnlineCount, peer]);
-  const myRole = conversation?.members.find((member) => member.userId === me)?.role;
-  const canManage = myRole === 'owner' || myRole === 'admin';
-  const isOwner = myRole === 'owner';
-  const isCreator = Boolean(me && conversation?.createdBy === me);
-  const memberIds = conversation?.members.map((member) => member.userId) ?? [];
   const forwardTargets = useMemo(
     () => conversations.filter((item) => item.id !== id),
     [conversations, id],
@@ -549,9 +556,17 @@ export function ThreadView() {
     setMessages([]);
     setPinnedMessages([]);
     setPinnedBannerOpen(false);
+    setMentionJumpId(null);
+    setMentionBannerDismissed(false);
     setScheduledMessages([]);
     setScheduleOpen(false);
-    setSummary('');
+    setPollOpen(false);
+    setPollQuestion('');
+    setPollOptions(['', '']);
+    setPollAllowMultiple(false);
+    setBookmarkedIds(new Set());
+    setSavedOpen(false);
+    setSavedItems([]);
     const conv = await api<Conversation>(`/chat/conversations/${id}`);
     await loadHistory(1, false);
     void loadPinned();
@@ -562,7 +577,17 @@ export function ThreadView() {
       pinned: Boolean(conv.data.pinned),
       blockedByMe: Boolean(conv.data.blockedByMe),
       blockedMe: Boolean(conv.data.blockedMe),
+      hasUnreadMention: Boolean(conv.data.hasUnreadMention),
+      firstUnreadMentionMessageId:
+        conv.data.firstUnreadMentionMessageId ?? null,
     });
+    const inboxRow = conversations.find((item) => item.id === id);
+    const mentionJumpTarget =
+      conv.data.firstUnreadMentionMessageId ??
+      inboxRow?.firstUnreadMentionMessageId ??
+      null;
+    setMentionJumpId(mentionJumpTarget);
+    setMentionBannerDismissed(false);
     setLoading(false);
     clearUnread(id);
     void ensureProfiles(
@@ -572,6 +597,7 @@ export function ThreadView() {
     if (conv.data.type === 'group') {
       void refreshLobby(id);
     }
+    void loadBookmarks();
     try {
       await api(`/chat/conversations/${id}/seen`, {
         method: 'POST',
@@ -580,6 +606,75 @@ export function ThreadView() {
       clearUnread(id);
     } catch {
       clearUnread(id);
+    }
+  }
+
+  async function loadBookmarks() {
+    try {
+      const response = await api<Paginated<MessageBookmark>>(
+        `/chat/bookmarks?page=1&limit=100&conversationId=${encodeURIComponent(id)}`,
+      );
+      setBookmarkedIds(
+        new Set((response.data.items ?? []).map((item) => item.messageId)),
+      );
+    } catch {
+      setBookmarkedIds(new Set());
+    }
+  }
+
+  async function loadSavedMessages() {
+    setSavedBusy(true);
+    try {
+      const response = await api<Paginated<MessageBookmark>>(
+        '/chat/bookmarks?page=1&limit=50',
+      );
+      setSavedItems(
+        (response.data.items ?? []).map((item) => ({
+          ...item,
+          message: normalizeMessage(item.message),
+        })),
+      );
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not load saved messages',
+      );
+    } finally {
+      setSavedBusy(false);
+    }
+  }
+
+  async function toggleBookmark(message: ChatMessage) {
+    const isSaved = bookmarkedIds.has(message.id);
+    setMenuMessageId(null);
+    try {
+      if (isSaved) {
+        await api(`/chat/bookmarks/${message.id}`, { method: 'DELETE' });
+        setBookmarkedIds((current) => {
+          const next = new Set(current);
+          next.delete(message.id);
+          return next;
+        });
+        setSavedItems((current) =>
+          current.filter((item) => item.messageId !== message.id),
+        );
+      } else {
+        const response = await api<MessageBookmark>('/chat/bookmarks', {
+          method: 'POST',
+          body: JSON.stringify({ messageId: message.id }),
+        });
+        setBookmarkedIds((current) => new Set(current).add(message.id));
+        setSavedItems((current) => [
+          {
+            ...response.data,
+            message: normalizeMessage(response.data.message),
+          },
+          ...current.filter((item) => item.messageId !== message.id),
+        ]);
+      }
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not update saved message',
+      );
     }
   }
 
@@ -602,7 +697,6 @@ export function ThreadView() {
   useEffect(() => {
     setError('');
     setActionError('');
-    setDetails(false);
     setComposer(getMessageDraft(id));
     setTyping('');
     setReplyTo(null);
@@ -747,7 +841,6 @@ export function ThreadView() {
       subscribe('chat:group_deleted', (payload) => {
         const event = payload as { conversationId: string };
         if (event.conversationId === id) {
-          setDetails(false);
           navigate('/chat');
         }
       }),
@@ -776,7 +869,6 @@ export function ThreadView() {
         const event = payload as { conversationId: string };
         if (event.conversationId === id) {
           leaveConversation(id);
-          setDetails(false);
           navigate('/chat');
         }
       }),
@@ -1004,16 +1096,64 @@ export function ThreadView() {
     if (replyTo) {
       payload.replyToMessageId = replyTo.id;
     }
-    const response = await api<ChatMessage>(`/chat/conversations/${id}/messages`, {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
-    setMessages((current) => upsertMessage(current, response.data));
-    setComposer('');
-    clearMessageDraft(id);
-    setReplyTo(null);
-    setPendingLinkPreview(null);
-    void sendTyping(false);
+    try {
+      const response = await api<ChatMessage>(`/chat/conversations/${id}/messages`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      setMessages((current) => upsertMessage(current, response.data));
+      setComposer('');
+      clearMessageDraft(id);
+      setReplyTo(null);
+      setPendingLinkPreview(null);
+      void sendTyping(false);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not send message');
+    }
+  }
+
+  async function createPoll() {
+    const question = pollQuestion.trim();
+    const options = pollOptions.map((item) => item.trim()).filter(Boolean);
+    if (question.length < 2 || options.length < 2 || pollBusy) {
+      return;
+    }
+    setPollBusy(true);
+    setActionError('');
+    try {
+      const response = await api<ChatMessage>(`/chat/conversations/${id}/polls`, {
+        method: 'POST',
+        body: JSON.stringify({
+          question,
+          options,
+          allowMultiple: pollAllowMultiple,
+        }),
+      });
+      setMessages((current) => upsertMessage(current, normalizeMessage(response.data)));
+      setPollOpen(false);
+      setPollQuestion('');
+      setPollOptions(['', '']);
+      setPollAllowMultiple(false);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not create poll');
+    } finally {
+      setPollBusy(false);
+    }
+  }
+
+  async function votePoll(messageId: string, optionId: string) {
+    try {
+      const response = await api<ChatMessage>(
+        `/chat/conversations/${id}/messages/${messageId}/poll-votes`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ optionId }),
+        },
+      );
+      setMessages((current) => upsertMessage(current, normalizeMessage(response.data)));
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Could not record vote');
+    }
   }
 
   async function scheduleSend() {
@@ -1093,20 +1233,6 @@ export function ThreadView() {
     }
   }
 
-  async function summarizeThread() {
-    setSummaryBusy(true);
-    try {
-      const response = await api<{ summary: string; poweredByAi: boolean }>(
-        `/chat/conversations/${id}/summarize`,
-        { method: 'POST', body: JSON.stringify({}) },
-      );
-      setSummary(response.data.summary);
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Could not summarize thread');
-    } finally {
-      setSummaryBusy(false);
-    }
-  }
 
   async function loadMedia(page = 1, kind: MediaKindTab = mediaKind, append = false) {
     if (!id) {
@@ -1143,6 +1269,28 @@ export function ThreadView() {
     setMediaHasMore(false);
     void loadMedia(1, kind, false);
   }
+
+  useEffect(() => {
+    const mediaParam = searchParams.get('media');
+    if (!mediaParam || loading || !conversation) {
+      return;
+    }
+    const kind: MediaKindTab =
+      mediaParam === 'image' || mediaParam === 'file' || mediaParam === 'audio'
+        ? mediaParam
+        : 'all';
+    openMedia(kind);
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete('media');
+        return next;
+      },
+      { replace: true },
+    );
+    // Intentionally only when media query appears after load.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, loading, conversation?.id]);
 
   async function handleDownloadMedia(message: ChatMessage) {
     if (!message.attachment?.url) {
@@ -1584,54 +1732,6 @@ export function ThreadView() {
     emit('chat:typing', { conversationId: id, typing: isTyping });
   }
 
-  async function rename(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const name = String(new FormData(event.currentTarget).get('name') ?? '');
-    const response = await api<Conversation>(`/chat/conversations/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify({ name }),
-    });
-    setConversation(response.data);
-    void refreshInbox();
-  }
-
-  async function addMember(userId: string) {
-    try {
-      await api(`/chat/conversations/${id}/members`, {
-        method: 'POST',
-        body: JSON.stringify({ memberIds: [userId] }),
-      });
-      await load();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Could not add that person');
-    }
-  }
-
-  async function removeMember(userId: string) {
-    try {
-      await api(`/chat/conversations/${id}/members/${userId}`, { method: 'DELETE' });
-      await load();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Could not remove that person');
-    }
-  }
-
-  async function setMemberRole(userId: string, role: 'admin' | 'member') {
-    try {
-      const response = await api<Conversation>(
-        `/chat/conversations/${id}/members/${userId}/role`,
-        {
-          method: 'PATCH',
-          body: JSON.stringify({ role }),
-        },
-      );
-      setConversation(response.data);
-      void refreshInbox();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Could not update role');
-    }
-  }
-
   async function toggleMute() {
     if (!conversation) {
       return;
@@ -1664,64 +1764,6 @@ export function ThreadView() {
       void refreshInbox();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not update pin');
-    }
-  }
-
-  async function setDisappearing(durationSeconds: number) {
-    if (!conversation) {
-      return;
-    }
-    try {
-      const response = await api<Conversation>(
-        `/chat/conversations/${id}/disappearing`,
-        {
-          method: 'POST',
-          body: JSON.stringify({ durationSeconds }),
-        },
-      );
-      setConversation({
-        ...response.data,
-        muted: Boolean(response.data.muted),
-        pinned: Boolean(response.data.pinned),
-        disappearingDurationSeconds:
-          response.data.disappearingDurationSeconds ?? 0,
-      });
-      void refreshInbox();
-    } catch (err) {
-      setActionError(
-        err instanceof Error ? err.message : 'Could not update disappearing messages',
-      );
-    }
-  }
-
-  async function blockPeer() {
-    if (!peer) {
-      return;
-    }
-    const ok = await confirmDialog({
-      title: 'Block user',
-      message: 'Block this user? They will not be able to message you.',
-      confirmLabel: 'Block',
-      cancelLabel: 'Cancel',
-      danger: true,
-    });
-    if (!ok) {
-      return;
-    }
-    try {
-      await api('/chat/blocks', {
-        method: 'POST',
-        body: JSON.stringify({ userId: peer.userId }),
-      });
-      setDetails(false);
-      setConversation((current) =>
-        current
-          ? { ...current, blockedByMe: true, blockedMe: Boolean(current.blockedMe) }
-          : current,
-      );
-      void refreshInbox();
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Could not block user');
     }
   }
 
@@ -1774,36 +1816,6 @@ export function ThreadView() {
       }
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not delete message');
-    }
-  }
-
-  async function leave() {
-    try {
-      await api(`/chat/conversations/${id}/leave`, { method: 'POST' });
-      setDetails(false);
-      navigate('/chat');
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Could not leave the group');
-    }
-  }
-
-  async function deleteGroup() {
-    const ok = await confirmDialog({
-      title: 'Delete group',
-      message: 'Delete this group for everyone? This cannot be undone.',
-      confirmLabel: 'Delete',
-      cancelLabel: 'Cancel',
-      danger: true,
-    });
-    if (!ok) {
-      return;
-    }
-    try {
-      await api(`/chat/conversations/${id}`, { method: 'DELETE' });
-      setDetails(false);
-      navigate('/chat');
-    } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Could not delete the group');
     }
   }
 
@@ -1942,7 +1954,9 @@ export function ThreadView() {
       !me ||
       message.senderId !== me ||
       message.deletedForEveryone ||
-      isPendingMessage(message)
+      isPendingMessage(message) ||
+      message.type === 'poll' ||
+      message.type === 'call'
     ) {
       return false;
     }
@@ -2199,11 +2213,11 @@ export function ThreadView() {
             <button
               className="ghost thread-tool-btn"
               type="button"
-              aria-label={conversation.type === 'group' ? 'Group details' : 'Chat info'}
+              aria-label={conversation.type === 'group' ? 'Channel details' : 'Chat info'}
               title={conversation.type === 'group' ? 'Details' : 'Chat info'}
               onClick={() => {
                 setToolsMenuOpen(false);
-                setDetails(true);
+                navigate(`/chat/${id}/details`);
               }}
             >
               <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
@@ -2259,6 +2273,17 @@ export function ThreadView() {
                 role="menuitem"
                 onClick={() => {
                   setToolsMenuOpen(false);
+                  setSavedOpen(true);
+                  void loadSavedMessages();
+                }}
+              >
+                Saved messages
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setToolsMenuOpen(false);
                   void togglePin();
                 }}
               >
@@ -2279,10 +2304,10 @@ export function ThreadView() {
                 role="menuitem"
                 onClick={() => {
                   setToolsMenuOpen(false);
-                  setDetails(true);
+                  navigate(`/chat/${id}/details`);
                 }}
               >
-                {conversation.type === 'group' ? 'Group details' : 'Chat info'}
+                {conversation.type === 'group' ? 'Channel details' : 'Chat info'}
               </button>
             </div>
           ) : null}
@@ -2351,6 +2376,51 @@ export function ThreadView() {
 
           <span className="wa-ongoing-call-join">Join</span>
         </button>
+      ) : null}
+
+      {mentionJumpId && !mentionBannerDismissed && !focusMessageId ? (
+        <div className="mention-jump-banner">
+          <button
+            type="button"
+            className="mention-jump-banner-main"
+            onClick={() => {
+              const targetId = mentionJumpId;
+              setMentionBannerDismissed(true);
+              setMentionJumpId(null);
+              if (messagesRef.current.some((item) => item.id === targetId)) {
+                jumpToMessage(targetId);
+                return;
+              }
+              setSearchParams(
+                (current) => {
+                  const next = new URLSearchParams(current);
+                  next.set('focus', targetId);
+                  return next;
+                },
+                { replace: true },
+              );
+            }}
+          >
+            <span className="mention-jump-icon" aria-hidden="true">
+              @
+            </span>
+            <span className="mention-jump-copy">
+              <strong>Jump to unread mention</strong>
+              <small>Someone mentioned you in this chat</small>
+            </span>
+          </button>
+          <button
+            type="button"
+            className="ghost mention-jump-dismiss"
+            aria-label="Dismiss mention banner"
+            onClick={() => {
+              setMentionBannerDismissed(true);
+              setMentionJumpId(null);
+            }}
+          >
+            ×
+          </button>
+        </div>
       ) : null}
 
       {pinnedMessages.length > 0 ? (
@@ -2551,8 +2621,13 @@ export function ThreadView() {
             !showImage &&
             !showAudio &&
             (message.type === 'file' || Boolean(message.attachment.url));
+          const showPoll =
+            !message.deletedForEveryone &&
+            (message.type === 'poll' || Boolean(message.poll?.question));
           const caption =
-            message.body && !isPlaceholderBody(message.body) ? message.body : null;
+            !showPoll && message.body && !isPlaceholderBody(message.body)
+              ? message.body
+              : null;
           const bodyParts = caption
             ? renderMessageBody(
                 caption,
@@ -2566,6 +2641,10 @@ export function ThreadView() {
               key={message.id}
               className={`${mine ? 'wa-row mine' : 'wa-row theirs'}${
                 highlightId === message.id ? ' highlight' : ''
+              }${
+                !mine && me && (message.mentions ?? []).includes(me)
+                  ? ' mentions-you'
+                  : ''
               }${pending ? ' is-pending' : ''}`}
               ref={(node) => {
                 if (node) {
@@ -2814,17 +2893,83 @@ export function ThreadView() {
                         ) : null}
                       </div>
                     ) : null}
+                    {showPoll && message.poll ? (
+                      <div className="wa-poll">
+                        <p className="wa-poll-question">{message.poll.question}</p>
+                        <ul className="wa-poll-options">
+                          {message.poll.options.map((option) => {
+                            const total = Math.max(1, message.poll!.totalVotes);
+                            const pct = Math.round(
+                              (option.voteCount / total) * 100,
+                            );
+                            return (
+                              <li key={option.id}>
+                                <button
+                                  type="button"
+                                  className={`wa-poll-option${
+                                    option.votedByMe ? ' selected' : ''
+                                  }`}
+                                  disabled={message.poll!.closed || pending}
+                                  onClick={() =>
+                                    void votePoll(message.id, option.id)
+                                  }
+                                >
+                                  <span
+                                    className="wa-poll-fill"
+                                    style={{ width: `${pct}%` }}
+                                    aria-hidden="true"
+                                  />
+                                  <span className="wa-poll-option-copy">
+                                    <strong>{option.text}</strong>
+                                    <small>
+                                      {option.voteCount}
+                                      {message.poll!.totalVotes > 0
+                                        ? ` · ${pct}%`
+                                        : ''}
+                                    </small>
+                                  </span>
+                                </button>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                        <p className="wa-poll-meta muted">
+                          {message.poll.totalVotes} vote
+                          {message.poll.totalVotes === 1 ? '' : 's'}
+                          {message.poll.allowMultiple ? ' · multiple choice' : ''}
+                          {message.poll.closed ? ' · closed' : ''}
+                        </p>
+                      </div>
+                    ) : null}
                     {caption ? (
                       <p className="wa-text">
-                        {bodyParts.map((part, index) =>
-                          part.type === 'mention' ? (
-                            <mark key={`${message.id}-m-${index}`} className="wa-mention">
+                        {bodyParts.map((part, index) => {
+                          if (part.type !== 'mention') {
+                            return (
+                              <span key={`${message.id}-t-${index}`}>
+                                {part.value}
+                              </span>
+                            );
+                          }
+                          const token = part.value.slice(1).toLowerCase();
+                          const isYou =
+                            Boolean(me) &&
+                            (message.mentions ?? []).includes(me!) &&
+                            mentionCandidates.some(
+                              (member) =>
+                                member.userId === me &&
+                                member.label.replace(/\s+/g, '').toLowerCase() ===
+                                  token,
+                            );
+                          return (
+                            <mark
+                              key={`${message.id}-m-${index}`}
+                              className={`wa-mention${isYou ? ' wa-mention-you' : ''}`}
+                            >
                               {part.value}
                             </mark>
-                          ) : (
-                            <span key={`${message.id}-t-${index}`}>{part.value}</span>
-                          ),
-                        )}
+                          );
+                        })}
                       </p>
                     ) : null}
                     {message.linkPreview ? (
@@ -2843,7 +2988,7 @@ export function ThreadView() {
                         </span>
                       </a>
                     ) : null}
-                    {!showImage && !showAudio && !caption ? (
+                    {!showImage && !showAudio && !showPoll && !caption ? (
                       <p className="wa-text">{message.body}</p>
                     ) : null}
                   </>
@@ -2963,6 +3108,12 @@ export function ThreadView() {
                           onClick={() => void toggleMessagePin(message)}
                         >
                           {message.pinned ? 'Unpin' : 'Pin'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void toggleBookmark(message)}
+                        >
+                          {bookmarkedIds.has(message.id) ? 'Unsave' : 'Save'}
                         </button>
                       </>
                     ) : null}
@@ -3351,6 +3502,16 @@ export function ThreadView() {
                       >
                         Document
                       </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setAttachMenuOpen(false);
+                          setPollOpen(true);
+                        }}
+                      >
+                        Poll
+                      </button>
                     </div>
                   ) : null}
                 </div>
@@ -3430,6 +3591,151 @@ export function ThreadView() {
         )}
       </form>
       )}
+
+      <Modal
+        open={savedOpen}
+        title="Saved messages"
+        onClose={() => setSavedOpen(false)}
+      >
+        <div className="saved-messages-panel">
+          {savedBusy && savedItems.length === 0 ? (
+            <p className="muted">Loading saved messages…</p>
+          ) : null}
+          {!savedBusy && savedItems.length === 0 ? (
+            <p className="muted">
+              Save any message from the ⋮ menu. They show up here across chats.
+            </p>
+          ) : null}
+          <ul className="saved-messages-list">
+            {savedItems.map((item) => {
+              const inThisChat = item.conversationId === id;
+              const title =
+                item.conversationName?.trim() ||
+                (item.conversationType === 'group' ? 'Channel' : 'Direct message');
+              return (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    className="saved-message-row"
+                    onClick={() => {
+                      setSavedOpen(false);
+                      if (inThisChat) {
+                        if (messagesRef.current.some((m) => m.id === item.messageId)) {
+                          jumpToMessage(item.messageId);
+                          return;
+                        }
+                        setSearchParams(
+                          (current) => {
+                            const next = new URLSearchParams(current);
+                            next.set('focus', item.messageId);
+                            return next;
+                          },
+                          { replace: true },
+                        );
+                        return;
+                      }
+                      navigate(
+                        `/chat/${item.conversationId}?focus=${encodeURIComponent(item.messageId)}`,
+                      );
+                    }}
+                  >
+                    <strong>{title}</strong>
+                    <span>{replySnippet(item.message)}</span>
+                    <small>{clock(item.createdAt)}</small>
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => void toggleBookmark(item.message)}
+                  >
+                    Unsave
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      </Modal>
+
+      <Modal
+        open={pollOpen}
+        title="Create poll"
+        onClose={() => {
+          if (!pollBusy) {
+            setPollOpen(false);
+          }
+        }}
+      >
+        <div className="poll-form">
+          <label>
+            Question
+            <input
+              value={pollQuestion}
+              onChange={(event) => setPollQuestion(event.target.value)}
+              maxLength={240}
+              placeholder="What should we decide?"
+              autoFocus
+            />
+          </label>
+          <div className="poll-form-options">
+            <p className="muted">Options</p>
+            {pollOptions.map((option, index) => (
+              <label key={`poll-opt-${index}`}>
+                Option {index + 1}
+                <input
+                  value={option}
+                  onChange={(event) => {
+                    const next = [...pollOptions];
+                    next[index] = event.target.value;
+                    setPollOptions(next);
+                  }}
+                  maxLength={80}
+                  placeholder={`Choice ${index + 1}`}
+                />
+              </label>
+            ))}
+            {pollOptions.length < 6 ? (
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => setPollOptions((current) => [...current, ''])}
+              >
+                Add option
+              </button>
+            ) : null}
+          </div>
+          <label className="poll-form-check">
+            <input
+              type="checkbox"
+              checked={pollAllowMultiple}
+              onChange={(event) => setPollAllowMultiple(event.target.checked)}
+            />
+            Allow multiple answers
+          </label>
+          <div className="poll-form-actions">
+            <button
+              type="button"
+              className="ghost"
+              disabled={pollBusy}
+              onClick={() => setPollOpen(false)}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="btn"
+              disabled={
+                pollBusy ||
+                pollQuestion.trim().length < 2 ||
+                pollOptions.map((item) => item.trim()).filter(Boolean).length < 2
+              }
+              onClick={() => void createPoll()}
+            >
+              {pollBusy ? 'Creating…' : 'Create poll'}
+            </button>
+          </div>
+        </div>
+      </Modal>
 
       <Modal
         open={mediaOpen}
@@ -3586,222 +3892,6 @@ export function ThreadView() {
         )}
       </Modal>
 
-      <Modal
-        open={details}
-        title={conversation.type === 'group' ? 'Group details' : 'Chat info'}
-        size="lg"
-        onClose={() => setDetails(false)}
-      >
-        {conversation.type === 'private' ? (
-          <>
-            <p className="muted modal-lead">
-              {peer
-                ? formatLastSeen(peer.lastSeenAt, peer.status)
-                : 'Direct message'}
-            </p>
-            <div className="modal-actions">
-              <button className="ghost full" type="button" onClick={() => void togglePin()}>
-                {conversation.pinned ? 'Unpin conversation' : 'Pin conversation'}
-              </button>
-              <button className="ghost full" type="button" onClick={() => void toggleMute()}>
-                {conversation.muted ? 'Unmute conversation' : 'Mute conversation'}
-              </button>
-              <label className="disappearing-field">
-                <span>Disappearing messages</span>
-                <select
-                  value={conversation.disappearingDurationSeconds ?? 0}
-                  onChange={(event) =>
-                    void setDisappearing(Number(event.target.value))
-                  }
-                >
-                  {DISAPPEARING_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <button
-                className="ghost full"
-                type="button"
-                onClick={() => {
-                  setDetails(false);
-                  openMedia('all');
-                }}
-              >
-                Media (photos, files, voice)
-              </button>
-              <button
-                className="ghost full"
-                type="button"
-                disabled={summaryBusy}
-                onClick={() => void summarizeThread()}
-              >
-                {summaryBusy ? 'Summarizing…' : 'Summarize thread (AI)'}
-              </button>
-              {conversation.blockedByMe ? (
-                <button className="btn full" type="button" onClick={() => void unblockPeer()}>
-                  Unblock user
-                </button>
-              ) : (
-                <button className="danger full" type="button" onClick={() => void blockPeer()}>
-                  Block user
-                </button>
-              )}
-              <button
-                className="ghost full"
-                type="button"
-                onClick={() => {
-                  setDetails(false);
-                  navigate('/blocked');
-                }}
-              >
-                Manage blocked users
-              </button>
-            </div>
-            {summary ? <pre className="thread-summary">{summary}</pre> : null}
-          </>
-        ) : (
-          <>
-            <ul className="member-list">
-              {conversation.members.map((member) => {
-                const name = displayName(byUserId.get(member.userId));
-                const canRemove =
-                  canManage && member.userId !== me && member.role !== 'owner';
-                const canChangeRole =
-                  isOwner && member.userId !== me && member.role !== 'owner';
-                return (
-                  <li key={member.userId}>
-                    <span className="member-identity">
-                      <span className={member.status === 'online' ? 'dot on' : 'dot'} />
-                      <span>
-                        {name}
-                        {member.userId === me ? ' (you)' : ''}
-                        <small> · {member.role}</small>
-                        <small className="member-last-seen">
-                          {' '}
-                          · {formatLastSeen(member.lastSeenAt, member.status)}
-                        </small>
-                      </span>
-                    </span>
-                    <span className="member-actions">
-                      {canChangeRole ? (
-                        member.role === 'admin' ? (
-                          <button
-                            className="ghost"
-                            type="button"
-                            onClick={() => void setMemberRole(member.userId, 'member')}
-                          >
-                            Demote to member
-                          </button>
-                        ) : (
-                          <button
-                            className="ghost"
-                            type="button"
-                            onClick={() => void setMemberRole(member.userId, 'admin')}
-                          >
-                            Promote to admin
-                          </button>
-                        )
-                      ) : null}
-                      {canRemove ? (
-                        <button
-                          className="danger-text"
-                          type="button"
-                          onClick={() => void removeMember(member.userId)}
-                        >
-                          Remove
-                        </button>
-                      ) : null}
-                    </span>
-                  </li>
-                );
-              })}
-            </ul>
-            <div className="modal-actions" style={{ marginBottom: 12 }}>
-              <button className="ghost full" type="button" onClick={() => void togglePin()}>
-                {conversation.pinned ? 'Unpin conversation' : 'Pin conversation'}
-              </button>
-              <button className="ghost full" type="button" onClick={() => void toggleMute()}>
-                {conversation.muted ? 'Unmute conversation' : 'Mute conversation'}
-              </button>
-              {canManage ? (
-                <label className="disappearing-field">
-                  <span>Disappearing messages</span>
-                  <select
-                    value={conversation.disappearingDurationSeconds ?? 0}
-                    onChange={(event) =>
-                      void setDisappearing(Number(event.target.value))
-                    }
-                  >
-                    {DISAPPEARING_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              ) : (
-                <p className="muted pad" style={{ margin: 0 }}>
-                  Disappearing messages:{' '}
-                  {disappearingLabel(conversation.disappearingDurationSeconds)}
-                </p>
-              )}
-              <button
-                className="ghost full"
-                type="button"
-                onClick={() => {
-                  setDetails(false);
-                  openMedia('all');
-                }}
-              >
-                Media (photos, files, voice)
-              </button>
-              <button
-                className="ghost full"
-                type="button"
-                disabled={summaryBusy}
-                onClick={() => void summarizeThread()}
-              >
-                {summaryBusy ? 'Summarizing…' : 'Summarize thread (AI)'}
-              </button>
-            </div>
-            {summary ? <pre className="thread-summary">{summary}</pre> : null}
-            {canManage ? (
-              <>
-                <form className="modal-form" onSubmit={(event) => void rename(event)}>
-                  <label>
-                    Group name
-                    <input name="name" defaultValue={conversation.name ?? ''} required />
-                  </label>
-                  <button className="btn full" type="submit">
-                    Save name
-                  </button>
-                </form>
-                <div className="add-people">
-                  <p className="muted">Add people</p>
-                  <PeoplePicker
-                    people={people}
-                    mode="single"
-                    exclude={memberIds}
-                    onPick={(person) => void addMember(person.userId)}
-                  />
-                </div>
-              </>
-            ) : null}
-            <div className="modal-actions">
-              <button className="danger full" type="button" onClick={() => void leave()}>
-                Leave group
-              </button>
-              {isCreator ? (
-                <button className="danger full" type="button" onClick={() => void deleteGroup()}>
-                  Delete group
-                </button>
-              ) : null}
-            </div>
-          </>
-        )}
-      </Modal>
     </div>
   );
 }

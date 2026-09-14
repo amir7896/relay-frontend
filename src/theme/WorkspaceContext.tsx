@@ -7,6 +7,7 @@ import {
   type ReactNode,
 } from 'react';
 import { api } from '../api/client';
+import { useAuth } from '../auth/AuthContext';
 
 export type WorkspaceBranding = {
   appName: string;
@@ -24,23 +25,44 @@ const defaultBranding: WorkspaceBranding = {
 
 const WorkspaceContext = createContext<WorkspaceBranding>(defaultBranding);
 
+function applyBrandColor(color: string) {
+  document.documentElement.style.setProperty('--brand', color);
+}
+
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
+  const { session } = useAuth();
+  const organizationId = session?.activeOrganizationId ?? null;
   const [branding, setBranding] = useState<WorkspaceBranding>(defaultBranding);
 
   useEffect(() => {
+    if (!organizationId) {
+      setBranding(defaultBranding);
+      applyBrandColor(defaultBranding.primaryColor);
+      return;
+    }
+
+    let cancelled = false;
     void (async () => {
       try {
         const response = await api<WorkspaceBranding>('/workspace/settings');
+        if (cancelled) {
+          return;
+        }
         setBranding(response.data);
-        document.documentElement.style.setProperty(
-          '--brand',
-          response.data.primaryColor,
-        );
+        applyBrandColor(response.data.primaryColor);
       } catch {
-        document.documentElement.style.setProperty('--brand', defaultBranding.primaryColor);
+        if (cancelled) {
+          return;
+        }
+        setBranding(defaultBranding);
+        applyBrandColor(defaultBranding.primaryColor);
       }
     })();
-  }, []);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [organizationId]);
 
   const value = useMemo(() => branding, [branding]);
   return (

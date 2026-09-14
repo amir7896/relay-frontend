@@ -1,5 +1,5 @@
 import { clearSession, getAccessToken, getSession, setSession } from '../auth/session';
-import type { ApiEnvelope } from './types';
+import type { ApiEnvelope, AuthResult } from './types';
 
 export class ApiError extends Error {
   constructor(
@@ -9,6 +9,22 @@ export class ApiError extends Error {
   ) {
     super(message);
   }
+}
+
+function shouldAttachOrganizationHeader(path: string): boolean {
+  // Workspace invite management needs the active org.
+  if (path === '/auth/invites') {
+    return true;
+  }
+  // DELETE /auth/invites/:inviteId (UUID)
+  if (
+    /^\/auth\/invites\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      path,
+    )
+  ) {
+    return true;
+  }
+  return !path.startsWith('/auth/');
 }
 
 export async function api<T>(
@@ -29,6 +45,15 @@ export async function api<T>(
   const token = getAccessToken();
   if (token) {
     headers.set('Authorization', `Bearer ${token}`);
+  }
+
+  const session = getSession();
+  if (
+    shouldAttachOrganizationHeader(path) &&
+    session?.activeOrganizationId &&
+    !headers.has('X-Organization-Id')
+  ) {
+    headers.set('X-Organization-Id', session.activeOrganizationId);
   }
 
   const response = await fetch(`/api${path}`, { ...init, headers });
@@ -61,13 +86,14 @@ export async function refreshSession(): Promise<boolean> {
     return false;
   }
   try {
-    const result = await api<{
-      user: { id: string; email: string; role: string; isEmailVerified?: boolean };
-      tokens: { accessToken: string; refreshToken: string };
-    }>('/auth/refresh', {
+    const result = await api<AuthResult>('/auth/refresh', {
       method: 'POST',
       body: JSON.stringify({ refreshToken: session.refreshToken }),
     });
+    const organizations = result.data.organizations ?? [];
+    const stillValid =
+      session.activeOrganizationId &&
+      organizations.some((org) => org.id === session.activeOrganizationId);
     setSession({
       accessToken: result.data.tokens.accessToken,
       refreshToken: result.data.tokens.refreshToken,
@@ -77,6 +103,10 @@ export async function refreshSession(): Promise<boolean> {
         role: result.data.user.role,
         isEmailVerified: result.data.user.isEmailVerified,
       },
+      organizations,
+      activeOrganizationId: stillValid
+        ? session.activeOrganizationId
+        : (result.data.activeOrganizationId ?? null),
     });
     return true;
   } catch {

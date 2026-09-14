@@ -138,7 +138,8 @@ export function conversationTitle(
   peopleById?: Map<string, UserProfile>,
 ): string {
   if (conversation.type === 'group') {
-    return conversation.name ?? 'Group';
+    const name = conversation.name?.trim() || 'channel';
+    return name.startsWith('#') ? name : `#${name}`;
   }
   const peer = otherMember(conversation, me);
   if (!peer) {

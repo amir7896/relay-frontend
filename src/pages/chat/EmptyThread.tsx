@@ -8,16 +8,17 @@ export function EmptyThread() {
     <div className="thread empty-thread">
       <div className="empty-panel">
         <span className="empty-glyph" aria-hidden="true" />
-        <h2>Your messages live here</h2>
+        <h2>Welcome to your workspace</h2>
         <p className="muted">
-          Pick a conversation from your inbox, or start a new chat or group.
+          Pick a channel on the left, message a teammate, or create a new
+          channel for a topic.
         </p>
         <div className="empty-actions">
-          <button className="btn" type="button" onClick={openNewChat}>
-            New chat
+          <button className="btn" type="button" onClick={openNewGroup}>
+            Create a channel
           </button>
-          <button className="ghost" type="button" onClick={openNewGroup}>
-            New group
+          <button className="ghost" type="button" onClick={openNewChat}>
+            Direct message
           </button>
         </div>
       </div>

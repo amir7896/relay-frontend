@@ -25,14 +25,30 @@ export type TokenPair = {
   expiresIn: string;
 };
 
+export type OrgMemberRole = 'owner' | 'admin' | 'member';
+
+export type OrganizationView = {
+  id: string;
+  slug: string;
+  name: string;
+  status: 'active' | 'suspended';
+  isDefault: boolean;
+  role?: OrgMemberRole;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type AuthResult = {
   user: AuthUser;
   tokens: TokenPair;
+  organizations: OrganizationView[];
+  activeOrganizationId: string | null;
 };
 
 export type UserProfile = {
   id: string;
   userId: string;
+  organizationId?: string;
   email: string;
   firstName: string;
   lastName: string;
@@ -83,6 +99,31 @@ export type LinkPreview = {
   image: string | null;
 };
 
+export type PollOption = {
+  id: string;
+  text: string;
+  voteCount: number;
+  votedByMe: boolean;
+};
+
+export type PollView = {
+  question: string;
+  options: PollOption[];
+  allowMultiple: boolean;
+  closed: boolean;
+  totalVotes: number;
+};
+
+export type MessageBookmark = {
+  id: string;
+  conversationId: string;
+  messageId: string;
+  createdAt: string;
+  message: ChatMessage;
+  conversationName: string | null;
+  conversationType: 'private' | 'group';
+};
+
 export type ChatMessage = {
   id: string;
   conversationId: string;
@@ -93,6 +134,7 @@ export type ChatMessage = {
   attachment: MessageAttachment | null;
   mentions: string[];
   linkPreview: LinkPreview | null;
+  poll?: PollView | null;
   reactions: MessageReaction[];
   editedAt: string | null;
   pinned?: boolean;
@@ -151,6 +193,8 @@ export type Conversation = {
   blockedByMe?: boolean;
   blockedMe?: boolean;
   unreadCount: number;
+  hasUnreadMention?: boolean;
+  firstUnreadMentionMessageId?: string | null;
   members: ConversationMember[];
   createdAt: string;
   updatedAt: string;

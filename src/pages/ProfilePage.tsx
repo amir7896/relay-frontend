@@ -2,6 +2,8 @@ import { FormEvent, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
+import { useOrganization } from '../organizations/OrganizationContext';
+import { useConfirm } from '../components/ConfirmProvider';
 import { PasswordInput } from '../components/PasswordInput';
 import { resolveMediaUrl } from '../components/VoiceNotePlayer';
 import { initials } from '../lib/format';
@@ -16,31 +18,75 @@ import type { UserProfile, WorkspaceSettings } from '../api/types';
 type WorkspaceInvite = {
   id: string;
   email: string | null;
+  organizationId?: string | null;
+  organizationName?: string;
   inviteUrl: string;
   maxUses: number;
   usedCount: number;
   expiresAt: string;
   revokedAt: string | null;
   createdAt: string;
+  debugInviteUrl?: string;
+  emailSent?: boolean;
 };
 
 export function ProfilePage() {
-  const { session, logout } = useAuth();
+  const { session, logout, replaceSession } = useAuth();
+  const {
+    organizations,
+    activeOrganizationId,
+    deleteOrganization,
+    leaveOrganization,
+    refreshOrganizations,
+  } = useOrganization();
+  const confirmDialog = useConfirm();
   const navigate = useNavigate();
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState('');
   const [busy, setBusy] = useState(false);
+  const [deleteConfirmName, setDeleteConfirmName] = useState('');
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [leaveBusy, setLeaveBusy] = useState(false);
   const [notifyStatus, setNotifyStatus] = useState(() => getNotificationPermission());
   const [notifyHint, setNotifyHint] = useState('');
   const [installHint, setInstallHint] = useState('');
   const { canInstall, standalone, install } = usePwaInstall();
   const isAdmin = session?.user.role === 'admin';
+  const activeOrg =
+    organizations.find((org) => org.id === activeOrganizationId) ??
+    organizations[0];
+  const canManageInvites =
+    activeOrg?.role === 'owner' ||
+    activeOrg?.role === 'admin' ||
+    isAdmin;
+  const canManageWorkspace =
+    activeOrg?.role === 'owner' || activeOrg?.role === 'admin';
+  const isWorkspaceOwner = activeOrg?.role === 'owner';
+  const canDeleteWorkspace =
+    Boolean(activeOrg) &&
+    activeOrg?.role === 'owner' &&
+    !activeOrg?.isDefault;
+  const canLeaveWorkspace = Boolean(activeOrg) && !activeOrg?.isDefault;
   const [branding, setBranding] = useState<WorkspaceSettings | null>(null);
   const [brandingSaved, setBrandingSaved] = useState('');
+  const [workspaceName, setWorkspaceName] = useState('');
+  const [workspaceNameSaved, setWorkspaceNameSaved] = useState('');
+  const [members, setMembers] = useState<
+    Array<{ userId: string; role: string; joinedAt: string; label?: string }>
+  >([]);
+  const [membersBusy, setMembersBusy] = useState(false);
   const [invites, setInvites] = useState<WorkspaceInvite[]>([]);
   const [inviteUrl, setInviteUrl] = useState('');
+  const [inviteHint, setInviteHint] = useState('');
   const [inviteBusy, setInviteBusy] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState('');
+  const inviteEmailTrimmed = inviteEmail.trim();
+  const inviteEmailValid =
+    inviteEmailTrimmed.length > 0 &&
+    /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(inviteEmailTrimmed);
+  const inviteEmailInvalid =
+    inviteEmailTrimmed.length > 0 && !inviteEmailValid;
   const [avatarDraft, setAvatarDraft] = useState<string | null>(null);
   const [avatarUploading, setAvatarUploading] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
@@ -61,14 +107,33 @@ export function ProfilePage() {
   }, []);
 
   useEffect(() => {
-    if (!isAdmin) {
+    setWorkspaceName(activeOrg?.name ?? '');
+  }, [activeOrg?.id, activeOrg?.name]);
+
+  useEffect(() => {
+    if (!canManageWorkspace) {
+      setBranding(null);
       return;
     }
     void api<WorkspaceSettings>('/workspace/settings')
       .then((response) => setBranding(response.data))
       .catch(() => undefined);
+  }, [canManageWorkspace, activeOrganizationId]);
+
+  useEffect(() => {
+    if (!canManageInvites) {
+      return;
+    }
     void loadInvites();
-  }, [isAdmin]);
+  }, [canManageInvites, activeOrganizationId]);
+
+  useEffect(() => {
+    if (!canManageWorkspace || !activeOrg?.id) {
+      setMembers([]);
+      return;
+    }
+    void loadMembers(activeOrg.id);
+  }, [canManageWorkspace, activeOrg?.id]);
 
   async function loadInvites() {
     try {
@@ -79,23 +144,64 @@ export function ProfilePage() {
     }
   }
 
+  async function loadMembers(organizationId: string) {
+    setMembersBusy(true);
+    try {
+      const response = await api<
+        Array<{ userId: string; role: string; joinedAt: string }>
+      >(`/organizations/${organizationId}/members`);
+      const rows = response.data ?? [];
+      const labeled = await Promise.all(
+        rows.map(async (row) => {
+          try {
+            const profile = await api<UserProfile>(`/users/lookup/${row.userId}`);
+            return {
+              ...row,
+              label: `${profile.data.firstName} ${profile.data.lastName}`.trim(),
+            };
+          } catch {
+            return { ...row, label: row.userId.slice(0, 8) };
+          }
+        }),
+      );
+      setMembers(labeled);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not load members');
+    } finally {
+      setMembersBusy(false);
+    }
+  }
+
   async function createInvite(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!inviteEmailValid) {
+      return;
+    }
     setInviteBusy(true);
     setError('');
+    setInviteHint('');
     const form = new FormData(event.currentTarget);
-    const email = String(form.get('email') ?? '').trim();
+    const email = inviteEmailTrimmed;
     try {
       const response = await api<WorkspaceInvite>('/auth/invites', {
         method: 'POST',
         body: JSON.stringify({
-          email: email || undefined,
+          email,
           expiresInDays: Number(form.get('expiresInDays') ?? 7),
-          maxUses: email ? 1 : Number(form.get('maxUses') ?? 25),
+          maxUses: 1,
         }),
       });
-      setInviteUrl(response.data.inviteUrl);
+      const link = response.data.debugInviteUrl || response.data.inviteUrl;
+      setInviteUrl(link);
+      if (response.data.emailSent) {
+        setInviteHint(`Invite emailed to ${email}. You can still copy the link below.`);
+      } else {
+        setInviteHint(
+          'SMTP is not configured (or send failed). Copy the link and share it — works with Gmail, YOPmail, etc.',
+        );
+      }
       event.currentTarget.reset();
+      setInviteEmail('');
       await loadInvites();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not create invite');
@@ -129,6 +235,107 @@ export function ProfilePage() {
       setBrandingSaved('Workspace branding saved');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not save branding');
+    }
+  }
+
+  async function saveWorkspaceName(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!activeOrg?.id || !workspaceName.trim()) {
+      return;
+    }
+    setWorkspaceNameSaved('');
+    setError('');
+    try {
+      const response = await api<{ id: string; name: string; role: string }>(
+        `/organizations/${activeOrg.id}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ name: workspaceName.trim() }),
+        },
+      );
+      const current = session;
+      if (current) {
+        replaceSession({
+          ...current,
+          organizations: current.organizations.map((org) =>
+            org.id === response.data.id
+              ? { ...org, name: response.data.name }
+              : org,
+          ),
+        });
+      }
+      setWorkspaceName(response.data.name);
+      setWorkspaceNameSaved('Workspace renamed');
+      await refreshOrganizations();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not rename workspace');
+    }
+  }
+
+  async function changeMemberRole(userId: string, role: 'admin' | 'member') {
+    if (!activeOrg?.id) {
+      return;
+    }
+    setError('');
+    try {
+      await api(`/organizations/${activeOrg.id}/members/${userId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ role }),
+      });
+      await loadMembers(activeOrg.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not update role');
+    }
+  }
+
+  async function kickMember(userId: string, label: string) {
+    if (!activeOrg?.id) {
+      return;
+    }
+    const ok = await confirmDialog({
+      title: 'Remove member?',
+      message: `Remove ${label} from ${activeOrg.name}? They will lose access to this workspace.`,
+      confirmLabel: 'Remove',
+      danger: true,
+    });
+    if (!ok) {
+      return;
+    }
+    setError('');
+    try {
+      await api(`/organizations/${activeOrg.id}/members/${userId}`, {
+        method: 'DELETE',
+      });
+      await loadMembers(activeOrg.id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not remove member');
+    }
+  }
+
+  async function transferOwnershipTo(userId: string, label: string) {
+    if (!activeOrg?.id) {
+      return;
+    }
+    const ok = await confirmDialog({
+      title: 'Transfer ownership?',
+      message: `Make ${label} the owner of ${activeOrg.name}? You will become an admin.`,
+      confirmLabel: 'Transfer',
+      danger: true,
+    });
+    if (!ok) {
+      return;
+    }
+    setError('');
+    try {
+      await api(`/organizations/${activeOrg.id}/transfer-ownership`, {
+        method: 'POST',
+        body: JSON.stringify({ userId }),
+      });
+      await refreshOrganizations();
+      await loadMembers(activeOrg.id);
+      setSaved('Ownership transferred');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not transfer ownership');
     }
   }
 
@@ -544,13 +751,49 @@ export function ProfilePage() {
         </div>
       </section>
 
-      {isAdmin && branding ? (
+      {canManageWorkspace ? (
+        <form className="profile-sheet" onSubmit={(event) => void saveWorkspaceName(event)}>
+          <header className="profile-sheet-head profile-sheet-head-row">
+            <div>
+              <p className="eyebrow">Workspace</p>
+              <h2>Rename {activeOrg?.name ?? 'workspace'}</h2>
+              <p className="muted">Owners and workspace admins can change the display name.</p>
+            </div>
+            <button className="btn profile-save-inline" type="submit">
+              Save name
+            </button>
+          </header>
+          <div className="profile-fields">
+            <label className="profile-plain-field">
+              Workspace name
+              <input
+                value={workspaceName}
+                onChange={(event) => setWorkspaceName(event.target.value)}
+                maxLength={80}
+                required
+              />
+            </label>
+          </div>
+          {workspaceNameSaved ? (
+            <p className="ok profile-inline-ok">{workspaceNameSaved}</p>
+          ) : null}
+          <div className="profile-sheet-actions profile-sheet-actions-mobile">
+            <button className="btn" type="submit">
+              Save name
+            </button>
+          </div>
+        </form>
+      ) : null}
+
+      {canManageWorkspace && branding ? (
         <form className="profile-sheet" onSubmit={(event) => void saveBranding(event)}>
           <header className="profile-sheet-head profile-sheet-head-row">
             <div>
-              <p className="eyebrow">Admin</p>
+              <p className="eyebrow">Workspace</p>
               <h2>Workspace branding</h2>
-              <p className="muted">White-label Relay for client demos — name, tagline, and accent.</p>
+              <p className="muted">
+                Name, tagline, and accent for this workspace (owners and admins).
+              </p>
             </div>
             <button className="btn profile-save-inline" type="submit">
               Save branding
@@ -600,17 +843,113 @@ export function ProfilePage() {
         </form>
       ) : null}
 
-      {isAdmin ? (
+      {canManageWorkspace ? (
         <section className="profile-sheet">
           <header className="profile-sheet-head">
-            <p className="eyebrow">Admin</p>
-            <h2>Workspace invites</h2>
-            <p className="muted">Create an open invite or bind one to a specific email.</p>
+            <p className="eyebrow">Workspace</p>
+            <h2>Members</h2>
+            <p className="muted">
+              Manage roles in {activeOrg?.name ?? 'this workspace'}. Owners can
+              transfer ownership; admins can promote/demote members.
+            </p>
+          </header>
+          {membersBusy ? <p className="muted">Loading members…</p> : null}
+          {!membersBusy && members.length === 0 ? (
+            <p className="muted">No members found.</p>
+          ) : null}
+          <ul className="member-list">
+            {members.map((member) => {
+              const label = member.label || member.userId.slice(0, 8);
+              const isSelf = member.userId === session?.user.id;
+              const isOwnerRow = member.role === 'owner';
+              return (
+                <li key={member.userId}>
+                  <div className="member-identity">
+                    <span>{label}</span>
+                    <small>
+                      {member.role}
+                      {isSelf ? ' · you' : ''}
+                    </small>
+                  </div>
+                  <div className="member-actions">
+                    {!isOwnerRow && isWorkspaceOwner ? (
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() =>
+                          void transferOwnershipTo(member.userId, label)
+                        }
+                      >
+                        Make owner
+                      </button>
+                    ) : null}
+                    {!isOwnerRow && isWorkspaceOwner && !isSelf ? (
+                      member.role === 'admin' ? (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() =>
+                            void changeMemberRole(member.userId, 'member')
+                          }
+                        >
+                          Demote
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() =>
+                            void changeMemberRole(member.userId, 'admin')
+                          }
+                        >
+                          Make admin
+                        </button>
+                      )
+                    ) : null}
+                    {!isOwnerRow && !isSelf && canManageWorkspace ? (
+                      <button
+                        type="button"
+                        className="danger-text"
+                        onClick={() => void kickMember(member.userId, label)}
+                      >
+                        Remove
+                      </button>
+                    ) : null}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      ) : null}
+
+      {canManageInvites ? (
+        <section className="profile-sheet">
+          <header className="profile-sheet-head">
+            <p className="eyebrow">Workspace</p>
+            <h2>Invite people to {activeOrg?.name ?? 'this workspace'}</h2>
+            <p className="muted">
+              Enter a teammate’s email to create an invite for this workspace and{' '}
+              <strong>#general</strong>. When SMTP is configured the link is
+              emailed; otherwise copy the link (works with YOPmail too).
+            </p>
           </header>
           <form className="invite-form" onSubmit={(event) => void createInvite(event)}>
             <label>
-              Email (optional)
-              <input name="email" type="email" placeholder="person@example.com" />
+              Email
+              <input
+                name="email"
+                type="email"
+                value={inviteEmail}
+                onChange={(event) => setInviteEmail(event.target.value)}
+                placeholder="teammate@yopmail.com"
+                autoComplete="email"
+                required
+                aria-invalid={inviteEmailInvalid}
+              />
+              {inviteEmailInvalid ? (
+                <small className="field-error">Enter a valid email address</small>
+              ) : null}
             </label>
             <label>
               Expires in days
@@ -618,12 +957,17 @@ export function ProfilePage() {
             </label>
             <label>
               Maximum uses
-              <input name="maxUses" type="number" min="1" max="500" defaultValue="25" required />
+              <input name="maxUses" type="number" min="1" max="500" defaultValue="1" required />
             </label>
-            <button className="btn" type="submit" disabled={inviteBusy}>
-              {inviteBusy ? 'Creating…' : 'Create invite'}
+            <button
+              className="btn"
+              type="submit"
+              disabled={inviteBusy || !inviteEmailValid}
+            >
+              {inviteBusy ? 'Creating…' : 'Create invite link'}
             </button>
           </form>
+          {inviteHint ? <p className="muted">{inviteHint}</p> : null}
           {inviteUrl ? (
             <div className="invite-created">
               <a href={inviteUrl}>{inviteUrl}</a>
@@ -632,7 +976,7 @@ export function ProfilePage() {
                 type="button"
                 onClick={() => void navigator.clipboard.writeText(inviteUrl)}
               >
-                Copy
+                Copy link
               </button>
             </div>
           ) : null}
@@ -663,6 +1007,136 @@ export function ProfilePage() {
               );
             })}
           </div>
+        </section>
+      ) : null}
+
+      {canLeaveWorkspace && activeOrg ? (
+        <section className="profile-sheet">
+          <header className="profile-sheet-head">
+            <p className="eyebrow">Workspace</p>
+            <h2>Leave {activeOrg.name}</h2>
+            <p className="muted">
+              Leave this workspace for your account. You will lose access to its
+              channels and messages until someone invites you again.
+              {activeOrg.role === 'owner'
+                ? ' If you are the only owner, delete the workspace instead (or add another owner first).'
+                : ''}
+            </p>
+          </header>
+          <div className="profile-sheet-actions">
+            <button
+              className="danger"
+              type="button"
+              disabled={leaveBusy}
+              onClick={() => {
+                void (async () => {
+                  if (!activeOrg.id || leaveBusy) {
+                    return;
+                  }
+                  const ok = await confirmDialog({
+                    title: 'Leave workspace',
+                    message: `Leave "${activeOrg.name}"? You can rejoin later with an invite.`,
+                    confirmLabel: 'Leave workspace',
+                    cancelLabel: 'Cancel',
+                    danger: true,
+                  });
+                  if (!ok) {
+                    return;
+                  }
+                  setLeaveBusy(true);
+                  setError('');
+                  try {
+                    await leaveOrganization(activeOrg.id);
+                  } catch (err) {
+                    setError(
+                      err instanceof Error ? err.message : 'Could not leave workspace',
+                    );
+                    setLeaveBusy(false);
+                  }
+                })();
+              }}
+            >
+              {leaveBusy ? 'Leaving…' : 'Leave workspace'}
+            </button>
+          </div>
+        </section>
+      ) : null}
+
+      {canDeleteWorkspace && activeOrg ? (
+        <section className="profile-sheet profile-danger-zone">
+          <header className="profile-sheet-head">
+            <p className="eyebrow">Danger zone</p>
+            <h2>Delete workspace</h2>
+            <p className="muted">
+              Permanently delete the <strong>currently active</strong> workspace{' '}
+              <strong>{activeOrg.name}</strong> (rail initials:{' '}
+              <strong>
+                {activeOrg.name
+                  .trim()
+                  .split(/\s+/)
+                  .filter(Boolean)
+                  .slice(0, 2)
+                  .map((part) => part[0])
+                  .join('')
+                  .toUpperCase() || 'WS'}
+              </strong>
+              ) for everyone. Channels, messages, and members of this workspace
+              will be removed. This cannot be undone.
+            </p>
+          </header>
+          <form
+            className="invite-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void (async () => {
+                if (!activeOrg.id || deleteBusy) {
+                  return;
+                }
+                const ok = await confirmDialog({
+                  title: 'Delete workspace',
+                  message: `Delete "${activeOrg.name}" for everyone? This cannot be undone.`,
+                  confirmLabel: 'Delete workspace',
+                  cancelLabel: 'Cancel',
+                  danger: true,
+                });
+                if (!ok) {
+                  return;
+                }
+                setDeleteBusy(true);
+                setError('');
+                try {
+                  await deleteOrganization(activeOrg.id, deleteConfirmName);
+                } catch (err) {
+                  setError(
+                    err instanceof Error ? err.message : 'Could not delete workspace',
+                  );
+                  setDeleteBusy(false);
+                }
+              })();
+            }}
+          >
+            <label>
+              Type <strong>{activeOrg.name}</strong> to confirm
+              <input
+                value={deleteConfirmName}
+                onChange={(event) => setDeleteConfirmName(event.target.value)}
+                placeholder={activeOrg.name}
+                autoComplete="off"
+                required
+              />
+            </label>
+            <button
+              className="danger"
+              type="submit"
+              disabled={
+                deleteBusy ||
+                deleteConfirmName.trim().toLowerCase() !==
+                  activeOrg.name.trim().toLowerCase()
+              }
+            >
+              {deleteBusy ? 'Deleting…' : 'Delete workspace'}
+            </button>
+          </form>
         </section>
       ) : null}
 

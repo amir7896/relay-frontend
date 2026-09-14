@@ -1,6 +1,7 @@
 import { FormEvent, useState } from 'react';
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
+import { getSession } from '../auth/session';
 import { PasswordInput } from '../components/PasswordInput';
 import {
   hasFieldErrors,
@@ -56,7 +57,13 @@ export function RegisterPage() {
         password: fields.password,
         inviteToken,
       });
-      navigate('/chat', { replace: true });
+      const next = getSession();
+      navigate(
+        next?.organizations.length && next.activeOrganizationId
+          ? '/chat'
+          : '/onboarding',
+        { replace: true },
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not create account');
     } finally {
