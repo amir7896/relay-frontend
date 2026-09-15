@@ -4,19 +4,31 @@ import { api } from '../../api/client';
 import { useAuth } from '../../auth/AuthContext';
 import { useChatSocket } from '../../chat/ChatSocketContext';
 import { Modal } from '../../components/Modal';
+import { useConfirm, usePrompt } from '../../components/ConfirmProvider';
 import { PeoplePicker } from '../../components/PeoplePicker';
 import {
   conversationTitle,
   displayName,
-  inboxTime,
+  formatScheduleWhen,
   otherMember,
 } from '../../lib/format';
-import { notify, subscribeWebPush, shouldShowNotificationBanner, dismissNotificationPrompt } from '../../lib/notifications';
+import { RelativeTime } from '../../components/RelativeTime';
+import { notify, subscribeWebPush, shouldShowNotificationBanner, dismissNotificationPrompt, loadNotificationPrefs, shouldNotifyForMessage } from '../../lib/notifications';
 import { usePwaInstall } from '../../hooks/usePwaInstall';
 import { useDirectory } from '../../people/useDirectory';
 import { UserAvatar } from '../../components/UserAvatar';
 import { useOrganization } from '../../organizations/OrganizationContext';
-import type { ChatMessage, Conversation, GlobalSearchHit, Paginated, UserProfile } from '../../api/types';
+import type {
+  ChatMessage,
+  Conversation,
+  GlobalSearchHit,
+  MessageReminder,
+  Paginated,
+  PresenceStatus,
+  SidebarSection,
+  ThreadSummary,
+  UserProfile,
+} from '../../api/types';
 
 export type MessengerOutletContext = {
   openNewChat: () => void;
@@ -131,11 +143,15 @@ function normalizeConversation(item: Conversation): Conversation {
 
 export function MessengerPage() {
   const { session } = useAuth();
+  const confirmDialog = useConfirm();
+  const promptDialog = usePrompt();
   const { organizations, activeOrganizationId } = useOrganization();
   const navigate = useNavigate();
   const threadMatch = useMatch({ path: '/chat/:id', end: false });
+  const detailsMatch = useMatch({ path: '/chat/:id/details', end: true });
   const activeConversationId = threadMatch?.params.id;
   const hasThread = Boolean(activeConversationId);
+  const hasDetails = Boolean(detailsMatch);
   const activeIdRef = useRef(activeConversationId);
   activeIdRef.current = activeConversationId;
   const me = session?.user.id;
@@ -144,6 +160,7 @@ export function MessengerPage() {
   const activeOrg =
     organizations.find((org) => org.id === activeOrganizationId) ??
     organizations[0];
+  const isGuest = activeOrg?.role === 'guest';
   const openedGeneralRef = useRef(false);
   const { people, byUserId, error: directoryError, ensureProfiles, refreshDirectory } =
     useDirectory();
@@ -157,14 +174,30 @@ export function MessengerPage() {
   const [groupOpen, setGroupOpen] = useState(false);
   const [groupName, setGroupName] = useState('');
   const [groupMembers, setGroupMembers] = useState<string[]>([]);
+  const [groupVisibility, setGroupVisibility] = useState<'public' | 'private'>(
+    'private',
+  );
+  const [groupAnnounceOnly, setGroupAnnounceOnly] = useState(false);
+  const [browseOpen, setBrowseOpen] = useState(false);
+  const [publicChannels, setPublicChannels] = useState<Conversation[]>([]);
+  const [browseBusy, setBrowseBusy] = useState(false);
+  const [threadsOpen, setThreadsOpen] = useState(false);
+  const [threadItems, setThreadItems] = useState<ThreadSummary[]>([]);
+  const [threadsBusy, setThreadsBusy] = useState(false);
+  const [threadsUnreadTotal, setThreadsUnreadTotal] = useState(0);
+  const [laterOpen, setLaterOpen] = useState(false);
+  const [laterItems, setLaterItems] = useState<MessageReminder[]>([]);
+  const [laterBusy, setLaterBusy] = useState(false);
+  const [sidebarSections, setSidebarSections] = useState<SidebarSection[]>([]);
+  const [sidebarBusy, setSidebarBusy] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notifyBanner, setNotifyBanner] = useState(false);
   const { showBanner: showInstallBanner, install, dismissBanner: dismissInstall } =
     usePwaInstall();
-  const [, setClock] = useState(0);
   const { subscribe, leaveConversation } = useChatSocket();
   const itemsRef = useRef<Conversation[]>([]);
   itemsRef.current = items;
+  const myStatusRef = useRef<PresenceStatus>('online');
   const byUserIdRef = useRef(byUserId);
   byUserIdRef.current = byUserId;
 
@@ -233,7 +266,11 @@ export function MessengerPage() {
       fromOther &&
       isBrandNew &&
       isLatestUpdate &&
-      (!existing?.muted || mentionsMe);
+      (!existing?.muted || mentionsMe) &&
+      shouldNotifyForMessage({
+        mentionsMe,
+        myStatus: myStatusRef.current,
+      });
 
     setItems((current) => {
       const index = current.findIndex((item) => item.id === message.conversationId);
@@ -326,12 +363,41 @@ export function MessengerPage() {
   }, [load]);
 
   useEffect(() => {
-    setNotifyBanner(shouldShowNotificationBanner());
+    let cancelled = false;
+    async function refreshThreadBadge() {
+      try {
+        const response = await api<Paginated<ThreadSummary>>(
+          '/chat/threads?page=1&limit=40',
+        );
+        if (cancelled) return;
+        const unread = (response.data.items ?? []).reduce(
+          (sum, item) => sum + (item.unreadCount ?? 0),
+          0,
+        );
+        setThreadsUnreadTotal(unread);
+      } catch {
+        // ignore badge errors
+      }
+    }
+    async function refreshLaterBadge() {
+      try {
+        const response = await api<MessageReminder[]>('/chat/reminders');
+        if (cancelled) return;
+        setLaterItems(response.data ?? []);
+      } catch {
+        // ignore
+      }
+    }
+    void refreshThreadBadge();
+    void refreshLaterBadge();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setClock((value) => value + 1), 60_000);
-    return () => window.clearInterval(timer);
+    setNotifyBanner(shouldShowNotificationBanner());
+    void loadNotificationPrefs();
   }, []);
 
   useEffect(() => {
@@ -361,9 +427,14 @@ export function MessengerPage() {
         (payload) => {
           const event = payload as {
             userId: string;
-            status: 'online' | 'offline';
+            status: 'online' | 'away' | 'busy' | 'dnd' | 'offline';
             conversationId?: string;
+            customStatus?: string | null;
+            lastSeenAt?: string | null;
           };
+          if (event.userId === meRef.current) {
+            myStatusRef.current = event.status;
+          }
           setItems((current) =>
             current.map((item) => {
               if (event.conversationId && item.id !== event.conversationId) {
@@ -376,7 +447,18 @@ export function MessengerPage() {
                 ...item,
                 members: item.members.map((member) =>
                   member.userId === event.userId
-                    ? { ...member, status: event.status }
+                    ? {
+                        ...member,
+                        status: event.status,
+                        customStatus:
+                          event.customStatus !== undefined
+                            ? event.customStatus
+                            : member.customStatus,
+                        lastSeenAt:
+                          event.status === 'offline'
+                            ? (event.lastSeenAt ?? member.lastSeenAt)
+                            : null,
+                      }
                     : member,
                 ),
               };
@@ -468,14 +550,70 @@ export function MessengerPage() {
     );
   }, [items, query, me, byUserId]);
 
+  const sectionedIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const section of sidebarSections) {
+      for (const id of section.conversationIds ?? []) {
+        ids.add(id);
+      }
+    }
+    return ids;
+  }, [sidebarSections]);
+
   const channels = useMemo(
-    () => filtered.filter((item) => item.type === 'group'),
-    [filtered],
+    () =>
+      filtered.filter(
+        (item) => item.type === 'group' && !sectionedIds.has(item.id),
+      ),
+    [filtered, sectionedIds],
   );
   const directs = useMemo(
-    () => filtered.filter((item) => item.type === 'private'),
-    [filtered],
+    () =>
+      filtered.filter(
+        (item) => item.type === 'private' && !sectionedIds.has(item.id),
+      ),
+    [filtered, sectionedIds],
   );
+
+  const conversationsById = useMemo(() => {
+    const map = new Map<string, Conversation>();
+    for (const item of filtered) {
+      map.set(item.id, item);
+    }
+    return map;
+  }, [filtered]);
+
+  const loadSidebarSections = useCallback(async () => {
+    try {
+      const response = await api<SidebarSection[]>('/chat/sidebar/sections');
+      setSidebarSections(response.data);
+    } catch {
+      setSidebarSections([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadSidebarSections();
+  }, [loadSidebarSections, activeOrganizationId]);
+
+  const peopleHits = useMemo(() => {
+    const term = query.trim().toLowerCase();
+    if (term.length < 2) {
+      return [];
+    }
+    return people
+      .filter((person) => {
+        if (person.userId === me) {
+          return false;
+        }
+        const name = `${person.firstName} ${person.lastName}`.trim().toLowerCase();
+        return (
+          name.includes(term) ||
+          person.email.toLowerCase().includes(term)
+        );
+      })
+      .slice(0, 12);
+  }, [people, query, me]);
 
   useEffect(() => {
     openedGeneralRef.current = false;
@@ -499,7 +637,13 @@ export function MessengerPage() {
 
   useEffect(() => {
     const term = query.trim();
-    if (term.length < 2) {
+    const looksLikeOperator = /\b(from|in|has|before|after):/i.test(term);
+    if (!looksLikeOperator && term.length < 2) {
+      setMessageHits([]);
+      setMessageSearchBusy(false);
+      return;
+    }
+    if (!term) {
       setMessageHits([]);
       setMessageSearchBusy(false);
       return;
@@ -548,12 +692,176 @@ export function MessengerPage() {
       setModalError('');
       setGroupMembers([]);
       setGroupName('');
+      setGroupVisibility('private');
+      setGroupAnnounceOnly(false);
       setGroupOpen(true);
     },
     clearUnread,
     refreshInbox: load,
     conversations: items,
   };
+
+  function sectionIdForConversation(conversationId: string): string | null {
+    for (const section of sidebarSections) {
+      if ((section.conversationIds ?? []).includes(conversationId)) {
+        return section.id;
+      }
+    }
+    return null;
+  }
+
+  async function createSidebarSection() {
+    const name = await promptDialog({
+      title: 'New sidebar section',
+      message: 'Name for this sidebar section',
+      placeholder: 'e.g. Design',
+      confirmLabel: 'Create',
+      maxLength: 80,
+    });
+    if (!name?.trim()) {
+      return;
+    }
+    setSidebarBusy(true);
+    setError('');
+    try {
+      const response = await api<SidebarSection>('/chat/sidebar/sections', {
+        method: 'POST',
+        body: JSON.stringify({ name: name.trim() }),
+      });
+      setSidebarSections((current) =>
+        [...current, response.data].sort((a, b) => a.sortOrder - b.sortOrder),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not create section');
+    } finally {
+      setSidebarBusy(false);
+    }
+  }
+
+  async function toggleSectionCollapsed(section: SidebarSection) {
+    try {
+      const response = await api<SidebarSection>(
+        `/chat/sidebar/sections/${section.id}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ collapsed: !section.collapsed }),
+        },
+      );
+      setSidebarSections((current) =>
+        current.map((row) => (row.id === section.id ? response.data : row)),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not update section');
+    }
+  }
+
+  async function renameSidebarSection(section: SidebarSection) {
+    const name = await promptDialog({
+      title: 'Rename section',
+      message: 'Choose a new name for this sidebar section',
+      defaultValue: section.name,
+      confirmLabel: 'Rename',
+      maxLength: 80,
+    });
+    if (!name?.trim() || name.trim() === section.name) {
+      return;
+    }
+    try {
+      const response = await api<SidebarSection>(
+        `/chat/sidebar/sections/${section.id}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ name: name.trim() }),
+        },
+      );
+      setSidebarSections((current) =>
+        current.map((row) => (row.id === section.id ? response.data : row)),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not rename section');
+    }
+  }
+
+  async function deleteSidebarSection(section: SidebarSection) {
+    const ok = await confirmDialog({
+      title: 'Delete section',
+      message: `Delete section “${section.name}”? Conversations return to Channels / DMs.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) {
+      return;
+    }
+    try {
+      await api(`/chat/sidebar/sections/${section.id}`, { method: 'DELETE' });
+      setSidebarSections((current) =>
+        current.filter((row) => row.id !== section.id),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not delete section');
+    }
+  }
+
+  async function moveConversationToSection(
+    conversationId: string,
+    targetSectionId: string,
+  ) {
+    const currentSectionId = sectionIdForConversation(conversationId);
+    if (currentSectionId === targetSectionId || (!currentSectionId && !targetSectionId)) {
+      return;
+    }
+    setSidebarBusy(true);
+    setError('');
+    try {
+      let nextSections = sidebarSections;
+      if (currentSectionId) {
+        const current = sidebarSections.find((row) => row.id === currentSectionId);
+        if (current) {
+          const response = await api<SidebarSection>(
+            `/chat/sidebar/sections/${current.id}`,
+            {
+              method: 'PATCH',
+              body: JSON.stringify({
+                conversationIds: (current.conversationIds ?? []).filter(
+                  (id) => id !== conversationId,
+                ),
+              }),
+            },
+          );
+          nextSections = nextSections.map((row) =>
+            row.id === current.id ? response.data : row,
+          );
+        }
+      }
+      if (targetSectionId) {
+        const target =
+          nextSections.find((row) => row.id === targetSectionId) ??
+          sidebarSections.find((row) => row.id === targetSectionId);
+        if (target) {
+          const response = await api<SidebarSection>(
+            `/chat/sidebar/sections/${target.id}`,
+            {
+              method: 'PATCH',
+              body: JSON.stringify({
+                conversationIds: [
+                  ...new Set([...(target.conversationIds ?? []), conversationId]),
+                ],
+              }),
+            },
+          );
+          nextSections = nextSections.map((row) =>
+            row.id === target.id ? response.data : row,
+          );
+        }
+      }
+      setSidebarSections(nextSections);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not move conversation');
+      await loadSidebarSections();
+    } finally {
+      setSidebarBusy(false);
+    }
+  }
 
   function renderConversationRow(item: Conversation) {
     const title = conversationTitle(item, me, byUserId);
@@ -564,13 +872,16 @@ export function MessengerPage() {
     const online =
       item.type === 'group'
         ? item.members.some(
-            (member) => member.status === 'online' && member.userId !== me,
+            (member) => member.status !== 'offline' && member.userId !== me,
           )
-        : peer?.status === 'online';
+        : Boolean(peer && peer.status !== 'offline');
+    const presenceClass =
+      peer && peer.status !== 'offline'
+        ? `presence on presence-${peer.status}`
+        : 'presence';
     const preview =
       previewText(item.lastMessage, me) ??
       (item.type === 'group' ? 'Channel' : 'Direct message');
-    const timeLabel = inboxTime(item.lastMessageAt);
     const unread =
       item.id !== activeConversationId && item.unreadCount > 0
         ? item.unreadCount
@@ -598,7 +909,7 @@ export function MessengerPage() {
             <UserAvatar profile={peerProfile} name={avatarLabel} size="sm" />
           )}
           {!isChannel ? (
-            <span className={online ? 'presence on' : 'presence'} />
+            <span className={online ? presenceClass : 'presence'} />
           ) : null}
         </span>
         <span className="chat-row-main">
@@ -626,19 +937,47 @@ export function MessengerPage() {
             </small>
           </span>
           <span className="chat-row-meta">
-            {timeLabel ? (
-              <time
+            {item.lastMessageAt ? (
+              <RelativeTime
                 className={`chat-row-time${unread ? ' unread-time' : ''}`}
-                dateTime={item.lastMessageAt ?? undefined}
-              >
-                {timeLabel}
-              </time>
+                value={item.lastMessageAt}
+              />
             ) : (
               <span className="chat-row-time chat-row-time-spacer" aria-hidden="true">
                 &nbsp;
               </span>
             )}
             <span className="chat-row-trailing">
+              {sidebarSections.length > 0 ? (
+                <select
+                  className="sidebar-section-move"
+                  aria-label="Move to sidebar section"
+                  title="Move to section"
+                  disabled={sidebarBusy}
+                  value={sectionIdForConversation(item.id) ?? ''}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                  }}
+                  onMouseDown={(event) => {
+                    event.stopPropagation();
+                  }}
+                  onChange={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    void moveConversationToSection(item.id, event.target.value);
+                  }}
+                >
+                  <option value="">
+                    {item.type === 'group' ? 'Channels' : 'Direct messages'}
+                  </option>
+                  {sidebarSections.map((section) => (
+                    <option key={section.id} value={section.id}>
+                      {section.name}
+                    </option>
+                  ))}
+                </select>
+              ) : null}
               <button
                 className={`pin-toggle${item.pinned ? ' is-pinned' : ''}`}
                 type="button"
@@ -759,11 +1098,15 @@ export function MessengerPage() {
         body: JSON.stringify({
           name: groupName.trim().replace(/^#/, ''),
           memberIds: groupMembers,
+          visibility: groupVisibility,
+          announceOnly: groupAnnounceOnly,
         }),
       });
       setGroupOpen(false);
       setGroupName('');
       setGroupMembers([]);
+      setGroupVisibility('private');
+      setGroupAnnounceOnly(false);
       await load();
       navigate(`/chat/${response.data.id}`);
     } catch (err) {
@@ -773,16 +1116,130 @@ export function MessengerPage() {
     }
   }
 
+  async function openBrowsePublic() {
+    setBrowseOpen(true);
+    setModalError('');
+    setBrowseBusy(true);
+    try {
+      const response = await api<Conversation[]>('/chat/channels/public');
+      const joined = new Set(items.map((item) => item.id));
+      setPublicChannels(
+        (response.data ?? [])
+          .map(normalizeConversation)
+          .filter((item) => !joined.has(item.id)),
+      );
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not load public channels',
+      );
+      setPublicChannels([]);
+    } finally {
+      setBrowseBusy(false);
+    }
+  }
+
+  async function openThreadsHome() {
+    setThreadsOpen(true);
+    setModalError('');
+    setThreadsBusy(true);
+    try {
+      const response = await api<Paginated<ThreadSummary>>(
+        '/chat/threads?page=1&limit=40',
+      );
+      setThreadItems(response.data.items ?? []);
+      const unread = (response.data.items ?? []).reduce(
+        (sum, item) => sum + (item.unreadCount ?? 0),
+        0,
+      );
+      setThreadsUnreadTotal(unread);
+      const profileIds = (response.data.items ?? []).flatMap((item) => [
+        item.root.senderId,
+        ...(item.latestReply ? [item.latestReply.senderId] : []),
+      ]);
+      await ensureProfiles(profileIds);
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not load threads',
+      );
+      setThreadItems([]);
+    } finally {
+      setThreadsBusy(false);
+    }
+  }
+
+  async function openLaterInbox() {
+    setLaterOpen(true);
+    setModalError('');
+    setLaterBusy(true);
+    try {
+      const response = await api<MessageReminder[]>('/chat/reminders');
+      setLaterItems(response.data ?? []);
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not load reminders',
+      );
+      setLaterItems([]);
+    } finally {
+      setLaterBusy(false);
+    }
+  }
+
+  async function cancelLaterReminder(reminderId: string) {
+    try {
+      await api(`/chat/reminders/${reminderId}`, { method: 'DELETE' });
+      setLaterItems((current) =>
+        current.filter((item) => item.id !== reminderId),
+      );
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not cancel reminder',
+      );
+    }
+  }
+
+  async function joinPublicChannel(conversationId: string) {
+    setBusy(true);
+    setModalError('');
+    try {
+      const response = await api<Conversation>(
+        `/chat/conversations/${conversationId}/join`,
+        { method: 'POST', body: JSON.stringify({}) },
+      );
+      setBrowseOpen(false);
+      await load();
+      navigate(`/chat/${response.data.id}`);
+    } catch (err) {
+      setModalError(err instanceof Error ? err.message : 'Could not join channel');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
-    <div className={hasThread ? 'messenger has-thread slack-messenger' : 'messenger slack-messenger'}>
+    <div
+      className={[
+        'messenger',
+        'slack-messenger',
+        hasThread ? 'has-thread' : '',
+        hasDetails ? 'has-details' : '',
+      ]
+        .filter(Boolean)
+        .join(' ')}
+    >
       <aside className="inbox">
         <div className="inbox-head">
           <div className="inbox-head-top">
             <div className="inbox-workspace">
               <h1>{activeOrg?.name ?? 'Workspace'}</h1>
-              <p className="muted inbox-workspace-sub">Channels &amp; messages</p>
+              <p className="muted inbox-workspace-sub">
+                {isGuest
+                  ? 'Guest — channels you are invited to'
+                  : 'Channels & messages'}
+              </p>
             </div>
             <div className="inbox-head-actions">
+              {!isGuest ? (
+                <>
               <button
                 className="inbox-action-btn"
                 type="button"
@@ -811,6 +1268,8 @@ export function MessengerPage() {
                   />
                 </svg>
               </button>
+                </>
+              ) : null}
             </div>
           </div>
           <div className="inbox-search-wrap">
@@ -818,8 +1277,9 @@ export function MessengerPage() {
               className="inbox-search"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search channels and messages"
+              placeholder="Search — try from:jane has:file in:general"
               aria-label="Search channels and messages"
+              title="Operators: from:name · in:#channel · has:file|image|link|audio · after:7d · before:2024-01-01"
             />
           </div>
         </div>
@@ -855,19 +1315,152 @@ export function MessengerPage() {
         ) : null}
         <div className="inbox-list">
           <div className="inbox-section-head">
-            <p className="inbox-section-label">Channels</p>
+            <p className="inbox-section-label">
+              Threads
+              {threadsUnreadTotal > 0 ? (
+                <span className="inbox-unread-pill">{threadsUnreadTotal}</span>
+              ) : null}
+            </p>
             <button
               type="button"
               className="inbox-section-add"
-              aria-label="Create a channel"
-              title="Create a channel"
-              onClick={outletContext.openNewGroup}
+              aria-label="Open threads"
+              title="Threads you follow"
+              onClick={() => void openThreadsHome()}
             >
-              +
+              ↗
             </button>
           </div>
+          <button
+            type="button"
+            className="inbox-empty-link"
+            onClick={() => void openThreadsHome()}
+          >
+            {threadsUnreadTotal > 0
+              ? `${threadsUnreadTotal} unread in threads`
+              : 'View threads you follow'}
+          </button>
+
+          <div className="inbox-section-head">
+            <p className="inbox-section-label">
+              Later
+              {laterItems.length > 0 ? (
+                <span className="inbox-unread-pill">{laterItems.length}</span>
+              ) : null}
+            </p>
+            <button
+              type="button"
+              className="inbox-section-add"
+              aria-label="Open Later reminders"
+              title="Reminders"
+              onClick={() => void openLaterInbox()}
+            >
+              ⏰
+            </button>
+          </div>
+          <button
+            type="button"
+            className="inbox-empty-link"
+            onClick={() => void openLaterInbox()}
+          >
+            {laterItems.length > 0
+              ? `${laterItems.length} reminder${laterItems.length === 1 ? '' : 's'}`
+              : 'Reminders from message menus'}
+          </button>
+
+          <div className="inbox-section-head">
+            <p className="inbox-section-label">Channels</p>
+            <div className="inbox-section-actions">
+              {!isGuest ? (
+                <>
+              <button
+                type="button"
+                className="inbox-section-add"
+                aria-label="Create sidebar section"
+                title="Create a custom section"
+                disabled={sidebarBusy}
+                onClick={() => void createSidebarSection()}
+              >
+                ≡
+              </button>
+              <button
+                type="button"
+                className="inbox-section-add"
+                aria-label="Browse public channels"
+                title="Browse public channels"
+                onClick={() => void openBrowsePublic()}
+              >
+                ⌕
+              </button>
+              <button
+                type="button"
+                className="inbox-section-add"
+                aria-label="Create a channel"
+                title="Create a channel"
+                onClick={outletContext.openNewGroup}
+              >
+                +
+              </button>
+                </>
+              ) : null}
+            </div>
+          </div>
+          {sidebarSections.map((section) => {
+            const sectionItems = (section.conversationIds ?? [])
+              .map((id) => conversationsById.get(id))
+              .filter((row): row is Conversation => Boolean(row));
+            return (
+              <div key={section.id} className="inbox-custom-section">
+                <div className="inbox-section-head">
+                  <button
+                    type="button"
+                    className="inbox-section-label inbox-section-toggle"
+                    aria-expanded={!section.collapsed}
+                    onClick={() => void toggleSectionCollapsed(section)}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      void renameSidebarSection(section);
+                    }}
+                    title="Click to collapse · right-click to rename"
+                  >
+                    <span aria-hidden="true">{section.collapsed ? '▸' : '▾'}</span>
+                    {section.name}
+                    {sectionItems.length > 0 ? (
+                      <span className="inbox-unread-pill muted-pill">
+                        {sectionItems.length}
+                      </span>
+                    ) : null}
+                  </button>
+                  <div className="inbox-section-actions">
+                    <button
+                      type="button"
+                      className="inbox-section-add"
+                      aria-label={`Delete ${section.name}`}
+                      title="Delete section"
+                      onClick={() => void deleteSidebarSection(section)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                </div>
+                {!section.collapsed
+                  ? sectionItems.map((item) => renderConversationRow(item))
+                  : null}
+                {!section.collapsed && sectionItems.length === 0 ? (
+                  <p className="muted pad inbox-section-hint">
+                    Use the section menu on a chat to move it here.
+                  </p>
+                ) : null}
+              </div>
+            );
+          })}
           {channels.map((item) => renderConversationRow(item))}
-          {channels.length === 0 && !query.trim() ? (
+          {channels.length === 0 && !query.trim() && sidebarSections.length === 0 ? (
+            isGuest ? (
+              <p className="muted inbox-empty-link">
+                Ask a teammate to invite you to a channel
+              </p>
+            ) : (
             <button
               type="button"
               className="inbox-empty-link"
@@ -875,10 +1468,12 @@ export function MessengerPage() {
             >
               Create a channel
             </button>
+            )
           ) : null}
 
           <div className="inbox-section-head">
             <p className="inbox-section-label">Direct messages</p>
+            {!isGuest ? (
             <button
               type="button"
               className="inbox-section-add"
@@ -888,9 +1483,13 @@ export function MessengerPage() {
             >
               +
             </button>
+            ) : null}
           </div>
           {directs.map((item) => renderConversationRow(item))}
           {directs.length === 0 && !query.trim() ? (
+            isGuest ? (
+              <p className="muted inbox-empty-link">No direct messages yet</p>
+            ) : (
             <button
               type="button"
               className="inbox-empty-link"
@@ -898,10 +1497,31 @@ export function MessengerPage() {
             >
               Message a teammate
             </button>
+            )
           ) : null}
 
-          {query.trim().length >= 2 ? (
+          {query.trim().length >= 2 ||
+          /\b(from|in|has|before|after):/i.test(query) ? (
             <>
+              <p className="inbox-section-label">People</p>
+              {peopleHits.map((person) => (
+                  <button
+                    key={person.userId}
+                    type="button"
+                    className="chat-row global-search-hit"
+                    onClick={() => {
+                      void startPrivate(person.userId);
+                    }}
+                  >
+                    <span className="chat-avatar-wrap">
+                      <UserAvatar profile={person} name={displayName(person)} size="sm" />
+                    </span>
+                    <span className="chat-row-main">
+                      <strong className="chat-row-title">{displayName(person)}</strong>
+                      <small className="chat-row-preview">{person.email}</small>
+                    </span>
+                  </button>
+                ))}
               <p className="inbox-section-label">
                 Messages
                 {messageSearchBusy ? '…' : messageHits.length ? ` · ${messageHits.length}` : ''}
@@ -909,7 +1529,6 @@ export function MessengerPage() {
               {messageHits.map((hit) => {
                 const title = hitConversationTitle(hit, me, byUserId);
                 const snippet = messageSnippet(hit.message, me);
-                const timeLabel = inboxTime(hit.message.createdAt);
                 const hitPeer =
                   hit.conversation.type === 'private'
                     ? hit.conversation.members.find((member) => member.userId !== me)
@@ -936,14 +1555,10 @@ export function MessengerPage() {
                     <span className="chat-row-main">
                       <span className="chat-row-top">
                         <strong className="chat-row-title">{title}</strong>
-                        {timeLabel ? (
-                          <time
-                            className="chat-row-time"
-                            dateTime={hit.message.createdAt}
-                          >
-                            {timeLabel}
-                          </time>
-                        ) : null}
+                        <RelativeTime
+                          className="chat-row-time"
+                          value={hit.message.createdAt}
+                        />
                       </span>
                       <span className="chat-row-bottom">
                         <small className="chat-row-preview">{snippet}</small>
@@ -997,6 +1612,8 @@ export function MessengerPage() {
         onClose={() => {
           setGroupOpen(false);
           setGroupMembers([]);
+          setGroupVisibility('private');
+          setGroupAnnounceOnly(false);
           setModalError('');
         }}
       >
@@ -1010,6 +1627,26 @@ export function MessengerPage() {
               maxLength={120}
               placeholder="product-launch"
             />
+          </label>
+          <label>
+            Visibility
+            <select
+              value={groupVisibility}
+              onChange={(event) =>
+                setGroupVisibility(event.target.value as 'public' | 'private')
+              }
+            >
+              <option value="private">Private — invite only</option>
+              <option value="public">Public — anyone in workspace can join</option>
+            </select>
+          </label>
+          <label>
+            <input
+              type="checkbox"
+              checked={groupAnnounceOnly}
+              onChange={(event) => setGroupAnnounceOnly(event.target.checked)}
+            />{' '}
+            Announce-only (admins post, members read)
           </label>
           <div className="modal-section">
             <p className="muted">
@@ -1033,6 +1670,158 @@ export function MessengerPage() {
             Create channel
           </button>
         </form>
+      </Modal>
+
+      <Modal
+        open={browseOpen}
+        title="Browse public channels"
+        onClose={() => {
+          setBrowseOpen(false);
+          setModalError('');
+        }}
+      >
+        {browseBusy ? <p className="muted">Loading…</p> : null}
+        {!browseBusy && publicChannels.length === 0 ? (
+          <p className="muted">No public channels to join right now.</p>
+        ) : null}
+        <ul className="member-list">
+          {publicChannels.map((channel) => (
+            <li key={channel.id}>
+              <span>#{channel.name?.replace(/^#/, '')}</span>
+              <button
+                className="btn"
+                type="button"
+                disabled={busy}
+                onClick={() => void joinPublicChannel(channel.id)}
+              >
+                Join
+              </button>
+            </li>
+          ))}
+        </ul>
+        {modalError ? <p className="error">{modalError}</p> : null}
+      </Modal>
+
+      <Modal
+        open={threadsOpen}
+        title="Threads"
+        onClose={() => {
+          setThreadsOpen(false);
+          setModalError('');
+        }}
+      >
+        {threadsBusy ? <p className="muted">Loading threads…</p> : null}
+        {!threadsBusy && threadItems.length === 0 ? (
+          <p className="muted">
+            Open or reply in a thread and it will show up here. Unfollow any
+            thread you no longer need.
+          </p>
+        ) : null}
+        <ul className="threads-home-list">
+          {threadItems.map((item) => {
+            const channelLabel =
+              item.conversationType === 'group'
+                ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
+                : item.conversationName || 'Direct message';
+            const latest = item.latestReply ?? item.root;
+            const unread = (item.unreadCount ?? 0) > 0;
+            return (
+              <li key={item.root.id}>
+                <button
+                  type="button"
+                  className={`threads-home-row${unread ? ' unread' : ''}`}
+                  onClick={() => {
+                    setThreadsOpen(false);
+                    navigate(
+                      `/chat/${item.conversationId}?thread=${item.root.id}`,
+                    );
+                  }}
+                >
+                  <div className="threads-home-meta">
+                    <strong>{channelLabel}</strong>
+                    <span className="muted">
+                      {unread ? (
+                        <span className="inbox-unread-pill">
+                          {item.unreadCount}
+                        </span>
+                      ) : null}{' '}
+                      {item.replyCount}{' '}
+                      {item.replyCount === 1 ? 'reply' : 'replies'}
+                    </span>
+                  </div>
+                  <p className="threads-home-snippet">
+                    {displayName(byUserId.get(item.root.senderId))}:{' '}
+                    {messageSnippet(item.root, me)}
+                  </p>
+                  <p className="threads-home-snippet muted">
+                    Latest · {displayName(byUserId.get(latest.senderId))}:{' '}
+                    {messageSnippet(latest, me)}
+                  </p>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+        {modalError ? <p className="error">{modalError}</p> : null}
+      </Modal>
+
+      <Modal
+        open={laterOpen}
+        title="Later"
+        onClose={() => {
+          setLaterOpen(false);
+          setModalError('');
+        }}
+      >
+        {laterBusy ? <p className="muted">Loading reminders…</p> : null}
+        {!laterBusy && laterItems.length === 0 ? (
+          <p className="muted">
+            Remind yourself from any message&apos;s ⋮ menu. Pending reminders
+            show up here until they fire.
+          </p>
+        ) : null}
+        <ul className="threads-home-list later-inbox-list">
+          {laterItems.map((item) => {
+            const channelLabel =
+              item.conversationType === 'group'
+                ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
+                : item.conversationName?.trim() || 'Direct message';
+            return (
+              <li key={item.id}>
+                <div className="later-inbox-row">
+                  <button
+                    type="button"
+                    className="threads-home-row"
+                    onClick={() => {
+                      setLaterOpen(false);
+                      navigate(
+                        `/chat/${item.conversationId}?focus=${item.messageId}`,
+                      );
+                    }}
+                  >
+                    <div className="threads-home-meta">
+                      <strong>{channelLabel}</strong>
+                      <span className="muted">
+                        {formatScheduleWhen(item.remindAt)}
+                      </span>
+                    </div>
+                    <p className="threads-home-snippet">
+                      {item.bodySnippet?.trim() || 'Saved message'}
+                    </p>
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost later-cancel-btn"
+                    onClick={() => void cancelLaterReminder(item.id)}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+        {modalError ? <p className="error">{modalError}</p> : null}
       </Modal>
     </div>
   );

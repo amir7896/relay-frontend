@@ -10,6 +10,7 @@ export type Session = {
     email: string;
     role: string;
     isEmailVerified?: boolean;
+    totpEnabled?: boolean;
   };
   organizations: OrganizationView[];
   activeOrganizationId: string | null;

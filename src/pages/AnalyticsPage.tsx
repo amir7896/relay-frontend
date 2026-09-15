@@ -14,7 +14,37 @@ function formatDayLabel(isoDate: string): string {
 }
 
 function formatAction(action: string): string {
-  return action.replace(/[._]/g, ' ');
+  const labels: Record<string, string> = {
+    'auth.login': 'Signed in',
+    'auth.registered': 'Registered',
+    'invite.created': 'Invite created',
+    'invite.accepted': 'Invite accepted',
+    'member.role_changed': 'Member role changed',
+    'member.removed': 'Member removed',
+    'member.left': 'Left workspace',
+    'org.created': 'Workspace created',
+    'org.renamed': 'Workspace renamed',
+    'org.deleted': 'Workspace deleted',
+    'org.sso_updated': 'SSO settings updated',
+    'org.billing_updated': 'Billing updated',
+    'org.billing_checkout_started': 'Checkout started',
+    'org.billing_portal_opened': 'Billing portal opened',
+    'org.ownership_transferred': 'Ownership transferred',
+    'conversation.created': 'Channel created',
+    'conversation.deleted': 'Channel deleted',
+    'conversation.joined': 'Joined channel',
+    'conversation.left': 'Left channel',
+    'conversation.members_added': 'Members added to channel',
+    'conversation.member_removed': 'Member removed from channel',
+    'message.sent': 'Message sent',
+    'message.edited': 'Message edited',
+    'message.deleted': 'Message deleted',
+    'message.poll_created': 'Poll created',
+    'message.scheduled': 'Message scheduled',
+    'conversation.disappearing_updated': 'Disappearing messages updated',
+    'workspace.updated': 'Workspace branding updated',
+  };
+  return labels[action] ?? action.replace(/[._]/g, ' ');
 }
 
 export function AnalyticsPage() {
@@ -30,7 +60,7 @@ export function AnalyticsPage() {
     try {
       const [stats, log] = await Promise.all([
         api<ChatAnalytics>('/admin/analytics'),
-        api<Paginated<AuditEvent>>('/admin/audit?page=1&limit=20'),
+        api<Paginated<AuditEvent>>('/admin/audit?page=1&limit=50'),
       ]);
       setAnalytics(stats.data);
       setAudit(log.data.items);
@@ -237,7 +267,10 @@ export function AnalyticsPage() {
         <div className="panel-head">
           <div>
             <h2>Audit log</h2>
-            <p className="muted panel-sub">Recent admin and workspace actions</p>
+            <p className="muted panel-sub">
+              Security and admin actions (sign-in, invites, roles, SSO, billing,
+              channel changes)
+            </p>
           </div>
           <button className="btn ghost" type="button" onClick={() => void exportAudit()}>
             Export CSV
@@ -266,7 +299,13 @@ export function AnalyticsPage() {
                     <td>
                       <span className="audit-action">{formatAction(item.action)}</span>
                     </td>
-                    <td className="muted">{item.targetType ?? '—'}</td>
+                    <td className="muted">
+                      {item.targetType
+                        ? `${item.targetType}${
+                            item.targetId ? ` · ${item.targetId.slice(0, 8)}…` : ''
+                          }`
+                        : '—'}
+                    </td>
                   </tr>
                 ))}
               </tbody>

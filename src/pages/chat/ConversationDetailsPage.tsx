@@ -5,6 +5,7 @@ import { useAuth } from '../../auth/AuthContext';
 import { useConfirm } from '../../components/ConfirmProvider';
 import { PeoplePicker } from '../../components/PeoplePicker';
 import { UserAvatar } from '../../components/UserAvatar';
+import { copyText } from '../../lib/clipboard';
 import {
   conversationTitle,
   displayName,
@@ -12,7 +13,7 @@ import {
   otherMember,
 } from '../../lib/format';
 import { useDirectory } from '../../people/useDirectory';
-import type { Conversation } from '../../api/types';
+import type { ChannelInvite, Conversation, IncomingWebhook } from '../../api/types';
 import type { MessengerOutletContext } from './MessengerPage';
 
 const DISAPPEARING_OPTIONS: Array<{ value: number; label: string }> = [
@@ -30,6 +31,15 @@ function disappearingLabel(seconds: number | undefined) {
   return match?.label ?? 'Off';
 }
 
+function isValidHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 export function ConversationDetailsPage() {
   const { id = '' } = useParams();
   const navigate = useNavigate();
@@ -43,9 +53,29 @@ export function ConversationDetailsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [actionError, setActionError] = useState('');
+  const [manageSaved, setManageSaved] = useState('');
+  const [nameError, setNameError] = useState('');
+  const [topicError, setTopicError] = useState('');
+  const [bookmarkError, setBookmarkError] = useState('');
+  const [nameBusy, setNameBusy] = useState(false);
+  const [topicBusy, setTopicBusy] = useState(false);
+  const [bookmarkBusy, setBookmarkBusy] = useState(false);
   const [summary, setSummary] = useState('');
   const [summaryBusy, setSummaryBusy] = useState(false);
   const [nameDraft, setNameDraft] = useState('');
+  const [topicDraft, setTopicDraft] = useState('');
+  const [descriptionDraft, setDescriptionDraft] = useState('');
+  const [bookmarkTitle, setBookmarkTitle] = useState('');
+  const [bookmarkUrl, setBookmarkUrl] = useState('');
+  const [channelInviteUrl, setChannelInviteUrl] = useState('');
+  const [inviteCopyHint, setInviteCopyHint] = useState('');
+  const [inviteBusy, setInviteBusy] = useState(false);
+  const [webhooks, setWebhooks] = useState<IncomingWebhook[]>([]);
+  const [webhookName, setWebhookName] = useState('');
+  const [webhookUsername, setWebhookUsername] = useState('');
+  const [webhookBusy, setWebhookBusy] = useState(false);
+  const [createdWebhookUrl, setCreatedWebhookUrl] = useState('');
+  const [webhookCopyHint, setWebhookCopyHint] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -55,18 +85,47 @@ export function ConversationDetailsPage() {
       const next = response.data;
       setConversation(next);
       setNameDraft(next.name ?? '');
+      setTopicDraft(next.topic ?? '');
+      setDescriptionDraft(next.description ?? '');
       await ensureProfiles(next.members.map((member) => member.userId));
+      const myMembership = next.members.find((member) => member.userId === me);
+      const canManageHooks =
+        myMembership?.role === 'owner' || myMembership?.role === 'admin';
+      if (next.type === 'group' && canManageHooks) {
+        try {
+          const hooks = await api<IncomingWebhook[]>(
+            `/chat/conversations/${id}/incoming-webhooks`,
+          );
+          setWebhooks(hooks.data);
+        } catch {
+          setWebhooks([]);
+        }
+      } else {
+        setWebhooks([]);
+      }
     } catch (err) {
       setConversation(null);
       setError(err instanceof Error ? err.message : 'Could not load details');
     } finally {
       setLoading(false);
     }
-  }, [ensureProfiles, id]);
+  }, [ensureProfiles, id, me]);
 
   useEffect(() => {
     setSummary('');
     setActionError('');
+    setManageSaved('');
+    setNameError('');
+    setTopicError('');
+    setBookmarkError('');
+    setChannelInviteUrl('');
+    setInviteCopyHint('');
+    setCreatedWebhookUrl('');
+    setWebhookCopyHint('');
+    setWebhookName('');
+    setWebhookUsername('');
+    setBookmarkTitle('');
+    setBookmarkUrl('');
     void load();
   }, [load]);
 
@@ -86,12 +145,28 @@ export function ConversationDetailsPage() {
   const pageTitle =
     conversation?.type === 'group' ? 'Channel details' : 'Chat info';
 
+  function flashSaved(message: string) {
+    setManageSaved(message);
+    setActionError('');
+    window.setTimeout(() => {
+      setManageSaved((current) => (current === message ? '' : current));
+    }, 3200);
+  }
+
   async function rename(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const name = nameDraft.trim();
+    setNameError('');
+    setManageSaved('');
     if (!name) {
+      setNameError('Channel name is required');
       return;
     }
+    if (name.length < 2) {
+      setNameError('Channel name must be at least 2 characters');
+      return;
+    }
+    setNameBusy(true);
     try {
       const response = await api<Conversation>(`/chat/conversations/${id}`, {
         method: 'PATCH',
@@ -99,9 +174,227 @@ export function ConversationDetailsPage() {
       });
       setConversation(response.data);
       setNameDraft(response.data.name ?? '');
+      flashSaved('Channel name saved');
       void refreshInbox();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not rename channel');
+    } finally {
+      setNameBusy(false);
+    }
+  }
+
+  async function patchChannelSettings(patch: {
+    visibility?: 'public' | 'private';
+    announceOnly?: boolean;
+    topic?: string | null;
+    description?: string | null;
+  }, savedMessage?: string) {
+    try {
+      const response = await api<Conversation>(`/chat/conversations/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+      });
+      setConversation(response.data);
+      setTopicDraft(response.data.topic ?? '');
+      setDescriptionDraft(response.data.description ?? '');
+      if (savedMessage) {
+        flashSaved(savedMessage);
+      }
+      void refreshInbox();
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not update channel settings',
+      );
+    }
+  }
+
+  async function saveTopicDescription(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setTopicError('');
+    setManageSaved('');
+    const topic = topicDraft.trim();
+    const description = descriptionDraft.trim();
+    setTopicBusy(true);
+    try {
+      await patchChannelSettings(
+        {
+          topic: topic || null,
+          description: description || null,
+        },
+        'Topic & description saved',
+      );
+    } finally {
+      setTopicBusy(false);
+    }
+  }
+
+  async function addChannelBookmark(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const title = bookmarkTitle.trim();
+    const url = bookmarkUrl.trim();
+    setBookmarkError('');
+    setManageSaved('');
+    if (!title) {
+      setBookmarkError('Bookmark title is required');
+      return;
+    }
+    if (!url) {
+      setBookmarkError('Bookmark URL is required');
+      return;
+    }
+    if (!isValidHttpUrl(url)) {
+      setBookmarkError('Enter a valid URL starting with http:// or https://');
+      return;
+    }
+    setBookmarkBusy(true);
+    try {
+      const response = await api<Conversation>(
+        `/chat/conversations/${id}/channel-bookmarks`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ title, url }),
+        },
+      );
+      setConversation(response.data);
+      setBookmarkTitle('');
+      setBookmarkUrl('');
+      flashSaved('Bookmark added');
+      void refreshInbox();
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not add bookmark',
+      );
+    } finally {
+      setBookmarkBusy(false);
+    }
+  }
+
+  async function removeChannelBookmark(bookmarkId: string) {
+    try {
+      const response = await api<Conversation>(
+        `/chat/conversations/${id}/channel-bookmarks/${bookmarkId}`,
+        { method: 'DELETE' },
+      );
+      setConversation(response.data);
+      void refreshInbox();
+      flashSaved('Bookmark removed');
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not remove bookmark',
+      );
+    }
+  }
+
+  async function createChannelInvite() {
+    setInviteBusy(true);
+    setActionError('');
+    setInviteCopyHint('');
+    try {
+      const response = await api<ChannelInvite>(
+        `/chat/conversations/${id}/invites`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ expiresInHours: 168, maxUses: 25 }),
+        },
+      );
+      const path =
+        response.data.inviteUrl ||
+        (response.data.token ? `/channel-invite/${response.data.token}` : '');
+      const url = path.startsWith('http')
+        ? path
+        : `${window.location.origin}${path.startsWith('/') ? path : `/${path}`}`;
+      setChannelInviteUrl(url);
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not create invite link',
+      );
+    } finally {
+      setInviteBusy(false);
+    }
+  }
+
+  async function copyChannelInviteLink() {
+    if (!channelInviteUrl) return;
+    const ok = await copyText(channelInviteUrl);
+    setInviteCopyHint(ok ? 'Link copied to clipboard' : 'Could not copy — select the URL and copy manually');
+  }
+
+  async function createIncomingWebhook(event: FormEvent) {
+    event.preventDefault();
+    const name = webhookName.trim();
+    setActionError('');
+    setWebhookCopyHint('');
+    if (!name) {
+      setActionError('Webhook name is required');
+      return;
+    }
+    setWebhookBusy(true);
+    try {
+      const response = await api<IncomingWebhook>(
+        `/chat/conversations/${id}/incoming-webhooks`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            name,
+            defaultUsername: webhookUsername.trim() || name,
+          }),
+        },
+      );
+      const path =
+        response.data.webhookUrl ||
+        (response.data.token ? `/hooks/incoming/${response.data.token}` : '');
+      const url = path.startsWith('http')
+        ? path
+        : `${window.location.origin}/api${path.startsWith('/') ? path : `/${path}`}`;
+      setCreatedWebhookUrl(url);
+      setWebhookName('');
+      setWebhookUsername('');
+      flashSaved('Incoming webhook created');
+      const list = await api<IncomingWebhook[]>(
+        `/chat/conversations/${id}/incoming-webhooks`,
+      );
+      setWebhooks(list.data);
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not create webhook',
+      );
+    } finally {
+      setWebhookBusy(false);
+    }
+  }
+
+  async function copyWebhookUrl() {
+    if (!createdWebhookUrl) return;
+    const ok = await copyText(createdWebhookUrl);
+    setWebhookCopyHint(
+      ok ? 'Webhook URL copied — store it securely; it is shown only once' : 'Could not copy',
+    );
+  }
+
+  async function revokeIncomingWebhook(webhookId: string) {
+    const ok = await confirmDialog({
+      title: 'Revoke incoming webhook?',
+      message: 'Integrations using this URL will stop posting to the channel.',
+      confirmLabel: 'Revoke',
+      danger: true,
+    });
+    if (!ok) return;
+    setActionError('');
+    try {
+      await api(`/chat/conversations/${id}/incoming-webhooks/${webhookId}`, {
+        method: 'DELETE',
+      });
+      setWebhooks((prev) =>
+        prev.map((hook) =>
+          hook.id === webhookId
+            ? { ...hook, revokedAt: new Date().toISOString() }
+            : hook,
+        ),
+      );
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not revoke webhook',
+      );
     }
   }
 
@@ -344,6 +637,7 @@ export function ConversationDetailsPage() {
       <div className="conversation-details-body">
         {error ? <p className="error">{error}</p> : null}
         {actionError ? <p className="error">{actionError}</p> : null}
+        {manageSaved ? <p className="ok">{manageSaved}</p> : null}
 
         {loading && !conversation ? (
           <p className="muted pad">Loading details…</p>
@@ -470,7 +764,7 @@ export function ConversationDetailsPage() {
                   return (
                     <li key={member.userId}>
                       <span className="member-identity">
-                        <span className={member.status === 'online' ? 'dot on' : 'dot'} />
+                        <span className={member.status !== 'offline' ? `dot on presence-${member.status}` : 'dot'} />
                         <span>
                           {name}
                           {member.userId === me ? ' (you)' : ''}
@@ -521,9 +815,17 @@ export function ConversationDetailsPage() {
               <h3>Settings</h3>
               <dl className="conversation-details-meta">
                 <div>
+                  <dt>Topic</dt>
+                  <dd>{conversation.topic?.trim() || 'No topic yet'}</dd>
+                </div>
+                <div>
+                  <dt>Description</dt>
+                  <dd>{conversation.description?.trim() || 'No description yet'}</dd>
+                </div>
+                <div>
                   <dt>Online</dt>
                   <dd>
-                    {conversation.members.filter((m) => m.status === 'online').length} /{' '}
+                    {conversation.members.filter((m) => m.status !== 'offline').length} /{' '}
                     {conversation.members.length}
                   </dd>
                 </div>
@@ -542,6 +844,20 @@ export function ConversationDetailsPage() {
                   <dd>{disappearingLabel(conversation.disappearingDurationSeconds)}</dd>
                 </div>
               </dl>
+              {(conversation.bookmarks?.length ?? 0) > 0 ? (
+                <div className="channel-bookmarks-list">
+                  <p className="muted">Bookmarks</p>
+                  <ul>
+                    {conversation.bookmarks?.map((bookmark) => (
+                      <li key={bookmark.id}>
+                        <a href={bookmark.url} target="_blank" rel="noreferrer">
+                          {bookmark.title}
+                        </a>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
               <div className="modal-actions">
                 <button className="ghost full" type="button" onClick={() => void togglePin()}>
                   {conversation.pinned ? 'Unpin conversation' : 'Pin conversation'}
@@ -591,14 +907,270 @@ export function ConversationDetailsPage() {
                       <input
                         name="name"
                         value={nameDraft}
-                        onChange={(event) => setNameDraft(event.target.value)}
+                        onChange={(event) => {
+                          setNameDraft(event.target.value);
+                          if (nameError) setNameError('');
+                        }}
                         required
+                        aria-invalid={Boolean(nameError)}
                       />
                     </label>
-                    <button className="btn full" type="submit">
-                      Save name
+                    {nameError ? <p className="error">{nameError}</p> : null}
+                    <button className="btn full" type="submit" disabled={nameBusy}>
+                      {nameBusy ? 'Saving…' : 'Save name'}
                     </button>
                   </form>
+                  <form
+                    className="modal-form"
+                    onSubmit={(event) => void saveTopicDescription(event)}
+                  >
+                    <label>
+                      Topic
+                      <input
+                        name="topic"
+                        value={topicDraft}
+                        maxLength={250}
+                        placeholder="What is this channel about?"
+                        onChange={(event) => {
+                          setTopicDraft(event.target.value);
+                          if (topicError) setTopicError('');
+                        }}
+                      />
+                    </label>
+                    <label>
+                      Description
+                      <textarea
+                        name="description"
+                        value={descriptionDraft}
+                        maxLength={2000}
+                        rows={3}
+                        placeholder="Optional longer purpose for this channel"
+                        onChange={(event) => {
+                          setDescriptionDraft(event.target.value);
+                          if (topicError) setTopicError('');
+                        }}
+                      />
+                    </label>
+                    {topicError ? <p className="error">{topicError}</p> : null}
+                    <button className="btn full" type="submit" disabled={topicBusy}>
+                      {topicBusy ? 'Saving…' : 'Save topic & description'}
+                    </button>
+                  </form>
+                  <form
+                    className="modal-form"
+                    onSubmit={(event) => void addChannelBookmark(event)}
+                    noValidate
+                  >
+                    <p className="muted">Channel bookmarks</p>
+                    {(conversation.bookmarks?.length ?? 0) > 0 ? (
+                      <ul className="channel-bookmarks-manage">
+                        {conversation.bookmarks?.map((bookmark) => (
+                          <li key={bookmark.id}>
+                            <a href={bookmark.url} target="_blank" rel="noreferrer">
+                              {bookmark.title}
+                            </a>
+                            <button
+                              className="danger-text"
+                              type="button"
+                              onClick={() => void removeChannelBookmark(bookmark.id)}
+                            >
+                              Remove
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                    <label>
+                      Title
+                      <input
+                        name="bookmarkTitle"
+                        value={bookmarkTitle}
+                        maxLength={80}
+                        placeholder="Design docs"
+                        onChange={(event) => {
+                          setBookmarkTitle(event.target.value);
+                          if (bookmarkError) setBookmarkError('');
+                        }}
+                        required
+                        aria-invalid={Boolean(bookmarkError)}
+                      />
+                    </label>
+                    <label>
+                      URL
+                      <input
+                        name="bookmarkUrl"
+                        type="url"
+                        value={bookmarkUrl}
+                        maxLength={2000}
+                        placeholder="https://example.com/docs"
+                        onChange={(event) => {
+                          setBookmarkUrl(event.target.value);
+                          if (bookmarkError) setBookmarkError('');
+                        }}
+                        required
+                        aria-invalid={Boolean(bookmarkError)}
+                      />
+                    </label>
+                    {bookmarkError ? <p className="error">{bookmarkError}</p> : null}
+                    <button
+                      className="btn full"
+                      type="submit"
+                      disabled={bookmarkBusy}
+                    >
+                      {bookmarkBusy ? 'Adding…' : 'Add bookmark'}
+                    </button>
+                  </form>
+                  <label className="disappearing-field">
+                    <span>Visibility</span>
+                    <select
+                      value={conversation.visibility ?? 'private'}
+                      onChange={(event) =>
+                        void patchChannelSettings(
+                          {
+                            visibility: event.target.value as 'public' | 'private',
+                          },
+                          'Visibility updated',
+                        )
+                      }
+                    >
+                      <option value="private">Private</option>
+                      <option value="public">Public</option>
+                    </select>
+                  </label>
+                  <label className="profile-check">
+                    <span className="profile-check-row">
+                      <input
+                        type="checkbox"
+                        checked={Boolean(conversation.announceOnly)}
+                        onChange={(event) =>
+                          void patchChannelSettings(
+                            {
+                              announceOnly: event.target.checked,
+                            },
+                            event.target.checked
+                              ? 'Announcement-only enabled'
+                              : 'Announcement-only disabled',
+                          )
+                        }
+                      />
+                      Announcement only
+                    </span>
+                  </label>
+                  <div className="modal-actions">
+                    <button
+                      className="ghost full"
+                      type="button"
+                      disabled={inviteBusy}
+                      onClick={() => void createChannelInvite()}
+                    >
+                      {inviteBusy ? 'Creating invite…' : 'Create invite link'}
+                    </button>
+                  </div>
+                  {channelInviteUrl ? (
+                    <label className="disappearing-field">
+                      <span>Invite URL</span>
+                      <input
+                        readOnly
+                        value={channelInviteUrl}
+                        onFocus={(event) => event.currentTarget.select()}
+                      />
+                      <button
+                        className="ghost"
+                        type="button"
+                        onClick={() => void copyChannelInviteLink()}
+                      >
+                        Copy link
+                      </button>
+                      {inviteCopyHint ? <p className="muted">{inviteCopyHint}</p> : null}
+                    </label>
+                  ) : null}
+                  <div className="incoming-webhooks-panel">
+                    <p className="muted" style={{ marginBottom: 8 }}>
+                      Incoming webhooks
+                    </p>
+                    <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
+                      Post into this channel from CI, monitoring, or other tools (Slack-style).
+                    </p>
+                    <form
+                      className="modal-form"
+                      onSubmit={(event) => void createIncomingWebhook(event)}
+                    >
+                      <label>
+                        Name
+                        <input
+                          value={webhookName}
+                          maxLength={80}
+                          placeholder="CI Deployments"
+                          onChange={(event) => setWebhookName(event.target.value)}
+                          required
+                        />
+                      </label>
+                      <label>
+                        Bot username
+                        <input
+                          value={webhookUsername}
+                          maxLength={80}
+                          placeholder="Defaults to name"
+                          onChange={(event) => setWebhookUsername(event.target.value)}
+                        />
+                      </label>
+                      <button className="btn full" type="submit" disabled={webhookBusy}>
+                        {webhookBusy ? 'Creating…' : 'Create webhook'}
+                      </button>
+                    </form>
+                    {createdWebhookUrl ? (
+                      <label className="disappearing-field">
+                        <span>Webhook URL (shown once)</span>
+                        <input
+                          readOnly
+                          value={createdWebhookUrl}
+                          onFocus={(event) => event.currentTarget.select()}
+                        />
+                        <button
+                          className="ghost"
+                          type="button"
+                          onClick={() => void copyWebhookUrl()}
+                        >
+                          Copy URL
+                        </button>
+                        {webhookCopyHint ? (
+                          <p className="muted">{webhookCopyHint}</p>
+                        ) : (
+                          <p className="muted">
+                            POST JSON {'{'} "text": "Hello" {'}'} to this URL.
+                          </p>
+                        )}
+                      </label>
+                    ) : null}
+                    {webhooks.length > 0 ? (
+                      <ul className="incoming-webhook-list">
+                        {webhooks.map((hook) => (
+                          <li key={hook.id}>
+                            <div>
+                              <strong>{hook.name}</strong>
+                              <span className="muted">
+                                {' '}
+                                as {hook.defaultUsername}
+                                {hook.revokedAt ? ' · revoked' : ''}
+                                {hook.lastUsedAt && !hook.revokedAt
+                                  ? ` · last used ${new Date(hook.lastUsedAt).toLocaleString()}`
+                                  : ''}
+                              </span>
+                            </div>
+                            {!hook.revokedAt ? (
+                              <button
+                                className="ghost danger-text"
+                                type="button"
+                                onClick={() => void revokeIncomingWebhook(hook.id)}
+                              >
+                                Revoke
+                              </button>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </div>
                   <div className="add-people">
                     <p className="muted">Add people</p>
                     <PeoplePicker

@@ -331,6 +331,30 @@ export class VoicePeer {
     }
   }
 
+  /**
+   * ICE restart for NAT blips / failed paths. Returns a new offer the caller
+   * must signal to the remote peer (same as a normal offer).
+   */
+  async restartIce(): Promise<RTCSessionDescriptionInit> {
+    return this.enqueueNegotiation(async () => {
+      const pc = await this.createPeerConnection();
+      if (
+        pc.signalingState === 'have-remote-offer' ||
+        pc.signalingState === 'have-local-pranswer'
+      ) {
+        throw new Error('skip-offer-have-remote');
+      }
+      this.makingOffer = true;
+      try {
+        const offer = await pc.createOffer({ iceRestart: true });
+        await pc.setLocalDescription(offer);
+        return pc.localDescription!.toJSON();
+      } finally {
+        this.makingOffer = false;
+      }
+    });
+  }
+
   async getStats(): Promise<RTCStatsReport | null> {
     if (!this.pc) {
       return null;

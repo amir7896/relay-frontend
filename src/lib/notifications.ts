@@ -1,6 +1,29 @@
 import { api } from '../api/client';
 
 const DISMISS_KEY = 'relay.notify.dismissed';
+const PREFS_KEY = 'relay.notify.prefs';
+
+export type NotificationMode = 'all' | 'mentions' | 'none';
+
+export type NotificationPrefs = {
+  mode: NotificationMode;
+  quietHoursEnabled: boolean;
+  quietStart: string;
+  quietEnd: string;
+  timezone: string;
+  respectStatus: boolean;
+};
+
+export const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
+  mode: 'all',
+  quietHoursEnabled: false,
+  quietStart: '22:00',
+  quietEnd: '08:00',
+  timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+  respectStatus: true,
+};
+
+let cachedPrefs: NotificationPrefs | null = null;
 
 export function notificationsSupported(): boolean {
   return typeof window !== 'undefined' && 'Notification' in window;
@@ -91,7 +114,6 @@ export async function registerServiceWorker(): Promise<ServiceWorkerRegistration
   }
 }
 
-
 function applicationServerKey(value: string): ArrayBuffer {
   const padding = '='.repeat((4 - (value.length % 4)) % 4);
   const base64 = (value + padding).replace(/-/g, '+').replace(/_/g, '/');
@@ -137,6 +159,116 @@ export async function subscribeWebPush(): Promise<
     body: JSON.stringify({ endpoint: json.endpoint, keys: json.keys }),
   });
   return 'granted';
+}
+
+function readCachedPrefs(): NotificationPrefs {
+  if (cachedPrefs) return cachedPrefs;
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    if (raw) {
+      cachedPrefs = { ...DEFAULT_NOTIFICATION_PREFS, ...(JSON.parse(raw) as NotificationPrefs) };
+      return cachedPrefs;
+    }
+  } catch {
+    // ignore
+  }
+  return { ...DEFAULT_NOTIFICATION_PREFS };
+}
+
+function writeCachedPrefs(prefs: NotificationPrefs): void {
+  cachedPrefs = prefs;
+  try {
+    localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+  } catch {
+    // ignore
+  }
+}
+
+export function getCachedNotificationPrefs(): NotificationPrefs {
+  return readCachedPrefs();
+}
+
+export async function loadNotificationPrefs(): Promise<NotificationPrefs> {
+  try {
+    const response = await api<NotificationPrefs>('/chat/notification-prefs');
+    const prefs = { ...DEFAULT_NOTIFICATION_PREFS, ...response.data };
+    writeCachedPrefs(prefs);
+    return prefs;
+  } catch {
+    return readCachedPrefs();
+  }
+}
+
+export async function saveNotificationPrefs(
+  patch: Partial<NotificationPrefs>,
+): Promise<NotificationPrefs> {
+  const response = await api<NotificationPrefs>('/chat/notification-prefs', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  const prefs = { ...DEFAULT_NOTIFICATION_PREFS, ...response.data };
+  writeCachedPrefs(prefs);
+  return prefs;
+}
+
+function parseHm(value: string): number | null {
+  const match = /^(\d{2}):(\d{2})$/.exec(value);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return null;
+  return hours * 60 + minutes;
+}
+
+function localMinutes(now: Date, timeZone: string): number | null {
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone,
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    }).formatToParts(now);
+    const hour = Number(parts.find((part) => part.type === 'hour')?.value);
+    const minute = Number(parts.find((part) => part.type === 'minute')?.value);
+    if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
+    const h = hour === 24 ? 0 : hour;
+    return h * 60 + minute;
+  } catch {
+    return null;
+  }
+}
+
+export function isInQuietHours(
+  prefs: NotificationPrefs = readCachedPrefs(),
+  now = new Date(),
+): boolean {
+  if (!prefs.quietHoursEnabled) return false;
+  const start = parseHm(prefs.quietStart);
+  const end = parseHm(prefs.quietEnd);
+  if (start === null || end === null) return false;
+  const minutes = localMinutes(now, prefs.timezone);
+  if (minutes === null) return false;
+  if (start <= end) {
+    return minutes >= start && minutes < end;
+  }
+  return minutes >= start || minutes < end;
+}
+
+/** Whether a foreground/desktop notification should fire for this message. */
+export function shouldNotifyForMessage(input: {
+  mentionsMe: boolean;
+  myStatus?: 'online' | 'away' | 'busy' | 'dnd' | 'offline';
+}): boolean {
+  const prefs = readCachedPrefs();
+  if (prefs.mode === 'none') return false;
+  if (prefs.mode === 'mentions' && !input.mentionsMe) return false;
+  if (isInQuietHours(prefs) && !input.mentionsMe) return false;
+  if (prefs.respectStatus) {
+    const status = input.myStatus;
+    if (status === 'dnd' || status === 'busy') return false;
+    if (status === 'away' && !input.mentionsMe) return false;
+  }
+  return true;
 }
 
 export function notify(options: {

@@ -3,6 +3,16 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom', 'react-router-dom'],
+          socket: ['socket.io-client'],
+        },
+      },
+    },
+  },
   server: {
     // Listen on all interfaces so ngrok / LAN can reach the dev server
     host: true,
@@ -26,7 +36,6 @@ export default defineConfig({
       '/socket.io': {
         target: 'http://127.0.0.1:3002',
         changeOrigin: true,
-        secure: false,
         ws: true,
       },
     },

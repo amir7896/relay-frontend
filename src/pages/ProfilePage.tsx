@@ -3,17 +3,28 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
 import { useOrganization } from '../organizations/OrganizationContext';
-import { useConfirm } from '../components/ConfirmProvider';
+import { useConfirm, usePrompt } from '../components/ConfirmProvider';
 import { PasswordInput } from '../components/PasswordInput';
 import { resolveMediaUrl } from '../components/VoiceNotePlayer';
 import { initials } from '../lib/format';
 import {
   getNotificationPermission,
   subscribeWebPush,
+  loadNotificationPrefs,
+  saveNotificationPrefs,
+  DEFAULT_NOTIFICATION_PREFS,
+  type NotificationPrefs,
 } from '../lib/notifications';
 import { usePwaInstall } from '../hooks/usePwaInstall';
 import { resetDemoTour } from '../components/DemoTour';
-import type { UserProfile, WorkspaceSettings } from '../api/types';
+import type {
+  SessionView,
+  SlashCommand,
+  UserProfile,
+  WorkspaceSettings,
+} from '../api/types';
+import { getSession } from '../auth/session';
+import { useWorkspace } from '../theme/WorkspaceContext';
 
 type WorkspaceInvite = {
   id: string;
@@ -40,7 +51,9 @@ export function ProfilePage() {
     refreshOrganizations,
   } = useOrganization();
   const confirmDialog = useConfirm();
+  const promptDialog = usePrompt();
   const navigate = useNavigate();
+  const workspace = useWorkspace();
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [error, setError] = useState('');
   const [saved, setSaved] = useState('');
@@ -50,6 +63,8 @@ export function ProfilePage() {
   const [leaveBusy, setLeaveBusy] = useState(false);
   const [notifyStatus, setNotifyStatus] = useState(() => getNotificationPermission());
   const [notifyHint, setNotifyHint] = useState('');
+  const [notifyPrefs, setNotifyPrefs] = useState<NotificationPrefs>(DEFAULT_NOTIFICATION_PREFS);
+  const [notifyPrefsBusy, setNotifyPrefsBusy] = useState(false);
   const [installHint, setInstallHint] = useState('');
   const { canInstall, standalone, install } = usePwaInstall();
   const isAdmin = session?.user.role === 'admin';
@@ -70,6 +85,21 @@ export function ProfilePage() {
   const canLeaveWorkspace = Boolean(activeOrg) && !activeOrg?.isDefault;
   const [branding, setBranding] = useState<WorkspaceSettings | null>(null);
   const [brandingSaved, setBrandingSaved] = useState('');
+  const [customEmojiDraft, setCustomEmojiDraft] = useState({
+    shortcode: '',
+    emoji: '',
+    imageFile: null as File | null,
+  });
+  const [customEmojiSaved, setCustomEmojiSaved] = useState('');
+  const [customEmojiBusy, setCustomEmojiBusy] = useState(false);
+  const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
+  const [slashDraft, setSlashDraft] = useState({
+    name: '',
+    description: '',
+    responseTemplate: '',
+  });
+  const [slashSaved, setSlashSaved] = useState('');
+  const [slashBusy, setSlashBusy] = useState(false);
   const [workspaceName, setWorkspaceName] = useState('');
   const [workspaceNameSaved, setWorkspaceNameSaved] = useState('');
   const [members, setMembers] = useState<
@@ -81,6 +111,29 @@ export function ProfilePage() {
   const [inviteHint, setInviteHint] = useState('');
   const [inviteBusy, setInviteBusy] = useState(false);
   const [inviteEmail, setInviteEmail] = useState('');
+  const [totpEnabled, setTotpEnabled] = useState(false);
+  const [totpSetup, setTotpSetup] = useState<{
+    secret: string;
+    otpauthUrl: string;
+  } | null>(null);
+  const [totpCode, setTotpCode] = useState('');
+  const [sessions, setSessions] = useState<SessionView[]>([]);
+  const [planDraft, setPlanDraft] = useState<'free' | 'pro' | 'enterprise'>(
+    'free',
+  );
+  const [presenceDraft, setPresenceDraft] = useState<
+    'online' | 'away' | 'busy' | 'dnd'
+  >('online');
+  const [customStatusDraft, setCustomStatusDraft] = useState('');
+  const [presenceBusy, setPresenceBusy] = useState(false);
+  const [ssoDraft, setSsoDraft] = useState({
+    ssoEnabled: false,
+    ssoProvider: 'oidc' as 'oidc' | 'saml',
+    ssoIssuerUrl: '',
+    ssoClientId: '',
+    ssoClientSecret: '',
+  });
+  const [inviteRole, setInviteRole] = useState<'member' | 'guest'>('member');
   const inviteEmailTrimmed = inviteEmail.trim();
   const inviteEmailValid =
     inviteEmailTrimmed.length > 0 &&
@@ -103,7 +156,50 @@ export function ProfilePage() {
   }, []);
 
   useEffect(() => {
+    void api<{ totpEnabled?: boolean }>('/auth/me')
+      .then((response) => {
+        setTotpEnabled(Boolean(response.data.totpEnabled));
+      })
+      .catch(() => {
+        // ignore
+      });
+    const refreshToken = getSession()?.refreshToken;
+    void api<SessionView[]>(
+      `/auth/sessions${
+        refreshToken ? `?refreshToken=${encodeURIComponent(refreshToken)}` : ''
+      }`,
+    )
+      .then((response) => setSessions(response.data))
+      .catch(() => setSessions([]));
+  }, []);
+
+  useEffect(() => {
+    setPlanDraft(activeOrg?.plan ?? 'free');
+    if (!activeOrganizationId) return;
+    void api<{
+      ssoEnabled: boolean;
+      ssoProvider: 'oidc' | 'saml' | null;
+      ssoIssuerUrl: string | null;
+      ssoClientId: string | null;
+      hasClientSecret?: boolean;
+    }>(`/organizations/${activeOrganizationId}/sso`)
+      .then((response) => {
+        setSsoDraft({
+          ssoEnabled: response.data.ssoEnabled,
+          ssoProvider: response.data.ssoProvider ?? 'oidc',
+          ssoIssuerUrl: response.data.ssoIssuerUrl ?? '',
+          ssoClientId: response.data.ssoClientId ?? '',
+          ssoClientSecret: '',
+        });
+      })
+      .catch(() => {
+        // ignore
+      });
+  }, [activeOrganizationId, activeOrg?.plan]);
+
+  useEffect(() => {
     setNotifyStatus(getNotificationPermission());
+    void loadNotificationPrefs().then(setNotifyPrefs);
   }, []);
 
   useEffect(() => {
@@ -116,7 +212,14 @@ export function ProfilePage() {
       return;
     }
     void api<WorkspaceSettings>('/workspace/settings')
-      .then((response) => setBranding(response.data))
+      .then((response) =>
+        setBranding({
+          ...response.data,
+          customEmojis: Array.isArray(response.data.customEmojis)
+            ? response.data.customEmojis
+            : [],
+        }),
+      )
       .catch(() => undefined);
   }, [canManageWorkspace, activeOrganizationId]);
 
@@ -134,6 +237,14 @@ export function ProfilePage() {
     }
     void loadMembers(activeOrg.id);
   }, [canManageWorkspace, activeOrg?.id]);
+
+  useEffect(() => {
+    if (!canManageWorkspace) {
+      setSlashCommands([]);
+      return;
+    }
+    void loadSlashCommands();
+  }, [canManageWorkspace, activeOrganizationId]);
 
   async function loadInvites() {
     try {
@@ -189,6 +300,7 @@ export function ProfilePage() {
           email,
           expiresInDays: Number(form.get('expiresInDays') ?? 7),
           maxUses: 1,
+          role: inviteRole,
         }),
       });
       const link = response.data.debugInviteUrl || response.data.inviteUrl;
@@ -228,13 +340,166 @@ export function ProfilePage() {
     try {
       const response = await api<WorkspaceSettings>('/workspace/settings', {
         method: 'PATCH',
-        body: JSON.stringify(branding),
+        body: JSON.stringify({
+          appName: branding.appName,
+          tagline: branding.tagline,
+          primaryColor: branding.primaryColor,
+          logoUrl: branding.logoUrl,
+        }),
       });
-      setBranding(response.data);
+      setBranding({
+        ...response.data,
+        customEmojis: Array.isArray(response.data.customEmojis)
+          ? response.data.customEmojis
+          : branding.customEmojis ?? [],
+      });
       document.documentElement.style.setProperty('--brand', response.data.primaryColor);
+      await workspace.refresh();
       setBrandingSaved('Workspace branding saved');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not save branding');
+    }
+  }
+
+  async function saveCustomEmojis(
+    next: WorkspaceSettings['customEmojis'],
+  ): Promise<boolean> {
+    if (!branding) {
+      return false;
+    }
+    setCustomEmojiBusy(true);
+    setCustomEmojiSaved('');
+    setError('');
+    try {
+      const response = await api<WorkspaceSettings>('/workspace/settings', {
+        method: 'PATCH',
+        body: JSON.stringify({ customEmojis: next }),
+      });
+      setBranding({
+        ...response.data,
+        customEmojis: Array.isArray(response.data.customEmojis)
+          ? response.data.customEmojis
+          : next,
+      });
+      await workspace.refresh();
+      setCustomEmojiSaved('Custom emoji updated');
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save custom emoji');
+      return false;
+    } finally {
+      setCustomEmojiBusy(false);
+    }
+  }
+
+  async function addCustomEmoji(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!branding) {
+      return;
+    }
+    const shortcode = customEmojiDraft.shortcode
+      .trim()
+      .toLowerCase()
+      .replace(/^:+|:+$/g, '');
+    const emoji = customEmojiDraft.emoji.trim();
+    if (!shortcode) {
+      setError('Shortcode is required');
+      return;
+    }
+    if ((branding.customEmojis ?? []).some((row) => row.shortcode === shortcode)) {
+      setError(`:${shortcode}: already exists`);
+      return;
+    }
+    setCustomEmojiBusy(true);
+    setError('');
+    try {
+      let imageUrl: string | null = null;
+      if (customEmojiDraft.imageFile) {
+        const form = new FormData();
+        form.append('file', customEmojiDraft.imageFile);
+        const uploaded = await api<{ url: string }>('/workspace/emojis/upload', {
+          method: 'POST',
+          body: form,
+        });
+        imageUrl = uploaded.data.url;
+      }
+      if (!emoji && !imageUrl) {
+        setError('Provide a Unicode emoji or upload an image');
+        return;
+      }
+      const ok = await saveCustomEmojis([
+        ...(branding.customEmojis ?? []),
+        {
+          shortcode,
+          ...(emoji ? { emoji } : {}),
+          ...(imageUrl ? { imageUrl } : {}),
+        },
+      ]);
+      if (ok) {
+        setCustomEmojiDraft({ shortcode: '', emoji: '', imageFile: null });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not add custom emoji');
+    } finally {
+      setCustomEmojiBusy(false);
+    }
+  }
+
+  async function loadSlashCommands() {
+    try {
+      const response = await api<SlashCommand[]>('/chat/slash-commands');
+      setSlashCommands(response.data);
+    } catch {
+      setSlashCommands([]);
+    }
+  }
+
+  async function createSlashCommand(event: FormEvent) {
+    event.preventDefault();
+    const name = slashDraft.name.trim().replace(/^\//, '');
+    const description = slashDraft.description.trim();
+    const responseTemplate = slashDraft.responseTemplate.trim();
+    if (!name || !description || !responseTemplate) {
+      return;
+    }
+    setSlashBusy(true);
+    setError('');
+    setSlashSaved('');
+    try {
+      await api<SlashCommand>('/chat/slash-commands', {
+        method: 'POST',
+        body: JSON.stringify({ name, description, responseTemplate }),
+      });
+      setSlashDraft({ name: '', description: '', responseTemplate: '' });
+      setSlashSaved(`/${name} created — try it in any channel`);
+      await loadSlashCommands();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Could not create slash command',
+      );
+    } finally {
+      setSlashBusy(false);
+    }
+  }
+
+  async function revokeSlashCommand(command: SlashCommand) {
+    if (command.builtin) return;
+    const ok = await confirmDialog({
+      title: 'Revoke slash command?',
+      message: `/${command.name} will stop working for everyone.`,
+      confirmLabel: 'Revoke',
+      danger: true,
+    });
+    if (!ok) return;
+    setError('');
+    try {
+      await api(`/chat/slash-commands/${command.id}`, { method: 'DELETE' });
+      await loadSlashCommands();
+      setSlashSaved(`/${command.name} revoked`);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Could not revoke slash command',
+      );
     }
   }
 
@@ -272,7 +537,10 @@ export function ProfilePage() {
     }
   }
 
-  async function changeMemberRole(userId: string, role: 'admin' | 'member') {
+  async function changeMemberRole(
+    userId: string,
+    role: 'admin' | 'member' | 'guest',
+  ) {
     if (!activeOrg?.id) {
       return;
     }
@@ -667,13 +935,14 @@ export function ProfilePage() {
         <header className="profile-sheet-head">
           <h2>Notifications</h2>
           <p className="muted">
-            Alerts for new messages when Relay is in the background. Muted chats stay quiet.
+            Control desktop alerts and offline push. Muted chats stay quiet unless you are
+            @mentioned.
           </p>
         </header>
         <div className="profile-notify">
           <div className="profile-notify-row">
             <p className="profile-notify-status">
-              Status{' '}
+              Browser{' '}
               <span className={`notify-pill notify-pill-${notifyStatus}`}>{notifyLabel}</span>
             </p>
             {notifyStatus === 'default' ? (
@@ -685,7 +954,7 @@ export function ProfilePage() {
           {notifyHint ? <p className="muted">{notifyHint}</p> : null}
           {notifyStatus === 'granted' ? (
             <p className="muted">
-              To turn them off, use your browser site settings for this page.
+              To fully disable the browser permission, use site settings for this page.
             </p>
           ) : null}
           {notifyStatus === 'denied' ? (
@@ -694,6 +963,126 @@ export function ProfilePage() {
               site settings, then refresh.
             </p>
           ) : null}
+
+          <div className="profile-fields" style={{ marginTop: '1rem' }}>
+            <label>
+              Message alerts
+              <select
+                value={notifyPrefs.mode}
+                onChange={(event) =>
+                  setNotifyPrefs((current) => ({
+                    ...current,
+                    mode: event.target.value as NotificationPrefs['mode'],
+                  }))
+                }
+              >
+                <option value="all">All messages</option>
+                <option value="mentions">Mentions only</option>
+                <option value="none">Nothing</option>
+              </select>
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={notifyPrefs.quietHoursEnabled}
+                onChange={(event) =>
+                  setNotifyPrefs((current) => ({
+                    ...current,
+                    quietHoursEnabled: event.target.checked,
+                  }))
+                }
+              />{' '}
+              Quiet hours
+            </label>
+            {notifyPrefs.quietHoursEnabled ? (
+              <div className="profile-notify-row" style={{ gap: '0.75rem' }}>
+                <label>
+                  From
+                  <input
+                    type="time"
+                    value={notifyPrefs.quietStart}
+                    onChange={(event) =>
+                      setNotifyPrefs((current) => ({
+                        ...current,
+                        quietStart: event.target.value || '22:00',
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  Until
+                  <input
+                    type="time"
+                    value={notifyPrefs.quietEnd}
+                    onChange={(event) =>
+                      setNotifyPrefs((current) => ({
+                        ...current,
+                        quietEnd: event.target.value || '08:00',
+                      }))
+                    }
+                  />
+                </label>
+              </div>
+            ) : null}
+            <label>
+              Timezone
+              <input
+                value={notifyPrefs.timezone}
+                onChange={(event) =>
+                  setNotifyPrefs((current) => ({
+                    ...current,
+                    timezone: event.target.value,
+                  }))
+                }
+                placeholder="Asia/Karachi"
+              />
+            </label>
+            <label>
+              <input
+                type="checkbox"
+                checked={notifyPrefs.respectStatus}
+                onChange={(event) =>
+                  setNotifyPrefs((current) => ({
+                    ...current,
+                    respectStatus: event.target.checked,
+                  }))
+                }
+              />{' '}
+              Silence alerts when Away / Busy / Do not disturb
+            </label>
+            <p className="muted">
+              Mentions still break through quiet hours and Away. Do not disturb blocks calls too.
+            </p>
+            <button
+              className="btn"
+              type="button"
+              disabled={notifyPrefsBusy}
+              onClick={() => {
+                setNotifyPrefsBusy(true);
+                void saveNotificationPrefs({
+                  ...notifyPrefs,
+                  timezone:
+                    notifyPrefs.timezone.trim() ||
+                    Intl.DateTimeFormat().resolvedOptions().timeZone ||
+                    'UTC',
+                })
+                  .then((savedPrefs) => {
+                    setNotifyPrefs(savedPrefs);
+                    setSaved('Notification preferences saved');
+                  })
+                  .catch((err: unknown) =>
+                    setError(
+                      err instanceof Error
+                        ? err.message
+                        : 'Could not save notification preferences',
+                    ),
+                  )
+                  .finally(() => setNotifyPrefsBusy(false));
+              }}
+            >
+              {notifyPrefsBusy ? 'Saving…' : 'Save notification preferences'}
+            </button>
+          </div>
         </div>
       </section>
 
@@ -843,6 +1232,204 @@ export function ProfilePage() {
         </form>
       ) : null}
 
+      {canManageWorkspace && branding ? (
+        <section className="profile-sheet">
+          <header className="profile-sheet-head">
+            <p className="eyebrow">Workspace</p>
+            <h2>Custom emoji</h2>
+            <p className="muted">
+              Add workspace shortcodes (like <code>:shipit:</code>) that appear in
+              the reaction picker.
+            </p>
+          </header>
+          <form className="profile-fields profile-fields-grid" onSubmit={(event) => void addCustomEmoji(event)}>
+            <label className="profile-plain-field">
+              Shortcode
+              <input
+                value={customEmojiDraft.shortcode}
+                onChange={(event) =>
+                  setCustomEmojiDraft((draft) => ({
+                    ...draft,
+                    shortcode: event.target.value,
+                  }))
+                }
+                placeholder="shipit"
+                maxLength={32}
+              />
+            </label>
+            <label className="profile-plain-field">
+              Emoji (optional if uploading image)
+              <input
+                value={customEmojiDraft.emoji}
+                onChange={(event) =>
+                  setCustomEmojiDraft((draft) => ({
+                    ...draft,
+                    emoji: event.target.value,
+                  }))
+                }
+                placeholder="🚀"
+                maxLength={16}
+              />
+            </label>
+            <label className="profile-plain-field">
+              Or upload image
+              <input
+                type="file"
+                accept="image/png,image/gif,image/webp,image/jpeg"
+                onChange={(event) =>
+                  setCustomEmojiDraft((draft) => ({
+                    ...draft,
+                    imageFile: event.target.files?.[0] ?? null,
+                  }))
+                }
+              />
+            </label>
+            <div className="profile-sheet-actions">
+              <button className="btn" type="submit" disabled={customEmojiBusy}>
+                {customEmojiBusy ? 'Saving…' : 'Add emoji'}
+              </button>
+            </div>
+          </form>
+          {(branding.customEmojis ?? []).length === 0 ? (
+            <p className="muted">No custom emoji yet.</p>
+          ) : (
+            <ul className="member-list">
+              {(branding.customEmojis ?? []).map((row) => (
+                <li key={row.shortcode}>
+                  <span>
+                    {row.imageUrl ? (
+                      <img
+                        src={row.imageUrl}
+                        alt={`:${row.shortcode}:`}
+                        width={24}
+                        height={24}
+                        style={{ verticalAlign: 'middle' }}
+                      />
+                    ) : (
+                      <strong style={{ fontSize: '1.25rem' }}>{row.emoji}</strong>
+                    )}{' '}
+                    <code>:{row.shortcode}:</code>
+                  </span>
+                  <button
+                    className="ghost"
+                    type="button"
+                    disabled={customEmojiBusy}
+                    onClick={() =>
+                      void saveCustomEmojis(
+                        (branding.customEmojis ?? []).filter(
+                          (item) => item.shortcode !== row.shortcode,
+                        ),
+                      )
+                    }
+                  >
+                    Remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {customEmojiSaved ? (
+            <p className="ok profile-inline-ok">{customEmojiSaved}</p>
+          ) : null}
+        </section>
+      ) : null}
+
+      {canManageWorkspace ? (
+        <section className="profile-sheet">
+          <header className="profile-sheet-head">
+            <p className="eyebrow">Workspace</p>
+            <h2>Slash commands</h2>
+            <p className="muted">
+              Built-ins: <code>/shrug</code>, <code>/me</code>,{' '}
+              <code>/status</code>, <code>/help</code>. Add custom commands with
+              a template — use <code>{'{text}'}</code> for the rest of the line.
+            </p>
+          </header>
+          <form
+            className="profile-fields profile-fields-grid"
+            onSubmit={(event) => void createSlashCommand(event)}
+          >
+            <label className="profile-plain-field">
+              Command
+              <input
+                value={slashDraft.name}
+                onChange={(event) =>
+                  setSlashDraft((draft) => ({
+                    ...draft,
+                    name: event.target.value,
+                  }))
+                }
+                placeholder="deploy"
+                maxLength={32}
+                required
+              />
+            </label>
+            <label className="profile-plain-field">
+              Description
+              <input
+                value={slashDraft.description}
+                onChange={(event) =>
+                  setSlashDraft((draft) => ({
+                    ...draft,
+                    description: event.target.value,
+                  }))
+                }
+                placeholder="Announce a deploy"
+                maxLength={160}
+                required
+              />
+            </label>
+            <label className="profile-plain-field" style={{ gridColumn: '1 / -1' }}>
+              Response template
+              <input
+                value={slashDraft.responseTemplate}
+                onChange={(event) =>
+                  setSlashDraft((draft) => ({
+                    ...draft,
+                    responseTemplate: event.target.value,
+                  }))
+                }
+                placeholder="Shipping: {text}"
+                maxLength={2000}
+                required
+              />
+            </label>
+            <div className="profile-sheet-actions" style={{ gridColumn: '1 / -1' }}>
+              <button className="btn" type="submit" disabled={slashBusy}>
+                {slashBusy ? 'Creating…' : 'Add command'}
+              </button>
+            </div>
+          </form>
+          <ul className="member-list" style={{ marginTop: 12 }}>
+            {slashCommands.map((command) => (
+              <li key={command.id}>
+                <div className="member-identity">
+                  <span>
+                    /{command.name}
+                    {command.builtin ? ' · built-in' : ''}
+                  </span>
+                  <small>{command.description}</small>
+                </div>
+                <div className="member-actions">
+                  {!command.builtin ? (
+                    <button
+                      type="button"
+                      className="ghost danger-text"
+                      onClick={() => void revokeSlashCommand(command)}
+                    >
+                      Revoke
+                    </button>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ul>
+          {slashSaved ? (
+            <p className="ok profile-inline-ok">{slashSaved}</p>
+          ) : null}
+        </section>
+      ) : null}
+
       {canManageWorkspace ? (
         <section className="profile-sheet">
           <header className="profile-sheet-head">
@@ -894,16 +1481,37 @@ export function ProfilePage() {
                         >
                           Demote
                         </button>
-                      ) : (
+                      ) : member.role === 'guest' ? (
                         <button
                           type="button"
                           className="ghost"
                           onClick={() =>
-                            void changeMemberRole(member.userId, 'admin')
+                            void changeMemberRole(member.userId, 'member')
                           }
                         >
-                          Make admin
+                          Make member
                         </button>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() =>
+                              void changeMemberRole(member.userId, 'admin')
+                            }
+                          >
+                            Make admin
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() =>
+                              void changeMemberRole(member.userId, 'guest')
+                            }
+                          >
+                            Make guest
+                          </button>
+                        </>
                       )
                     ) : null}
                     {!isOwnerRow && !isSelf && canManageWorkspace ? (
@@ -929,9 +1537,8 @@ export function ProfilePage() {
             <p className="eyebrow">Workspace</p>
             <h2>Invite people to {activeOrg?.name ?? 'this workspace'}</h2>
             <p className="muted">
-              Enter a teammate’s email to create an invite for this workspace and{' '}
-              <strong>#general</strong>. When SMTP is configured the link is
-              emailed; otherwise copy the link (works with YOPmail too).
+              Full members join <strong>#general</strong>. Guests only see
+              channels they are invited to and do not use billed seats.
             </p>
           </header>
           <form className="invite-form" onSubmit={(event) => void createInvite(event)}>
@@ -950,6 +1557,18 @@ export function ProfilePage() {
               {inviteEmailInvalid ? (
                 <small className="field-error">Enter a valid email address</small>
               ) : null}
+            </label>
+            <label>
+              Role
+              <select
+                value={inviteRole}
+                onChange={(event) =>
+                  setInviteRole(event.target.value as 'member' | 'guest')
+                }
+              >
+                <option value="member">Member</option>
+                <option value="guest">Guest</option>
+              </select>
             </label>
             <label>
               Expires in days
@@ -1172,6 +1791,500 @@ export function ProfilePage() {
           </button>
         </header>
       </section>
+
+      <section className="profile-sheet">
+        <header className="profile-sheet-head">
+          <h2>Status</h2>
+          <p className="muted">
+            Away, Busy, or Do not disturb — shown to teammates while you are connected.
+          </p>
+        </header>
+        <div className="profile-fields">
+          <label>
+            Availability
+            <select
+              value={presenceDraft}
+              onChange={(event) =>
+                setPresenceDraft(
+                  event.target.value as 'online' | 'away' | 'busy' | 'dnd',
+                )
+              }
+            >
+              <option value="online">Online (auto)</option>
+              <option value="away">Away</option>
+              <option value="busy">Busy</option>
+              <option value="dnd">Do not disturb</option>
+            </select>
+          </label>
+          <label>
+            Custom status
+            <input
+              value={customStatusDraft}
+              maxLength={120}
+              placeholder="In a meeting…"
+              onChange={(event) => setCustomStatusDraft(event.target.value)}
+            />
+          </label>
+          <button
+            className="btn"
+            type="button"
+            disabled={presenceBusy}
+            onClick={() => {
+              setPresenceBusy(true);
+              void api('/chat/presence', {
+                method: 'PATCH',
+                body: JSON.stringify({
+                  status: presenceDraft,
+                  customStatus: customStatusDraft,
+                }),
+              })
+                .then(() => setSaved('Status updated'))
+                .catch((err: unknown) =>
+                  setError(
+                    err instanceof Error ? err.message : 'Could not update status',
+                  ),
+                )
+                .finally(() => setPresenceBusy(false));
+            }}
+          >
+            {presenceBusy ? 'Saving…' : 'Save status'}
+          </button>
+        </div>
+      </section>
+
+      <section className="profile-sheet">
+        <header className="profile-sheet-head">
+          <h2>Two-factor & sessions</h2>
+          <p className="muted">
+            Authenticator app login and active device sessions.
+          </p>
+        </header>
+        <div className="profile-fields">
+          <p>
+            Status:{' '}
+            <strong>{totpEnabled ? '2FA enabled' : '2FA off'}</strong>
+          </p>
+          {!totpEnabled ? (
+            <>
+              <button
+                className="btn"
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  void api<{ secret: string; otpauthUrl: string }>(
+                    '/auth/2fa/setup',
+                    { method: 'POST', body: '{}' },
+                  )
+                    .then((response) => setTotpSetup(response.data))
+                    .catch((err: unknown) =>
+                      setError(
+                        err instanceof Error ? err.message : 'Could not start 2FA',
+                      ),
+                    );
+                }}
+              >
+                Set up authenticator
+              </button>
+              {totpSetup ? (
+                <div>
+                  <p className="muted">
+                    Add this secret in your authenticator app, then confirm:
+                  </p>
+                  <code>{totpSetup.secret}</code>
+                  {totpSetup.otpauthUrl ? (
+                    <p className="muted" style={{ wordBreak: 'break-all' }}>
+                      {totpSetup.otpauthUrl}
+                    </p>
+                  ) : null}
+                  <label>
+                    Code
+                    <input
+                      value={totpCode}
+                      onChange={(event) => setTotpCode(event.target.value)}
+                      maxLength={6}
+                      inputMode="numeric"
+                    />
+                  </label>
+                  <button
+                    className="btn"
+                    type="button"
+                    onClick={() => {
+                      void api('/auth/2fa/confirm', {
+                        method: 'POST',
+                        body: JSON.stringify({ code: totpCode }),
+                      })
+                        .then(() => {
+                          setTotpEnabled(true);
+                          setTotpSetup(null);
+                          setTotpCode('');
+                          setSaved('Two-factor authentication enabled');
+                        })
+                        .catch((err: unknown) =>
+                          setError(
+                            err instanceof Error
+                              ? err.message
+                              : 'Invalid code',
+                          ),
+                        );
+                    }}
+                  >
+                    Confirm 2FA
+                  </button>
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <button
+              className="ghost"
+              type="button"
+              onClick={() => {
+                void (async () => {
+                  const password = await promptDialog({
+                    title: 'Disable two-factor authentication',
+                    message: 'Enter your password to disable 2FA',
+                    inputType: 'password',
+                    confirmLabel: 'Disable',
+                    placeholder: 'Password',
+                  });
+                  if (!password) return;
+                  try {
+                    await api('/auth/2fa/disable', {
+                      method: 'POST',
+                      body: JSON.stringify({ password }),
+                    });
+                    setTotpEnabled(false);
+                    setSaved('Two-factor authentication disabled');
+                  } catch (err: unknown) {
+                    setError(
+                      err instanceof Error
+                        ? err.message
+                        : 'Could not disable 2FA',
+                    );
+                  }
+                })();
+              }}
+            >
+              Disable 2FA
+            </button>
+          )}
+          <ul className="member-list">
+            {sessions.map((item) => (
+              <li key={item.id}>
+                <span>
+                  {item.current ? 'This device · ' : ''}
+                  {item.userAgent?.slice(0, 64) || 'Unknown device'}
+                  {item.ip ? ` · ${item.ip}` : ''}
+                </span>
+                {!item.current ? (
+                  <button
+                    className="ghost"
+                    type="button"
+                    onClick={() => {
+                      void api(`/auth/sessions/${item.id}`, {
+                        method: 'DELETE',
+                      }).then(() =>
+                        setSessions((current) =>
+                          current.filter((row) => row.id !== item.id),
+                        ),
+                      );
+                    }}
+                  >
+                    Revoke
+                  </button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          <button
+            className="ghost"
+            type="button"
+            onClick={() => {
+              const refreshToken = getSession()?.refreshToken;
+              void api('/auth/sessions/revoke-others', {
+                method: 'POST',
+                body: JSON.stringify({ refreshToken }),
+              }).then(() =>
+                setSessions((current) => current.filter((row) => row.current)),
+              );
+            }}
+          >
+            Sign out other sessions
+          </button>
+        </div>
+      </section>
+
+      {isWorkspaceOwner && activeOrganizationId ? (
+        <section className="profile-sheet">
+          <header className="profile-sheet-head">
+            <h2>Plan & SSO</h2>
+            <p className="muted">
+              Seat limits and OIDC single sign-on (requires Pro or Enterprise;
+              SAML is not available yet).
+            </p>
+          </header>
+          <div className="profile-fields">
+            <p>
+              Plan: <strong>{activeOrg?.plan ?? planDraft}</strong>
+            </p>
+            <p>
+              Seats: {activeOrg?.seatCount ?? '—'} / {activeOrg?.maxSeats ?? '—'}
+            </p>
+            <label>
+              Plan
+              <select
+                value={planDraft}
+                onChange={(event) =>
+                  setPlanDraft(
+                    event.target.value as 'free' | 'pro' | 'enterprise',
+                  )
+                }
+              >
+                <option value="free">Free</option>
+                <option value="pro">Pro</option>
+                <option value="enterprise">Enterprise</option>
+              </select>
+            </label>
+            <button
+              className="btn"
+              type="button"
+              onClick={() => {
+                void api(`/organizations/${activeOrganizationId}/billing`, {
+                  method: 'PATCH',
+                  body: JSON.stringify({ plan: planDraft }),
+                })
+                  .then(() => {
+                    setSaved('Billing plan updated');
+                    void refreshOrganizations();
+                  })
+                  .catch((err: unknown) =>
+                    setError(
+                      err instanceof Error
+                        ? err.message
+                        : 'Could not update plan',
+                    ),
+                  );
+              }}
+            >
+              Save plan
+            </button>
+            <div className="profile-fields" style={{ marginTop: '0.75rem' }}>
+              <p className="muted">
+                Upgrade with Stripe Checkout, then manage payment method,
+                invoices, and cancellation in the Customer Portal.
+              </p>
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={() => {
+                    void api<{ url: string }>(
+                      `/organizations/${activeOrganizationId}/billing/checkout`,
+                      {
+                        method: 'POST',
+                        body: JSON.stringify({ plan: 'pro' }),
+                      },
+                    )
+                      .then((res) => {
+                        if (res.data?.url) {
+                          window.location.href = res.data.url;
+                          return;
+                        }
+                        setError('Checkout did not return a URL');
+                      })
+                      .catch((err: unknown) =>
+                        setError(
+                          err instanceof Error
+                            ? err.message
+                            : 'Stripe checkout unavailable',
+                        ),
+                      );
+                  }}
+                >
+                  Upgrade with Stripe — Pro
+                </button>
+                <button
+                  className="btn"
+                  type="button"
+                  onClick={() => {
+                    void api<{ url: string }>(
+                      `/organizations/${activeOrganizationId}/billing/checkout`,
+                      {
+                        method: 'POST',
+                        body: JSON.stringify({ plan: 'enterprise' }),
+                      },
+                    )
+                      .then((res) => {
+                        if (res.data?.url) {
+                          window.location.href = res.data.url;
+                          return;
+                        }
+                        setError('Checkout did not return a URL');
+                      })
+                      .catch((err: unknown) =>
+                        setError(
+                          err instanceof Error
+                            ? err.message
+                            : 'Stripe checkout unavailable',
+                        ),
+                      );
+                  }}
+                >
+                  Upgrade with Stripe — Enterprise
+                </button>
+                <button
+                  className="btn ghost"
+                  type="button"
+                  onClick={() => {
+                    void api<{ url: string }>(
+                      `/organizations/${activeOrganizationId}/billing/portal`,
+                      { method: 'POST', body: JSON.stringify({}) },
+                    )
+                      .then((res) => {
+                        if (res.data?.url) {
+                          window.location.href = res.data.url;
+                          return;
+                        }
+                        setError('Billing portal did not return a URL');
+                      })
+                      .catch((err: unknown) =>
+                        setError(
+                          err instanceof Error
+                            ? err.message
+                            : 'Billing portal unavailable',
+                        ),
+                      );
+                  }}
+                >
+                  Manage billing in Stripe
+                </button>
+              </div>
+            </div>
+            <label>
+              <input
+                type="checkbox"
+                checked={ssoDraft.ssoEnabled}
+                disabled={
+                  (activeOrg?.plan ?? planDraft) === 'free' &&
+                  !ssoDraft.ssoEnabled
+                }
+                onChange={(event) =>
+                  setSsoDraft((current) => ({
+                    ...current,
+                    ssoEnabled: event.target.checked,
+                  }))
+                }
+              />{' '}
+              Enable SSO
+            </label>
+            {(activeOrg?.plan ?? planDraft) === 'free' ? (
+              <p className="muted">
+                Upgrade to Pro or Enterprise to enable workspace SSO.
+              </p>
+            ) : null}
+            <label>
+              Provider
+              <select
+                value={ssoDraft.ssoProvider}
+                onChange={(event) =>
+                  setSsoDraft((current) => ({
+                    ...current,
+                    ssoProvider: event.target.value as 'oidc' | 'saml',
+                  }))
+                }
+              >
+                <option value="oidc">OIDC</option>
+                <option value="saml">SAML</option>
+              </select>
+            </label>
+            <label>
+              Issuer URL
+              <input
+                value={ssoDraft.ssoIssuerUrl}
+                onChange={(event) =>
+                  setSsoDraft((current) => ({
+                    ...current,
+                    ssoIssuerUrl: event.target.value,
+                  }))
+                }
+              />
+            </label>
+            <label>
+              Client ID
+              <input
+                value={ssoDraft.ssoClientId}
+                onChange={(event) =>
+                  setSsoDraft((current) => ({
+                    ...current,
+                    ssoClientId: event.target.value,
+                  }))
+                }
+              />
+            </label>
+            <label>
+              Client secret
+              <input
+                type="password"
+                value={ssoDraft.ssoClientSecret}
+                placeholder="Leave blank to keep existing"
+                onChange={(event) =>
+                  setSsoDraft((current) => ({
+                    ...current,
+                    ssoClientSecret: event.target.value,
+                  }))
+                }
+              />
+            </label>
+            <button
+              className="btn"
+              type="button"
+              onClick={() => {
+                const payload: Record<string, unknown> = {
+                  ssoEnabled: ssoDraft.ssoEnabled,
+                  ssoProvider: ssoDraft.ssoProvider,
+                  ssoIssuerUrl: ssoDraft.ssoIssuerUrl,
+                  ssoClientId: ssoDraft.ssoClientId,
+                };
+                if (ssoDraft.ssoClientSecret.trim()) {
+                  payload.ssoClientSecret = ssoDraft.ssoClientSecret.trim();
+                }
+                void api(`/organizations/${activeOrganizationId}/sso`, {
+                  method: 'PATCH',
+                  body: JSON.stringify(payload),
+                })
+                  .then(() => {
+                    setSsoDraft((current) => ({
+                      ...current,
+                      ssoClientSecret: '',
+                    }));
+                    setSaved('SSO settings saved');
+                  })
+                  .catch((err: unknown) =>
+                    setError(
+                      err instanceof Error
+                        ? err.message
+                        : 'Could not save SSO',
+                    ),
+                  );
+              }}
+            >
+              Save SSO
+            </button>
+            <p className="muted">
+              Redirect URI for your IdP: <code>/api/auth/sso/callback</code>{' '}
+              (prepend your public API base URL). Client secret is write-only.
+            </p>
+            <button
+              className="ghost"
+              type="button"
+              onClick={() => {
+                window.location.href = `/api/auth/sso/${activeOrganizationId}/start`;
+              }}
+            >
+              Test SSO login
+            </button>
+          </div>
+        </section>
+      ) : null}
 
       <form className="profile-sheet" onSubmit={(event) => void changePassword(event)}>
         <header className="profile-sheet-head">

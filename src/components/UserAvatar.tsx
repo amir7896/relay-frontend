@@ -5,6 +5,8 @@ import type { UserProfile } from '../api/types';
 type UserAvatarProps = {
   profile?: UserProfile | null;
   name?: string;
+  /** Direct image URL (e.g. incoming webhook bot icon). */
+  imageUrl?: string | null;
   size?: 'sm' | 'md' | 'lg' | 'xl';
   className?: string;
 };
@@ -12,6 +14,7 @@ type UserAvatarProps = {
 export function UserAvatar({
   profile,
   name,
+  imageUrl,
   size = 'sm',
   className = '',
 }: UserAvatarProps) {
@@ -20,9 +23,11 @@ export function UserAvatar({
     [profile?.firstName, profile?.lastName].filter(Boolean).join(' ').trim() ||
     profile?.email ||
     '?';
-  const src = profile?.avatar?.trim()
-    ? resolveMediaUrl(profile.avatar.trim())
-    : '';
+  const src = imageUrl?.trim()
+    ? resolveMediaUrl(imageUrl.trim())
+    : profile?.avatar?.trim()
+      ? resolveMediaUrl(profile.avatar.trim())
+      : '';
 
   if (src) {
     return (

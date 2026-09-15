@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from 'react';
 import { api, refreshSession } from '../api/client';
-import type { AuthResult } from '../api/types';
+import type { AuthRequires2fa, AuthResult } from '../api/types';
 import { clearSession, getSession, setSession, type Session } from './session';
 
 type RegisterInput = {
@@ -21,7 +21,11 @@ type RegisterInput = {
 
 type AuthContextValue = {
   session: Session | null;
-  login: (email: string, password: string) => Promise<void>;
+  login: (
+    email: string,
+    password: string,
+  ) => Promise<{ requires2fa: true; tempToken: string; email: string } | void>;
+  verify2faLogin: (tempToken: string, code: string) => Promise<void>;
   register: (input: RegisterInput) => Promise<void>;
   logout: () => Promise<void>;
   /** Persist session to localStorage and React state together. */
@@ -39,6 +43,7 @@ function toSession(result: AuthResult): Session {
       email: result.user.email,
       role: result.user.role,
       isEmailVerified: result.user.isEmailVerified,
+      totpEnabled: Boolean(result.user.totpEnabled),
     },
     organizations: result.organizations ?? [],
     activeOrganizationId: result.activeOrganizationId ?? null,
@@ -71,9 +76,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const login = useCallback(
     async (email: string, password: string) => {
-      const response = await api<AuthResult>('/auth/login', {
+      const response = await api<AuthResult | AuthRequires2fa>('/auth/login', {
         method: 'POST',
         body: JSON.stringify({ email, password }),
+      });
+      if ('requires2fa' in response.data && response.data.requires2fa) {
+        return {
+          requires2fa: true as const,
+          tempToken: response.data.tempToken,
+          email: response.data.email,
+        };
+      }
+      apply(response.data as AuthResult);
+    },
+    [apply],
+  );
+
+  const verify2faLogin = useCallback(
+    async (tempToken: string, code: string) => {
+      const response = await api<AuthResult>('/auth/login/2fa', {
+        method: 'POST',
+        body: JSON.stringify({ tempToken, code }),
       });
       apply(response.data);
     },
@@ -118,8 +141,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo(
-    () => ({ session, login, register, logout, replaceSession }),
-    [session, login, register, logout, replaceSession],
+    () => ({ session, login, verify2faLogin, register, logout, replaceSession }),
+    [session, login, verify2faLogin, register, logout, replaceSession],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

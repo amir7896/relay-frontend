@@ -14,6 +14,7 @@ export type AuthUser = {
   role: string;
   isActive: boolean;
   isEmailVerified: boolean;
+  totpEnabled?: boolean;
   createdAt: string;
   updatedAt: string;
 };
@@ -25,7 +26,7 @@ export type TokenPair = {
   expiresIn: string;
 };
 
-export type OrgMemberRole = 'owner' | 'admin' | 'member';
+export type OrgMemberRole = 'owner' | 'admin' | 'member' | 'guest';
 
 export type OrganizationView = {
   id: string;
@@ -34,6 +35,70 @@ export type OrganizationView = {
   status: 'active' | 'suspended';
   isDefault: boolean;
   role?: OrgMemberRole;
+  plan?: 'free' | 'pro' | 'enterprise';
+  maxSeats?: number;
+  seatCount?: number;
+  ssoEnabled?: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type OrgSsoView = {
+  organizationId: string;
+  ssoEnabled: boolean;
+  ssoProvider: 'oidc' | 'saml' | null;
+  ssoIssuerUrl: string | null;
+  ssoClientId: string | null;
+  hasClientSecret: boolean;
+  plan: 'free' | 'pro' | 'enterprise';
+  configured: boolean;
+};
+
+export type ChannelInvite = {
+  id: string;
+  conversationId: string;
+  token: string | null;
+  inviteUrl: string | null;
+  expiresAt: string | null;
+  maxUses: number | null;
+  useCount: number;
+  revokedAt: string | null;
+  createdBy: string;
+  createdAt: string;
+};
+
+export type IncomingWebhook = {
+  id: string;
+  conversationId: string;
+  name: string;
+  defaultUsername: string;
+  defaultIconUrl: string | null;
+  token?: string | null;
+  webhookUrl?: string | null;
+  createdBy: string;
+  revokedAt: string | null;
+  lastUsedAt: string | null;
+  createdAt: string;
+};
+
+export type SlashCommand = {
+  id: string;
+  name: string;
+  description: string;
+  responseTemplate: string;
+  builtin: boolean;
+  createdBy: string | null;
+  revokedAt: string | null;
+  createdAt: string | null;
+};
+
+export type UserGroup = {
+  id: string;
+  name: string;
+  displayName: string;
+  description: string | null;
+  memberIds: string[];
+  createdBy: string;
   createdAt: string;
   updatedAt: string;
 };
@@ -43,6 +108,22 @@ export type AuthResult = {
   tokens: TokenPair;
   organizations: OrganizationView[];
   activeOrganizationId: string | null;
+};
+
+export type AuthRequires2fa = {
+  requires2fa: true;
+  tempToken: string;
+  userId: string;
+  email: string;
+};
+
+export type SessionView = {
+  id: string;
+  userAgent: string | null;
+  ip: string | null;
+  createdAt: string;
+  expiresAt: string;
+  current: boolean;
 };
 
 export type UserProfile = {
@@ -61,14 +142,17 @@ export type UserProfile = {
   updatedAt: string;
 };
 
+export type PresenceStatus = 'online' | 'away' | 'busy' | 'dnd' | 'offline';
+
 export type ConversationMember = {
   userId: string;
   role: string;
   joinedAt: string;
   lastReadAt: string | null;
   muted?: boolean;
-  status: 'online' | 'offline';
+  status: PresenceStatus;
   lastSeenAt: string | null;
+  customStatus?: string | null;
 };
 
 export type MessageReply = {
@@ -124,6 +208,19 @@ export type MessageBookmark = {
   conversationType: 'private' | 'group';
 };
 
+export type ThreadSummary = {
+  conversationId: string;
+  conversationName: string | null;
+  conversationType: 'private' | 'group';
+  root: ChatMessage;
+  latestReply: ChatMessage | null;
+  replyCount: number;
+  lastReplyAt: string;
+  followed?: boolean;
+  unreadCount?: number;
+  hasUnread?: boolean;
+};
+
 export type ChatMessage = {
   id: string;
   conversationId: string;
@@ -131,6 +228,8 @@ export type ChatMessage = {
   body: string;
   type: string;
   replyTo: MessageReply | null;
+  threadRootId?: string | null;
+  replyCount?: number;
   attachment: MessageAttachment | null;
   mentions: string[];
   linkPreview: LinkPreview | null;
@@ -145,11 +244,41 @@ export type ChatMessage = {
   seenBy: string[];
   undelivered?: boolean;
   expiresAt?: string | null;
+  botUsername?: string | null;
+  botIconUrl?: string | null;
   createdAt: string;
   /** Client-only: optimistic send state for attachments */
   sendStatus?: 'uploading' | 'sending' | 'failed';
   /** Client-only: 0–100 while uploading */
   uploadProgress?: number;
+  /** Client-only: translation overlay */
+  translatedText?: string | null;
+  /** Client-only: show original instead of translation */
+  showOriginal?: boolean;
+};
+
+export type MessageEditVersion = {
+  id: string;
+  body: string;
+  editorId: string;
+  createdAt: string;
+};
+
+export type MessageEditHistory = {
+  messageId: string;
+  currentBody: string;
+  currentEditedAt: string | null;
+  versions: MessageEditVersion[];
+};
+
+export type SidebarSection = {
+  id: string;
+  name: string;
+  sortOrder: number;
+  collapsed: boolean;
+  conversationIds: string[];
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type GlobalSearchHit = {
@@ -179,11 +308,37 @@ export type ScheduledMessage = {
   createdAt: string;
 };
 
+export type MessageReminder = {
+  id: string;
+  conversationId: string;
+  messageId: string;
+  remindAt: string;
+  status: 'pending' | 'sent' | 'cancelled';
+  notifiedAt: string | null;
+  createdAt: string;
+  bodySnippet?: string;
+  conversationName?: string | null;
+  conversationType?: 'private' | 'group';
+};
+
+export type ChannelBookmark = {
+  id: string;
+  title: string;
+  url: string;
+  createdBy: string;
+  createdAt: string;
+};
+
 export type Conversation = {
   id: string;
   type: 'private' | 'group';
   name: string | null;
   createdBy: string;
+  visibility?: 'public' | 'private';
+  announceOnly?: boolean;
+  topic?: string | null;
+  description?: string | null;
+  bookmarks?: ChannelBookmark[];
   lastMessageAt: string | null;
   lastMessage: ChatMessage | null;
   lastReadAt: string | null;
@@ -219,8 +374,9 @@ export type Paginated<T> = {
 
 export type Presence = {
   userId: string;
-  status: 'online' | 'offline';
+  status: PresenceStatus;
   lastSeenAt: string | null;
+  customStatus?: string | null;
 };
 
 export type ChatAnalytics = {
@@ -249,11 +405,18 @@ export type AuditEvent = {
   createdAt: string;
 };
 
+export type WorkspaceCustomEmoji = {
+  shortcode: string;
+  emoji?: string;
+  imageUrl?: string | null;
+};
+
 export type WorkspaceSettings = {
   appName: string;
   tagline: string;
   primaryColor: string;
   logoUrl: string | null;
+  customEmojis: WorkspaceCustomEmoji[];
 };
 
 export type SeenResult = {

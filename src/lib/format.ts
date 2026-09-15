@@ -84,10 +84,23 @@ export function inboxTime(value: string | null | undefined): string {
 
 export function formatLastSeen(
   lastSeenAt: string | null,
-  status: 'online' | 'offline',
+  status: 'online' | 'away' | 'busy' | 'dnd' | 'offline',
+  customStatus?: string | null,
 ): string {
-  if (status === 'online') {
-    return 'Online';
+  const statusLabel =
+    status === 'online'
+      ? 'Online'
+      : status === 'away'
+        ? 'Away'
+        : status === 'busy'
+          ? 'Busy'
+          : status === 'dnd'
+            ? 'Do not disturb'
+            : null;
+  if (statusLabel) {
+    return customStatus?.trim()
+      ? `${statusLabel} · ${customStatus.trim()}`
+      : statusLabel;
   }
   if (!lastSeenAt) {
     return 'last seen recently';
@@ -146,4 +159,17 @@ export function conversationTitle(
     return 'Direct message';
   }
   return displayName(peopleById?.get(peer.userId));
+}
+
+export function formatScheduleWhen(iso: string) {
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
 }

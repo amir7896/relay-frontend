@@ -11,7 +11,7 @@ import {
 import { useAuth } from '../auth/AuthContext';
 import { api } from '../api/client';
 import { useChatSocket } from '../chat/ChatSocketContext';
-import { loadIceServers } from './iceServers';
+import { clearIceServersCache, loadIceServers } from './iceServers';
 import {
   playCallConnectedChime,
   playCallEndedChime,
@@ -173,6 +173,11 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
   const peersRef = useRef<Map<string, VoicePeer>>(new Map());
   /** Prevents duplicate RTCPeerConnections when offer + join race on mobile. */
   const peerCreateInflightRef = useRef<Map<string, Promise<VoicePeer>>>(new Map());
+  /** ICE restart attempts per remote peer (cleared on connected). */
+  const iceRestartAttemptsRef = useRef<Map<string, number>>(new Map());
+  const iceRestartTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
+    new Map(),
+  );
   const localStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const remoteAudioElements = useRef<Map<string, HTMLAudioElement>>(new Map());
@@ -442,6 +447,9 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
   const cleanupMedia = useCallback(() => {
     stopSpeakingMonitor();
     peerCreateInflightRef.current.clear();
+    iceRestartTimersRef.current.forEach((timer) => clearTimeout(timer));
+    iceRestartTimersRef.current.clear();
+    iceRestartAttemptsRef.current.clear();
     peersRef.current.forEach((peer) => peer.close({ stopLocal: false }));
     peersRef.current.clear();
     remoteAudioElements.current.forEach((audio) => {
@@ -583,6 +591,55 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
     return stream;
   }, []);
 
+  const scheduleIceRestart = useCallback(
+    (remoteUserId: string) => {
+      if (phaseRef.current !== 'active' && phaseRef.current !== 'connecting') {
+        return;
+      }
+      if (iceRestartTimersRef.current.has(remoteUserId)) {
+        return;
+      }
+      const attempts = iceRestartAttemptsRef.current.get(remoteUserId) ?? 0;
+      if (attempts >= 3) {
+        setConnectionState('failed');
+        setNetworkHint('Connection failed — try leaving and rejoining');
+        return;
+      }
+      const delayMs = 800 * (attempts + 1);
+      const timer = setTimeout(() => {
+        iceRestartTimersRef.current.delete(remoteUserId);
+        void (async () => {
+          const active = callRef.current;
+          const peer = peersRef.current.get(remoteUserId);
+          if (!active || !peer || !me) {
+            return;
+          }
+          iceRestartAttemptsRef.current.set(remoteUserId, attempts + 1);
+          try {
+            clearIceServersCache();
+            iceServersRef.current = null;
+            const offer = await peer.restartIce();
+            await emitAck('call:offer', {
+              callId: active.callId,
+              toUserId: remoteUserId,
+              sdp: offer,
+            });
+            setNetworkHint(`Reconnecting… (attempt ${attempts + 1}/3)`);
+          } catch {
+            if (attempts + 1 >= 3) {
+              setConnectionState('failed');
+              setNetworkHint('Connection failed — try leaving and rejoining');
+            } else {
+              scheduleIceRestart(remoteUserId);
+            }
+          }
+        })();
+      }, delayMs);
+      iceRestartTimersRef.current.set(remoteUserId, timer);
+    },
+    [emitAck, me],
+  );
+
   const getOrCreatePeer = useCallback(
     async (remoteUserId: string) => {
       const existing = peersRef.current.get(remoteUserId);
@@ -617,6 +674,12 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
           },
           onConnectionState: (state) => {
             if (state === 'connected') {
+              iceRestartAttemptsRef.current.delete(remoteUserId);
+              const pending = iceRestartTimersRef.current.get(remoteUserId);
+              if (pending) {
+                clearTimeout(pending);
+                iceRestartTimersRef.current.delete(remoteUserId);
+              }
               setConnectionState('connected');
               setNetworkQuality('good');
               setNetworkHint('');
@@ -631,13 +694,12 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
               setConnectionState('reconnecting');
               setNetworkQuality('poor');
               setNetworkHint('Reconnecting… Weak connection');
+              scheduleIceRestart(remoteUserId);
             } else if (state === 'failed') {
-              closePeer(remoteUserId);
-              if (peersRef.current.size === 0 && phaseRef.current === 'active') {
-                setConnectionState('failed');
-                setNetworkQuality('poor');
-                setNetworkHint('Connection failed — try leaving and rejoining');
-              }
+              setConnectionState('reconnecting');
+              setNetworkQuality('poor');
+              setNetworkHint('Connection failed — retrying…');
+              scheduleIceRestart(remoteUserId);
             }
           },
           onIceConnectionState: (state) => {
@@ -647,9 +709,11 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
               setConnectionState('reconnecting');
               setNetworkQuality('poor');
               setNetworkHint('Reconnecting…');
+              scheduleIceRestart(remoteUserId);
             } else if (state === 'failed') {
               setNetworkQuality('poor');
-              setNetworkHint('Poor network — audio may drop');
+              setNetworkHint('Poor network — retrying ICE…');
+              scheduleIceRestart(remoteUserId);
             } else if (state === 'connected' || state === 'completed') {
               setNetworkHint('');
             }
@@ -669,7 +733,7 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
         peerCreateInflightRef.current.delete(remoteUserId);
       }
     },
-    [attachRemoteAudio, cameraOn, closePeer, emitAck, ensureIceServers, ensureLocalStream],
+    [attachRemoteAudio, cameraOn, closePeer, emitAck, ensureIceServers, ensureLocalStream, scheduleIceRestart],
   );
 
   const offerToPeer = useCallback(
