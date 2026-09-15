@@ -94,8 +94,8 @@ export type SlashCommand = {
 
 export type UserGroup = {
   id: string;
+  handle: string;
   name: string;
-  displayName: string;
   description: string | null;
   memberIds: string[];
   createdBy: string;

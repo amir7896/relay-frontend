@@ -51,7 +51,8 @@ export type MessageBodyPart = {
   value: string;
   userId?: string;
   href?: string;
-  special?: 'channel' | 'here';
+  special?: 'channel' | 'here' | 'usergroup';
+  groupHandle?: string;
 };
 
 /**
@@ -92,11 +93,12 @@ function formatPlainText(text: string): MessageBodyPart[] {
 
 /**
  * Split message body for display. Mentions render WhatsApp-style (name, no @);
- * @channel / @here stay as special mention chips; remaining text gets mrkdwn-lite.
+ * @channel / @here / @usergroup stay as special mention chips; remaining text gets mrkdwn-lite.
  */
 export function renderMessageBody(
   body: string,
   mentionLabels: Map<string, string>,
+  userGroupHandles: Set<string> = new Set(),
 ): MessageBodyPart[] {
   const byHandle = new Map<string, { userId: string; label: string }>();
   for (const [userId, label] of mentionLabels) {
@@ -121,6 +123,13 @@ export function renderMessageBody(
         type: 'mention',
         value: token,
         special: token,
+      });
+    } else if (userGroupHandles.has(token)) {
+      mentionParts.push({
+        type: 'mention',
+        value: token,
+        special: 'usergroup',
+        groupHandle: token,
       });
     } else {
       const hit = byHandle.get(token);

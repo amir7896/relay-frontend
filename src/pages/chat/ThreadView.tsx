@@ -61,6 +61,7 @@ import type {
   Paginated,
   ScheduledMessage,
   SeenResult,
+  UserGroup,
 } from '../../api/types';
 import type { MessengerOutletContext } from './MessengerPage';
 
@@ -221,15 +222,17 @@ function disappearingLabel(seconds: number | undefined) {
 function MentionedText({
   body,
   mentionLabels,
+  userGroupHandles,
   selfId,
   messageId,
 }: {
   body: string;
   mentionLabels: Map<string, string>;
+  userGroupHandles?: Set<string>;
   selfId?: string;
   messageId: string;
 }) {
-  const parts = renderMessageBody(body, mentionLabels);
+  const parts = renderMessageBody(body, mentionLabels, userGroupHandles);
   return (
     <>
       {parts.map((part, index) => {
@@ -239,13 +242,16 @@ function MentionedText({
             Boolean(selfId) &&
             (part.userId === selfId ||
               part.special === 'channel' ||
-              part.special === 'here');
+              part.special === 'here' ||
+              part.special === 'usergroup');
           const label =
             part.special === 'channel'
               ? '@channel'
               : part.special === 'here'
                 ? '@here'
-                : part.value;
+                : part.special === 'usergroup'
+                  ? `@${part.groupHandle ?? part.value}`
+                  : part.value;
           return (
             <mark
               key={key}
@@ -494,6 +500,7 @@ export function ThreadView() {
   const [actionError, setActionError] = useState('');
   const [slashNotice, setSlashNotice] = useState('');
   const [topicDetailsOpen, setTopicDetailsOpen] = useState(false);
+  const [userGroups, setUserGroups] = useState<UserGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [composer, setComposer] = useState('');
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
@@ -677,6 +684,11 @@ export function ThreadView() {
       }));
   }, [conversation, me, byUserId]);
 
+  const userGroupHandles = useMemo(
+    () => new Set(userGroups.map((group) => group.handle.toLowerCase())),
+    [userGroups],
+  );
+
   /** All members (including you) — needed so @you renders WhatsApp-style without "@". */
   const mentionRenderLabels = useMemo(() => {
     if (!conversation || conversation.type !== 'group') {
@@ -698,13 +710,33 @@ export function ThreadView() {
           .map((token) => ({
             userId: `__${token}`,
             label: token,
-            special: token as 'channel' | 'here',
+            special: token as 'channel' | 'here' | 'usergroup',
+            hint:
+              token === 'channel'
+                ? 'notify everyone'
+                : 'notify people online',
+          })),
+        ...userGroups
+          .filter(
+            (group) =>
+              group.handle.startsWith(mentionQuery.query) ||
+              group.name.toLowerCase().includes(mentionQuery.query),
+          )
+          .map((group) => ({
+            userId: `__group:${group.id}`,
+            label: group.handle,
+            special: 'usergroup' as const,
+            hint: group.name,
           })),
         ...mentionCandidates
           .filter((member) =>
             member.label.toLowerCase().includes(mentionQuery.query),
           )
-          .map((member) => ({ ...member, special: undefined as undefined })),
+          .map((member) => ({
+            ...member,
+            special: undefined as undefined,
+            hint: undefined as string | undefined,
+          })),
       ]
     : [];
 
@@ -716,13 +748,33 @@ export function ThreadView() {
           .map((token) => ({
             userId: `__${token}`,
             label: token,
-            special: token as 'channel' | 'here',
+            special: token as 'channel' | 'here' | 'usergroup',
+            hint:
+              token === 'channel'
+                ? 'notify everyone'
+                : 'notify people online',
+          })),
+        ...userGroups
+          .filter(
+            (group) =>
+              group.handle.startsWith(threadMentionQuery.query) ||
+              group.name.toLowerCase().includes(threadMentionQuery.query),
+          )
+          .map((group) => ({
+            userId: `__group:${group.id}`,
+            label: group.handle,
+            special: 'usergroup' as const,
+            hint: group.name,
           })),
         ...mentionCandidates
           .filter((member) =>
             member.label.toLowerCase().includes(threadMentionQuery.query),
           )
-          .map((member) => ({ ...member, special: undefined as undefined })),
+          .map((member) => ({
+            ...member,
+            special: undefined as undefined,
+            hint: undefined as string | undefined,
+          })),
       ]
     : [];
 
@@ -821,6 +873,9 @@ export function ThreadView() {
     if (conv.data.type === 'group') {
       void refreshLobby(id);
     }
+    void api<UserGroup[]>('/chat/user-groups')
+      .then((response) => setUserGroups(response.data))
+      .catch(() => setUserGroups([]));
     void loadBookmarks();
     try {
       await api(`/chat/conversations/${id}/seen`, {
@@ -1692,20 +1747,36 @@ export function ThreadView() {
     }
   }
 
-  function insertMention(label: string, special?: 'channel' | 'here') {
+  function insertMention(
+    label: string,
+    special?: 'channel' | 'here' | 'usergroup',
+  ) {
     if (mentionQuery === null) {
       return;
     }
-    const handle = special ?? label.replace(/\s+/g, '');
+    const handle =
+      special === 'usergroup' || special === 'channel' || special === 'here'
+        ? special === 'usergroup'
+          ? label
+          : special
+        : label.replace(/\s+/g, '');
     const next = `${composer.slice(0, mentionQuery.start)}@${handle} `;
     setComposer(next);
   }
 
-  function insertThreadMention(label: string, special?: 'channel' | 'here') {
+  function insertThreadMention(
+    label: string,
+    special?: 'channel' | 'here' | 'usergroup',
+  ) {
     if (threadMentionQuery === null) {
       return;
     }
-    const handle = special ?? label.replace(/\s+/g, '');
+    const handle =
+      special === 'usergroup' || special === 'channel' || special === 'here'
+        ? special === 'usergroup'
+          ? label
+          : special
+        : label.replace(/\s+/g, '');
     const next = `${threadComposer.slice(0, threadMentionQuery.start)}@${handle} `;
     setThreadComposer(next);
   }
@@ -3745,6 +3816,7 @@ export function ThreadView() {
                         <MentionedText
                           body={caption}
                           mentionLabels={mentionRenderLabels}
+                          userGroupHandles={userGroupHandles}
                           selfId={me}
                           messageId={message.id}
                         />
@@ -4317,13 +4389,10 @@ export function ThreadView() {
                 onClick={() => insertMention(member.label, member.special)}
               >
                 {member.special
-                  ? `@${member.special}`
+                  ? `@${member.label}`
                   : `@${member.label.replace(/\s+/g, '')}`}
-                {member.special === 'channel' ? (
-                  <small className="muted"> notify everyone</small>
-                ) : null}
-                {member.special === 'here' ? (
-                  <small className="muted"> notify people online</small>
+                {member.hint ? (
+                  <small className="muted"> {member.hint}</small>
                 ) : null}
               </button>
             </li>
@@ -4796,6 +4865,7 @@ export function ThreadView() {
                 <MentionedText
                   body={activeThreadRoot.body}
                   mentionLabels={mentionRenderLabels}
+                  userGroupHandles={userGroupHandles}
                   selfId={me}
                   messageId={activeThreadRoot.id}
                 />
@@ -4823,6 +4893,7 @@ export function ThreadView() {
                       <MentionedText
                         body={reply.body}
                         mentionLabels={mentionRenderLabels}
+                        userGroupHandles={userGroupHandles}
                         selfId={me}
                         messageId={reply.id}
                       />
@@ -4929,8 +5000,11 @@ export function ThreadView() {
                           }
                         >
                           {member.special
-                            ? `@${member.special}`
+                            ? `@${member.label}`
                             : `@${member.label.replace(/\s+/g, '')}`}
+                          {member.hint ? (
+                            <small className="muted"> {member.hint}</small>
+                          ) : null}
                         </button>
                       </li>
                     ))}

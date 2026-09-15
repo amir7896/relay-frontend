@@ -7323,7 +7323,8 @@ html[data-theme='dark'] .voice-note.mine .voice-note-play {
 }
 
 .wa-mention-channel,
-.wa-mention-here {
+.wa-mention-here,
+.wa-mention-usergroup {
   font-weight: 700;
 }
 

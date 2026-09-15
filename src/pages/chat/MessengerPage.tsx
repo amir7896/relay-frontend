@@ -956,7 +956,7 @@ export function MessengerPage() {
                   disabled={sidebarBusy}
                   value={sectionIdForConversation(item.id) ?? ''}
                   onClick={(event) => {
-                    event.preventDefault();
+    event.preventDefault();
                     event.stopPropagation();
                   }}
                   onMouseDown={(event) => {
@@ -1062,13 +1062,13 @@ export function MessengerPage() {
     setBusy(true);
     setModalError('');
     try {
-      const response = await api<Conversation>('/chat/private', {
-        method: 'POST',
-        body: JSON.stringify({ userId }),
-      });
-      setDmOpen(false);
-      await load();
-      navigate(`/chat/${response.data.id}`);
+    const response = await api<Conversation>('/chat/private', {
+      method: 'POST',
+      body: JSON.stringify({ userId }),
+    });
+    setDmOpen(false);
+    await load();
+    navigate(`/chat/${response.data.id}`);
     } catch (err) {
       setModalError(err instanceof Error ? err.message : 'Could not start chat');
     } finally {
@@ -1093,22 +1093,22 @@ export function MessengerPage() {
     setBusy(true);
     setModalError('');
     try {
-      const response = await api<Conversation>('/chat/groups', {
-        method: 'POST',
+    const response = await api<Conversation>('/chat/groups', {
+      method: 'POST',
         body: JSON.stringify({
           name: groupName.trim().replace(/^#/, ''),
           memberIds: groupMembers,
           visibility: groupVisibility,
           announceOnly: groupAnnounceOnly,
         }),
-      });
-      setGroupOpen(false);
+    });
+    setGroupOpen(false);
       setGroupName('');
       setGroupMembers([]);
       setGroupVisibility('private');
       setGroupAnnounceOnly(false);
-      await load();
-      navigate(`/chat/${response.data.id}`);
+    await load();
+    navigate(`/chat/${response.data.id}`);
     } catch (err) {
       setModalError(err instanceof Error ? err.message : 'Could not create channel');
     } finally {
@@ -1253,7 +1253,7 @@ export function MessengerPage() {
                     d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zm-2 12H6v-2h12zm0-3H6V9h12zm0-3H6V6h12z"
                   />
                 </svg>
-              </button>
+            </button>
               <button
                 className="inbox-action-btn"
                 type="button"
@@ -1267,20 +1267,20 @@ export function MessengerPage() {
                     d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6z"
                   />
                 </svg>
-              </button>
+            </button>
                 </>
               ) : null}
-            </div>
           </div>
+        </div>
           <div className="inbox-search-wrap">
-            <input
-              className="inbox-search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
+        <input
+          className="inbox-search"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
               placeholder="Search — try from:jane has:file in:general"
               aria-label="Search channels and messages"
               title="Operators: from:name · in:#channel · has:file|image|link|audio · after:7d · before:2024-01-01"
-            />
+        />
           </div>
         </div>
         {error ? <p className="error pad">{error}</p> : null}
@@ -1428,8 +1428,8 @@ export function MessengerPage() {
                     {sectionItems.length > 0 ? (
                       <span className="inbox-unread-pill muted-pill">
                         {sectionItems.length}
-                      </span>
-                    ) : null}
+                </span>
+                ) : null}
                   </button>
                   <div className="inbox-section-actions">
                     <button
@@ -1483,8 +1483,8 @@ export function MessengerPage() {
             >
               +
             </button>
-            ) : null}
-          </div>
+          ) : null}
+        </div>
           {directs.map((item) => renderConversationRow(item))}
           {directs.length === 0 && !query.trim() ? (
             isGuest ? (
@@ -1564,7 +1564,7 @@ export function MessengerPage() {
                         <small className="chat-row-preview">{snippet}</small>
                       </span>
                     </span>
-                  </button>
+          </button>
                 );
               })}
               {!messageSearchBusy && messageHits.length === 0 ? (

@@ -5,8 +5,9 @@ import { useAuth } from '../auth/AuthContext';
 import { useOrganization } from '../organizations/OrganizationContext';
 import { useConfirm, usePrompt } from '../components/ConfirmProvider';
 import { PasswordInput } from '../components/PasswordInput';
+import { PeoplePicker } from '../components/PeoplePicker';
 import { resolveMediaUrl } from '../components/VoiceNotePlayer';
-import { initials } from '../lib/format';
+import { displayName, initials } from '../lib/format';
 import {
   getNotificationPermission,
   subscribeWebPush,
@@ -17,9 +18,11 @@ import {
 } from '../lib/notifications';
 import { usePwaInstall } from '../hooks/usePwaInstall';
 import { resetDemoTour } from '../components/DemoTour';
+import { useDirectory } from '../people/useDirectory';
 import type {
   SessionView,
   SlashCommand,
+  UserGroup,
   UserProfile,
   WorkspaceSettings,
 } from '../api/types';
@@ -100,6 +103,19 @@ export function ProfilePage() {
   });
   const [slashSaved, setSlashSaved] = useState('');
   const [slashBusy, setSlashBusy] = useState(false);
+  const [userGroups, setUserGroups] = useState<UserGroup[]>([]);
+  const [userGroupDraft, setUserGroupDraft] = useState({
+    handle: '',
+    name: '',
+    description: '',
+    memberIds: [] as string[],
+  });
+  const [editingUserGroupId, setEditingUserGroupId] = useState<string | null>(
+    null,
+  );
+  const [userGroupSaved, setUserGroupSaved] = useState('');
+  const [userGroupBusy, setUserGroupBusy] = useState(false);
+  const { people } = useDirectory();
   const [workspaceName, setWorkspaceName] = useState('');
   const [workspaceNameSaved, setWorkspaceNameSaved] = useState('');
   const [members, setMembers] = useState<
@@ -241,9 +257,11 @@ export function ProfilePage() {
   useEffect(() => {
     if (!canManageWorkspace) {
       setSlashCommands([]);
+      setUserGroups([]);
       return;
     }
     void loadSlashCommands();
+    void loadUserGroups();
   }, [canManageWorkspace, activeOrganizationId]);
 
   async function loadInvites() {
@@ -499,6 +517,117 @@ export function ProfilePage() {
     } catch (err) {
       setError(
         err instanceof Error ? err.message : 'Could not revoke slash command',
+      );
+    }
+  }
+
+  async function loadUserGroups() {
+    try {
+      const response = await api<UserGroup[]>('/chat/user-groups');
+      setUserGroups(response.data);
+    } catch {
+      setUserGroups([]);
+    }
+  }
+
+  function resetUserGroupDraft() {
+    setUserGroupDraft({
+      handle: '',
+      name: '',
+      description: '',
+      memberIds: [],
+    });
+    setEditingUserGroupId(null);
+  }
+
+  function startEditUserGroup(group: UserGroup) {
+    setEditingUserGroupId(group.id);
+    setUserGroupDraft({
+      handle: group.handle,
+      name: group.name,
+      description: group.description ?? '',
+      memberIds: [...group.memberIds],
+    });
+    setUserGroupSaved('');
+  }
+
+  function toggleUserGroupMember(userId: string) {
+    setUserGroupDraft((draft) => {
+      const has = draft.memberIds.includes(userId);
+      return {
+        ...draft,
+        memberIds: has
+          ? draft.memberIds.filter((id) => id !== userId)
+          : [...draft.memberIds, userId],
+      };
+    });
+  }
+
+  async function saveUserGroup(event: FormEvent) {
+    event.preventDefault();
+    const handle = userGroupDraft.handle.trim().replace(/^@/, '');
+    const name = userGroupDraft.name.trim();
+    const description = userGroupDraft.description.trim();
+    if (!handle || !name || userGroupDraft.memberIds.length === 0) {
+      return;
+    }
+    setUserGroupBusy(true);
+    setError('');
+    setUserGroupSaved('');
+    try {
+      if (editingUserGroupId) {
+        await api<UserGroup>(`/chat/user-groups/${editingUserGroupId}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            handle,
+            name,
+            description: description || null,
+            memberIds: userGroupDraft.memberIds,
+          }),
+        });
+        setUserGroupSaved(`@${handle} updated`);
+      } else {
+        await api<UserGroup>('/chat/user-groups', {
+          method: 'POST',
+          body: JSON.stringify({
+            handle,
+            name,
+            description: description || undefined,
+            memberIds: userGroupDraft.memberIds,
+          }),
+        });
+        setUserGroupSaved(`@${handle} created — mention it in any channel`);
+      }
+      resetUserGroupDraft();
+      await loadUserGroups();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Could not save user group',
+      );
+    } finally {
+      setUserGroupBusy(false);
+    }
+  }
+
+  async function deleteUserGroup(group: UserGroup) {
+    const ok = await confirmDialog({
+      title: 'Delete user group?',
+      message: `@${group.handle} will stop notifying members when mentioned.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
+    setError('');
+    try {
+      await api(`/chat/user-groups/${group.id}`, { method: 'DELETE' });
+      if (editingUserGroupId === group.id) {
+        resetUserGroupDraft();
+      }
+      await loadUserGroups();
+      setUserGroupSaved(`@${group.handle} deleted`);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Could not delete user group',
       );
     }
   }
@@ -837,7 +966,7 @@ export function ProfilePage() {
         onSubmit={(event) => void saveProfile(event)}
       >
         <header className="profile-sheet-head profile-sheet-head-row">
-          <div>
+        <div>
             <h2>About</h2>
             <p className="muted">How you appear to people in Relay.</p>
           </div>
@@ -928,7 +1057,7 @@ export function ProfilePage() {
           <button className="btn" type="submit" disabled={busy}>
             {busy ? 'Saving…' : 'Save profile'}
           </button>
-        </div>
+      </div>
       </form>
 
       <section className="profile-sheet">
@@ -965,7 +1094,7 @@ export function ProfilePage() {
           ) : null}
 
           <div className="profile-fields" style={{ marginTop: '1rem' }}>
-            <label>
+          <label>
               Message alerts
               <select
                 value={notifyPrefs.mode}
@@ -980,8 +1109,8 @@ export function ProfilePage() {
                 <option value="mentions">Mentions only</option>
                 <option value="none">Nothing</option>
               </select>
-            </label>
-            <label>
+          </label>
+          <label>
               <input
                 type="checkbox"
                 checked={notifyPrefs.quietHoursEnabled}
@@ -993,10 +1122,10 @@ export function ProfilePage() {
                 }
               />{' '}
               Quiet hours
-            </label>
+          </label>
             {notifyPrefs.quietHoursEnabled ? (
               <div className="profile-notify-row" style={{ gap: '0.75rem' }}>
-                <label>
+          <label>
                   From
                   <input
                     type="time"
@@ -1008,8 +1137,8 @@ export function ProfilePage() {
                       }))
                     }
                   />
-                </label>
-                <label>
+          </label>
+          <label>
                   Until
                   <input
                     type="time"
@@ -1021,10 +1150,10 @@ export function ProfilePage() {
                       }))
                     }
                   />
-                </label>
-              </div>
+          </label>
+        </div>
             ) : null}
-            <label>
+        <label>
               Timezone
               <input
                 value={notifyPrefs.timezone}
@@ -1036,8 +1165,8 @@ export function ProfilePage() {
                 }
                 placeholder="Asia/Karachi"
               />
-            </label>
-            <label>
+        </label>
+        <label>
               <input
                 type="checkbox"
                 checked={notifyPrefs.respectStatus}
@@ -1049,7 +1178,7 @@ export function ProfilePage() {
                 }
               />{' '}
               Silence alerts when Away / Busy / Do not disturb
-            </label>
+        </label>
             <p className="muted">
               Mentions still break through quiet hours and Away. Do not disturb blocks calls too.
             </p>
@@ -1167,11 +1296,11 @@ export function ProfilePage() {
             <p className="ok profile-inline-ok">{workspaceNameSaved}</p>
           ) : null}
           <div className="profile-sheet-actions profile-sheet-actions-mobile">
-            <button className="btn" type="submit">
+        <button className="btn" type="submit">
               Save name
-            </button>
+        </button>
           </div>
-        </form>
+      </form>
       ) : null}
 
       {canManageWorkspace && branding ? (
@@ -1434,6 +1563,168 @@ export function ProfilePage() {
         <section className="profile-sheet">
           <header className="profile-sheet-head">
             <p className="eyebrow">Workspace</p>
+            <h2>User groups</h2>
+            <p className="muted">
+              Mention <code>@handle</code> in a channel to notify that group’s
+              members (like <code>@channel</code>). Handles start with a letter;
+              letters, numbers, and underscores only.
+            </p>
+          </header>
+          <form
+            className="profile-fields profile-fields-grid"
+            onSubmit={(event) => void saveUserGroup(event)}
+          >
+            <label className="profile-plain-field">
+              Handle
+              <input
+                value={userGroupDraft.handle}
+                onChange={(event) =>
+                  setUserGroupDraft((draft) => ({
+                    ...draft,
+                    handle: event.target.value,
+                  }))
+                }
+                placeholder="eng"
+                maxLength={32}
+                required
+              />
+            </label>
+            <label className="profile-plain-field">
+              Display name
+              <input
+                value={userGroupDraft.name}
+                onChange={(event) =>
+                  setUserGroupDraft((draft) => ({
+                    ...draft,
+                    name: event.target.value,
+                  }))
+                }
+                placeholder="Engineering"
+                maxLength={80}
+                required
+              />
+            </label>
+            <label
+              className="profile-plain-field"
+              style={{ gridColumn: '1 / -1' }}
+            >
+              Description
+              <input
+                value={userGroupDraft.description}
+                onChange={(event) =>
+                  setUserGroupDraft((draft) => ({
+                    ...draft,
+                    description: event.target.value,
+                  }))
+                }
+                placeholder="Optional"
+                maxLength={240}
+              />
+            </label>
+            <div style={{ gridColumn: '1 / -1' }}>
+              <p className="muted" style={{ marginBottom: 8 }}>
+                {userGroupDraft.memberIds.length === 0
+                  ? 'Select at least one member'
+                  : `${userGroupDraft.memberIds.length} member${
+                      userGroupDraft.memberIds.length === 1 ? '' : 's'
+                    }`}
+              </p>
+              <PeoplePicker
+                people={people}
+                mode="multi"
+                selected={userGroupDraft.memberIds}
+                onToggle={toggleUserGroupMember}
+              />
+            </div>
+            <div
+              className="profile-sheet-actions"
+              style={{ gridColumn: '1 / -1' }}
+            >
+              <button
+                className="btn"
+                type="submit"
+                disabled={
+                  userGroupBusy ||
+                  !userGroupDraft.handle.trim() ||
+                  !userGroupDraft.name.trim() ||
+                  userGroupDraft.memberIds.length === 0
+                }
+              >
+                {userGroupBusy
+                  ? 'Saving…'
+                  : editingUserGroupId
+                    ? 'Save group'
+                    : 'Create group'}
+              </button>
+              {editingUserGroupId ? (
+                <button
+                  className="ghost"
+                  type="button"
+                  onClick={() => resetUserGroupDraft()}
+                >
+                  Cancel
+                </button>
+              ) : null}
+            </div>
+          </form>
+          <ul className="member-list" style={{ marginTop: 12 }}>
+            {userGroups.map((group) => (
+              <li key={group.id}>
+                <div className="member-identity">
+                  <span>@{group.handle}</span>
+                  <small>
+                    {group.name}
+                    {group.description ? ` — ${group.description}` : ''} ·{' '}
+                    {group.memberIds.length} member
+                    {group.memberIds.length === 1 ? '' : 's'}
+                    {group.memberIds.length > 0
+                      ? `: ${group.memberIds
+                          .slice(0, 4)
+                          .map((id) =>
+                            displayName(
+                              people.find((person) => person.userId === id),
+                            ),
+                          )
+                          .join(', ')}${
+                          group.memberIds.length > 4 ? '…' : ''
+                        }`
+                      : ''}
+                  </small>
+                </div>
+                <div className="member-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => startEditUserGroup(group)}
+                  >
+                    Edit
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost danger-text"
+                    onClick={() => void deleteUserGroup(group)}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+          {userGroups.length === 0 ? (
+            <p className="muted" style={{ marginTop: 8 }}>
+              No user groups yet.
+            </p>
+          ) : null}
+          {userGroupSaved ? (
+            <p className="ok profile-inline-ok">{userGroupSaved}</p>
+          ) : null}
+        </section>
+      ) : null}
+
+      {canManageWorkspace ? (
+        <section className="profile-sheet">
+          <header className="profile-sheet-head">
+            <p className="eyebrow">Workspace</p>
             <h2>Members</h2>
             <p className="muted">
               Manage roles in {activeOrg?.name ?? 'this workspace'}. Owners can
@@ -1542,7 +1833,7 @@ export function ProfilePage() {
             </p>
           </header>
           <form className="invite-form" onSubmit={(event) => void createInvite(event)}>
-            <label>
+          <label>
               Email
               <input
                 name="email"
@@ -1557,8 +1848,8 @@ export function ProfilePage() {
               {inviteEmailInvalid ? (
                 <small className="field-error">Enter a valid email address</small>
               ) : null}
-            </label>
-            <label>
+          </label>
+          <label>
               Role
               <select
                 value={inviteRole}
@@ -1569,7 +1860,7 @@ export function ProfilePage() {
                 <option value="member">Member</option>
                 <option value="guest">Guest</option>
               </select>
-            </label>
+          </label>
             <label>
               Expires in days
               <input name="expiresInDays" type="number" min="1" max="90" defaultValue="7" required />
@@ -1597,7 +1888,7 @@ export function ProfilePage() {
               >
                 Copy link
               </button>
-            </div>
+        </div>
           ) : null}
           <div className="invite-list">
             {invites.length === 0 ? <p className="muted invite-empty">No invites created yet.</p> : null}
@@ -2310,8 +2601,8 @@ export function ProfilePage() {
 
         <div className="profile-sheet-actions">
           <button className="btn" type="submit" disabled={busy}>
-            Update password
-          </button>
+          Update password
+        </button>
         </div>
       </form>
     </main>
