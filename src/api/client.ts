@@ -12,19 +12,20 @@ export class ApiError extends Error {
 }
 
 function shouldAttachOrganizationHeader(path: string): boolean {
+  const pathname = path.split('?')[0] ?? path;
   // Workspace invite management needs the active org.
-  if (path === '/auth/invites') {
+  if (pathname === '/auth/invites') {
     return true;
   }
   // DELETE /auth/invites/:inviteId (UUID)
   if (
     /^\/auth\/invites\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-      path,
+      pathname,
     )
   ) {
     return true;
   }
-  return !path.startsWith('/auth/');
+  return !pathname.startsWith('/auth/');
 }
 
 export async function api<T>(

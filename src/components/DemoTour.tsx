@@ -5,6 +5,11 @@ const STORAGE_KEY = 'relay.tour.done';
 
 const steps = [
   {
+    target: '.command-palette-trigger, .inbox-search-wrap',
+    title: 'Command palette',
+    body: 'Press ⌘K (or Ctrl+K) anytime to jump to channels, people, messages, or create a channel — like Slack’s quick switcher.',
+  },
+  {
     target: '.inbox',
     title: 'Your inbox',
     body: 'All direct messages and groups live here. Pin, mute, search, and install Relay as an app.',
@@ -16,8 +21,8 @@ const steps = [
   },
   {
     target: '.composer',
-    title: 'Rich composer',
-    body: 'Attach images, documents, voice notes, @mentions, and polls. Save important messages from the ⋮ menu.',
+    title: 'Smart composer',
+    body: 'Attach media, @mentions, polls — plus AI / quick reply chips under the composer when someone messages you.',
   },
   {
     target: '.side-nav-links',

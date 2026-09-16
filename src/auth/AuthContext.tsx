@@ -26,7 +26,7 @@ type AuthContextValue = {
     password: string,
   ) => Promise<{ requires2fa: true; tempToken: string; email: string } | void>;
   verify2faLogin: (tempToken: string, code: string) => Promise<void>;
-  register: (input: RegisterInput) => Promise<void>;
+  register: (input: RegisterInput) => Promise<{ pendingChannelId?: string | null }>;
   logout: () => Promise<void>;
   /** Persist session to localStorage and React state together. */
   replaceSession: (next: Session | null) => void;
@@ -110,6 +110,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         body: JSON.stringify(input),
       });
       apply(response.data);
+      return { pendingChannelId: response.data.pendingChannelId ?? null };
     },
     [apply],
   );

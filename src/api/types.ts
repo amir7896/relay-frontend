@@ -50,6 +50,8 @@ export type OrgSsoView = {
   ssoIssuerUrl: string | null;
   ssoClientId: string | null;
   hasClientSecret: boolean;
+  ssoIdpSsoUrl: string | null;
+  hasIdpCertificate: boolean;
   plan: 'free' | 'pro' | 'enterprise';
   configured: boolean;
 };
@@ -57,6 +59,7 @@ export type OrgSsoView = {
 export type ChannelInvite = {
   id: string;
   conversationId: string;
+  conversationName?: string | null;
   token: string | null;
   inviteUrl: string | null;
   expiresAt: string | null;
@@ -65,6 +68,17 @@ export type ChannelInvite = {
   revokedAt: string | null;
   createdBy: string;
   createdAt: string;
+  emailSent?: boolean;
+  debugInviteUrl?: string;
+};
+
+export type ChannelInvitePreview = {
+  valid: boolean;
+  conversationId: string | null;
+  conversationName: string | null;
+  organizationId: string | null;
+  expiresAt: string | null;
+  message?: string;
 };
 
 export type IncomingWebhook = {
@@ -81,11 +95,27 @@ export type IncomingWebhook = {
   createdAt: string;
 };
 
+export type OutgoingWebhook = {
+  id: string;
+  conversationId: string;
+  name: string;
+  targetUrl: string;
+  excludeBots: boolean;
+  signingSecret?: string | null;
+  createdBy: string;
+  revokedAt: string | null;
+  lastDeliveredAt: string | null;
+  failureCount: number;
+  createdAt: string;
+};
+
 export type SlashCommand = {
   id: string;
   name: string;
   description: string;
   responseTemplate: string;
+  responseMode: 'in_channel' | 'ephemeral';
+  requestUrl: string | null;
   builtin: boolean;
   createdBy: string | null;
   revokedAt: string | null;
@@ -108,6 +138,7 @@ export type AuthResult = {
   tokens: TokenPair;
   organizations: OrganizationView[];
   activeOrganizationId: string | null;
+  pendingChannelId?: string | null;
 };
 
 export type AuthRequires2fa = {
@@ -353,6 +384,8 @@ export type Conversation = {
   members: ConversationMember[];
   createdAt: string;
   updatedAt: string;
+  isShared?: boolean;
+  sharedExternalLabel?: string | null;
 };
 
 export type BlockView = {
@@ -424,4 +457,93 @@ export type SeenResult = {
   userId: string;
   lastReadAt: string;
   messageId: string | null;
+};
+
+export type ConversationCanvas = {
+  id: string;
+  organizationId: string;
+  conversationId: string;
+  title: string;
+  body: string;
+  updatedBy: string;
+  createdAt: string;
+  updatedAt: string | null;
+};
+
+export type ChannelListItemStatus = 'todo' | 'doing' | 'done';
+
+export type ChannelListItem = {
+  id: string;
+  listId: string;
+  title: string;
+  status: ChannelListItemStatus;
+  assigneeId: string | null;
+  sortOrder: number;
+  createdAt: string;
+};
+
+export type ChannelList = {
+  id: string;
+  organizationId: string;
+  conversationId: string;
+  name: string;
+  createdBy: string;
+  createdAt: string;
+  items?: ChannelListItem[];
+};
+
+export type Clip = {
+  id: string;
+  organizationId: string;
+  conversationId: string;
+  messageId: string | null;
+  createdBy: string;
+  mediaUrl: string;
+  mediaType: 'audio' | 'video';
+  durationSeconds: number | null;
+  createdAt: string;
+};
+
+export type WorkflowTriggerType = 'message_contains' | 'channel_created' | 'manual';
+export type WorkflowActionType = 'post_message' | 'webhook' | 'set_reminder';
+
+export type Workflow = {
+  id: string;
+  organizationId: string;
+  conversationId: string | null;
+  name: string;
+  enabled: boolean;
+  triggerType: WorkflowTriggerType;
+  triggerConfig: Record<string, unknown>;
+  actionType: WorkflowActionType;
+  actionConfig: Record<string, unknown>;
+  createdBy: string;
+  createdAt: string;
+};
+
+export type AppCatalogItem = {
+  key: string;
+  name: string;
+  description: string;
+  icon: string;
+  iconUrl?: string | null;
+  installed?: boolean;
+};
+
+export type ConnectInvite = {
+  id: string;
+  email: string;
+  status: 'pending' | 'accepted' | 'revoked';
+  createdAt: string;
+  acceptedAt?: string | null;
+  token?: string;
+  inviteUrl?: string | null;
+};
+
+export type ConnectStatus = {
+  conversationId: string;
+  isShared: boolean;
+  sharedExternalLabel: string | null;
+  conversationName?: string | null;
+  invites: ConnectInvite[];
 };

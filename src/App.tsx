@@ -72,6 +72,11 @@ const ChannelInviteAcceptPage = lazy(() =>
     default: m.ChannelInviteAcceptPage,
   })),
 );
+const ConnectAcceptPage = lazy(() =>
+  import('./pages/chat/ConnectAcceptPage').then((m) => ({
+    default: m.ConnectAcceptPage,
+  })),
+);
 const OnboardingPage = lazy(() =>
   import('./pages/OnboardingPage').then((m) => ({ default: m.OnboardingPage })),
 );
@@ -118,14 +123,18 @@ export function App() {
                       />
                       <Route path="/verify-email" element={<VerifyEmailPage />} />
                       <Route path="/invite/:token" element={<InviteAcceptPage />} />
+                      <Route
+                        path="/channel-invite/:token"
+                        element={<ChannelInviteAcceptPage />}
+                      />
+                      <Route
+                        path="/connect-invite/:token"
+                        element={<ConnectAcceptPage />}
+                      />
                     </Route>
                     <Route element={<Protected />}>
                       <Route path="/onboarding" element={<OnboardingPage />} />
                       <Route element={<RequireWorkspace />}>
-                        <Route
-                          path="/channel-invite/:token"
-                          element={<ChannelInviteAcceptPage />}
-                        />
                         <Route element={<AppShell />}>
                           <Route path="/chat" element={<MessengerPage />}>
                             <Route index element={<EmptyThread />} />

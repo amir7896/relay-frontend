@@ -9,10 +9,11 @@ import {
 import { createPortal } from 'react-dom';
 import { Link, useNavigate, useOutletContext, useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../../api/client';
-import { getAccessToken } from '../../auth/session';
+import { getAccessToken, getSession } from '../../auth/session';
 import { useAuth } from '../../auth/AuthContext';
 import { useChatSocket } from '../../chat/ChatSocketContext';
 import { useVoiceCall } from '../../calls/VoiceCallContext';
+import { HuddleIcon } from '../../components/HuddleIcon';
 import { Modal } from '../../components/Modal';
 import { useConfirm } from '../../components/ConfirmProvider';
 import { MessageTicks } from '../../components/MessageTicks';
@@ -58,12 +59,14 @@ import type {
   LinkPreview,
   MessageBookmark,
   MessageEditHistory,
+  MessageReminder,
   Paginated,
   ScheduledMessage,
   SeenResult,
   UserGroup,
 } from '../../api/types';
 import type { MessengerOutletContext } from './MessengerPage';
+import { ChannelTabs, type ChannelTab } from './ChannelTabs';
 
 const DELETE_FOR_EVERYONE_MS = Number.POSITIVE_INFINITY;
 const EDIT_WINDOW_MS = 15 * 60 * 1000;
@@ -210,6 +213,8 @@ const MSG_MENU_ICONS = {
     'M17 3H7c-1.1 0-2 .9-2 2v16l7-3 7 3V5c0-1.1-.9-2-2-2z',
   remind:
     'M12 22c1.1 0 2-.9 2-2h-4c0 1.1.9 2 2 2zm6-6v-5c0-3.07-1.63-5.64-4.5-6.32V4c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5v.68C7.64 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z',
+  unread:
+    'M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 4l-8 5-8-5V6l8 5 8-5v2z',
   delete:
     'M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z',
 } as const;
@@ -444,11 +449,16 @@ async function uploadFileWithProgress(
   onProgress: (percent: number) => void,
 ): Promise<{ url: string; mime: string; name: string; size: number }> {
   const token = getAccessToken();
+  const session = getSession();
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/api/chat/uploads');
+    xhr.setRequestHeader('ngrok-skip-browser-warning', 'true');
     if (token) {
       xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    }
+    if (session?.activeOrganizationId) {
+      xhr.setRequestHeader('X-Organization-Id', session.activeOrganizationId);
     }
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) {
@@ -490,7 +500,7 @@ export function ThreadView() {
   const navigate = useNavigate();
   const confirmDialog = useConfirm();
   const workspace = useWorkspace();
-  const { clearUnread, refreshInbox, conversations } =
+  const { clearUnread, setUnread, refreshInbox, conversations, laterItems, refreshLater } =
     useOutletContext<MessengerOutletContext>();
   const { byUserId, ensureProfiles } = useDirectory();
   const [conversation, setConversation] = useState<Conversation | null>(null);
@@ -503,6 +513,9 @@ export function ThreadView() {
   const [userGroups, setUserGroups] = useState<UserGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [composer, setComposer] = useState('');
+  const [smartReplies, setSmartReplies] = useState<string[]>([]);
+  const [smartRepliesAi, setSmartRepliesAi] = useState(false);
+  const [smartRepliesBusy, setSmartRepliesBusy] = useState(false);
   const [replyTo, setReplyTo] = useState<ChatMessage | null>(null);
   const [editingMessage, setEditingMessage] = useState<ChatMessage | null>(null);
   const [menuMessageId, setMenuMessageId] = useState<string | null>(null);
@@ -512,8 +525,17 @@ export function ThreadView() {
     placeAbove: boolean;
   } | null>(null);
   const [remindMenuOpen, setRemindMenuOpen] = useState(false);
+  const [remindCustomOpen, setRemindCustomOpen] = useState(false);
+  const [remindCustomAt, setRemindCustomAt] = useState(() =>
+    toDatetimeLocalValue(new Date(Date.now() + 60 * 60 * 1000)),
+  );
   const [reminderToast, setReminderToast] = useState<string | null>(null);
   const [reactPickerId, setReactPickerId] = useState<string | null>(null);
+  const [reactPickerAnchor, setReactPickerAnchor] = useState<{
+    top: number;
+    left: number;
+    alignEnd: boolean;
+  } | null>(null);
   const [reactPickerExpanded, setReactPickerExpanded] = useState(false);
   const [reactPickerQuery, setReactPickerQuery] = useState('');
   const [editHistory, setEditHistory] = useState<MessageEditHistory | null>(null);
@@ -531,6 +553,7 @@ export function ThreadView() {
   const [mediaPage, setMediaPage] = useState(1);
   const [mediaHasMore, setMediaHasMore] = useState(false);
   const [mediaDownloadingId, setMediaDownloadingId] = useState<string | null>(null);
+  const [channelTab, setChannelTab] = useState<ChannelTab>('messages');
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
   const toolsMenuRef = useRef<HTMLDivElement | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -544,6 +567,22 @@ export function ThreadView() {
   const [pollAllowMultiple, setPollAllowMultiple] = useState(false);
   const [pollBusy, setPollBusy] = useState(false);
   const [bookmarkedIds, setBookmarkedIds] = useState<Set<string>>(new Set());
+  const remindersByMessageId = useMemo(() => {
+    const next: Record<string, MessageReminder> = {};
+    for (const item of laterItems) {
+      if (item.conversationId !== id || item.status !== 'pending') {
+        continue;
+      }
+      const existing = next[item.messageId];
+      if (
+        !existing ||
+        new Date(item.remindAt).getTime() < new Date(existing.remindAt).getTime()
+      ) {
+        next[item.messageId] = item;
+      }
+    }
+    return next;
+  }, [laterItems, id]);
   const [savedOpen, setSavedOpen] = useState(false);
   const [savedItems, setSavedItems] = useState<MessageBookmark[]>([]);
   const [savedBusy, setSavedBusy] = useState(false);
@@ -599,21 +638,30 @@ export function ThreadView() {
   const messagePageRef = useRef(messagePage);
   messagePageRef.current = messagePage;
   const focusBusyRef = useRef(false);
+  /** When true, skip auto-mark-seen so Slack-style "Mark unread" can stick until leave. */
+  const holdAutoSeenRef = useRef(false);
   const { joinConversation, leaveConversation, subscribe, emit } = useChatSocket();
   const {
     phase: callPhase,
     startCall,
+    startHuddle,
     joinCall,
     refreshLobby,
     lobbiesByConversation,
   } = useVoiceCall();
   const ongoingLobby = lobbiesByConversation[id];
+  const ongoingIsHuddle = ongoingLobby?.mode === 'huddle';
   const canJoinOngoing =
-    conversation?.type === 'group' &&
+    (conversation?.type === 'group' || conversation?.type === 'private') &&
     callPhase === 'idle' &&
     Boolean(ongoingLobby?.active) &&
     Boolean(ongoingLobby?.joinedIds.length) &&
     !ongoingLobby?.joinedIds.includes(me || '');
+  const inThisHuddle =
+    Boolean(ongoingIsHuddle) &&
+    Boolean(ongoingLobby?.active) &&
+    Boolean(me && ongoingLobby?.joinedIds.includes(me)) &&
+    callPhase !== 'idle';
 
   const myMemberRole = conversation?.members.find((member) => member.userId === me)?.role;
   const announceOnlyLocked = Boolean(
@@ -865,7 +913,9 @@ export function ThreadView() {
     setMentionJumpId(mentionJumpTarget);
     setMentionBannerDismissed(false);
     setLoading(false);
-    clearUnread(id);
+    if (!holdAutoSeenRef.current) {
+      clearUnread(id);
+    }
     void ensureProfiles(
       conv.data.members.map((member) => member.userId),
       { refresh: true },
@@ -873,10 +923,13 @@ export function ThreadView() {
     if (conv.data.type === 'group') {
       void refreshLobby(id);
     }
-    void api<UserGroup[]>('/chat/user-groups')
-      .then((response) => setUserGroups(response.data))
+    void api<Paginated<UserGroup>>('/chat/user-groups?page=1&limit=100')
+      .then((response) => setUserGroups(response.data.items ?? []))
       .catch(() => setUserGroups([]));
     void loadBookmarks();
+    if (holdAutoSeenRef.current) {
+      return;
+    }
     try {
       await api(`/chat/conversations/${id}/seen`, {
         method: 'POST',
@@ -974,10 +1027,12 @@ export function ThreadView() {
   }
 
   useEffect(() => {
+    holdAutoSeenRef.current = false;
     setError('');
     setActionError('');
     setComposer('');
     setRemindMenuOpen(false);
+    setRemindCustomOpen(false);
     setReminderToast(null);
     void loadMessageDraft(id).then((draft) => {
       setComposer(draft);
@@ -988,6 +1043,7 @@ export function ThreadView() {
     setMenuMessageId(null);
     setMenuAnchor(null);
     setReactPickerId(null);
+    setReactPickerAnchor(null);
     setForwardMessage(null);
     setSearchOpen(false);
     setSearchQuery('');
@@ -1000,6 +1056,7 @@ export function ThreadView() {
     setMediaPage(1);
     setMediaHasMore(false);
     setMediaDownloadingId(null);
+    setChannelTab('messages');
     setHighlightId(null);
     setMessages((current) => {
       current.forEach(revokeAttachmentBlob);
@@ -1064,6 +1121,9 @@ export function ThreadView() {
             );
           }
           clearUnread(id);
+          if (holdAutoSeenRef.current) {
+            return;
+          }
           void api(`/chat/conversations/${id}/seen`, {
             method: 'POST',
             body: JSON.stringify({}),
@@ -1085,6 +1145,9 @@ export function ThreadView() {
         // Scheduled delivery lands as a normal message — refresh pending list.
         if (scheduledMessagesRef.current.length > 0) {
           void loadScheduled();
+        }
+        if (holdAutoSeenRef.current) {
+          return;
         }
         clearUnread(id);
         void api(`/chat/conversations/${id}/seen`, {
@@ -1177,6 +1240,40 @@ export function ThreadView() {
             };
           }),
         );
+      }),
+      subscribe('chat:unseen', (payload) => {
+        const event = payload as SeenResult;
+        if (event.conversationId !== id || !event.userId) {
+          return;
+        }
+        const readAt = new Date(event.lastReadAt).getTime();
+        setMessages((current) =>
+          current.map((message) => {
+            if (!message.seenBy.includes(event.userId)) {
+              return message;
+            }
+            const createdAt = new Date(message.createdAt).getTime();
+            // Cursor rewound before this message → drop their read receipt.
+            if (Number.isFinite(readAt) && createdAt > readAt) {
+              return {
+                ...message,
+                seenBy: message.seenBy.filter((userId) => userId !== event.userId),
+              };
+            }
+            return message;
+          }),
+        );
+        setConversation((current) => {
+          if (!current) return current;
+          return {
+            ...current,
+            members: current.members.map((member) =>
+              member.userId === event.userId
+                ? { ...member, lastReadAt: event.lastReadAt }
+                : member,
+            ),
+          };
+        });
       }),
       subscribe('chat:group_deleted', (payload) => {
         const event = payload as { conversationId: string };
@@ -1288,24 +1385,58 @@ export function ThreadView() {
       setMenuMessageId(null);
       setMenuAnchor(null);
       setReactPickerId(null);
+      setReactPickerAnchor(null);
+      setReactPickerExpanded(false);
+      setReactPickerQuery('');
+      setRemindMenuOpen(false);
+      setRemindCustomOpen(false);
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         closeOverlays();
       }
     };
-    const onScrollOrWheel = () => {
+    const isInsideOverlay = (event: Event) => {
+      const node = event.target;
+      if (!(node instanceof Element)) {
+        return false;
+      }
+      return Boolean(
+        node.closest('.msg-menu') ||
+          node.closest('.msg-menu-btn') ||
+          node.closest('.msg-react-picker') ||
+          node.closest('.reaction-picker'),
+      );
+    };
+    const onPointerDown = (event: Event) => {
+      if (isInsideOverlay(event)) {
+        return;
+      }
       closeOverlays();
     };
+    const onScrollOrWheel = (event: Event) => {
+      // Allow scrolling inside the menu / reaction picker; only dismiss when the thread moves.
+      if (isInsideOverlay(event)) {
+        return;
+      }
+      closeOverlays();
+    };
+
+    // Defer so the same tap that opened the menu (and mobile ghost clicks) don't instantly close it.
+    const attachTimer = window.setTimeout(() => {
+      document.addEventListener('pointerdown', onPointerDown, true);
+      document.addEventListener('scroll', onScrollOrWheel, true);
+      document.addEventListener('wheel', onScrollOrWheel, {
+        passive: true,
+        capture: true,
+      });
+    }, 320);
+
     document.addEventListener('keydown', onKey);
-    // Capture phase so any nested scroll container (or page wheel) closes the menu.
-    document.addEventListener('scroll', onScrollOrWheel, true);
-    document.addEventListener('wheel', onScrollOrWheel, {
-      passive: true,
-      capture: true,
-    });
     window.addEventListener('resize', closeOverlays);
     return () => {
+      window.clearTimeout(attachTimer);
+      document.removeEventListener('pointerdown', onPointerDown, true);
       document.removeEventListener('keydown', onKey);
       document.removeEventListener('scroll', onScrollOrWheel, true);
       document.removeEventListener('wheel', onScrollOrWheel, true);
@@ -1370,6 +1501,66 @@ export function ThreadView() {
     }, 600);
     return () => window.clearTimeout(handle);
   }, [composer, editingMessage, id]);
+
+  const latestIncomingId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i];
+      if (
+        message &&
+        me &&
+        message.senderId !== me &&
+        !message.deletedForEveryone &&
+        message.body?.trim()
+      ) {
+        return message.id;
+      }
+    }
+    return null;
+  }, [messages, me]);
+
+  useEffect(() => {
+    const composerLocked =
+      Boolean(conversation?.blockedMe) ||
+      Boolean(conversation?.blockedByMe) ||
+      announceOnlyLocked;
+    if (!id || !latestIncomingId || editingMessage || composerLocked) {
+      setSmartReplies([]);
+      setSmartRepliesAi(false);
+      return;
+    }
+    let cancelled = false;
+    setSmartRepliesBusy(true);
+    const timer = window.setTimeout(() => {
+      void api<{ replies: string[]; poweredByAi: boolean }>(
+        `/chat/conversations/${id}/smart-replies`,
+      )
+        .then((response) => {
+          if (cancelled) return;
+          setSmartReplies(response.data.replies ?? []);
+          setSmartRepliesAi(Boolean(response.data.poweredByAi));
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setSmartReplies([]);
+            setSmartRepliesAi(false);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setSmartRepliesBusy(false);
+        });
+    }, 350);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    id,
+    latestIncomingId,
+    editingMessage,
+    announceOnlyLocked,
+    conversation?.blockedMe,
+    conversation?.blockedByMe,
+  ]);
 
   useEffect(() => {
     const node = scroller.current;
@@ -2648,9 +2839,54 @@ export function ThreadView() {
     setMenuMessageId(null);
     setMenuAnchor(null);
     setReactPickerId(null);
+    setReactPickerAnchor(null);
     setReactPickerExpanded(false);
     setReactPickerQuery('');
     setRemindMenuOpen(false);
+    setRemindCustomOpen(false);
+  }
+
+  function openReactPicker(messageId: string, alignEnd: boolean) {
+    const row = messageRefs.current.get(messageId);
+    const bubble =
+      (row?.querySelector('.wa-bubble') as HTMLElement | null) ?? row ?? null;
+    if (!bubble) {
+      return;
+    }
+    const rect = bubble.getBoundingClientRect();
+    // Use expanded width so opening "+" doesn't push the panel off-screen.
+    const pickerWidth = Math.min(280, window.innerWidth - 24);
+    const edge = 12;
+    const gap = 8;
+    let left = alignEnd ? rect.right - pickerWidth : rect.left;
+    left = Math.max(edge, Math.min(left, window.innerWidth - pickerWidth - edge));
+    const top = rect.bottom + gap;
+    setMenuMessageId(null);
+    setMenuAnchor(null);
+    setRemindMenuOpen(false);
+    setRemindCustomOpen(false);
+    setReactPickerExpanded(false);
+    setReactPickerQuery('');
+    setReactPickerAnchor({ top, left, alignEnd });
+    setReactPickerId(messageId);
+  }
+
+  function clampReactPickerInViewport() {
+    setReactPickerAnchor((current) => {
+      if (!current) {
+        return current;
+      }
+      const pickerWidth = Math.min(280, window.innerWidth - 24);
+      const edge = 12;
+      const left = Math.max(
+        edge,
+        Math.min(current.left, window.innerWidth - pickerWidth - edge),
+      );
+      if (left === current.left) {
+        return current;
+      }
+      return { ...current, left };
+    });
   }
 
   function reminderAtInOneHour(): string {
@@ -2673,10 +2909,14 @@ export function ThreadView() {
 
   async function createMessageReminder(message: ChatMessage, remindAt: string) {
     try {
-      await api(`/chat/conversations/${id}/messages/${message.id}/remind`, {
-        method: 'POST',
-        body: JSON.stringify({ remindAt }),
-      });
+      await api<MessageReminder>(
+        `/chat/conversations/${id}/messages/${message.id}/remind`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ remindAt }),
+        },
+      );
+      await refreshLater();
       setActionError('');
       setReminderToast(`Reminder set for ${formatScheduleWhen(remindAt)}`);
       window.setTimeout(() => setReminderToast(null), 4000);
@@ -2688,16 +2928,72 @@ export function ThreadView() {
     }
   }
 
+  async function cancelMessageReminder(message: ChatMessage) {
+    const existing = remindersByMessageId[message.id];
+    if (!existing) {
+      return;
+    }
+    try {
+      await api(`/chat/reminders/${existing.id}`, { method: 'DELETE' });
+      await refreshLater();
+      setActionError('');
+      setReminderToast('Reminder cancelled');
+      window.setTimeout(() => setReminderToast(null), 3000);
+      closeMessageOverlays();
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not cancel reminder',
+      );
+    }
+  }
+
+  async function createCustomMessageReminder(message: ChatMessage) {
+    const when = new Date(remindCustomAt);
+    if (Number.isNaN(when.getTime())) {
+      setActionError('Pick a valid date and time');
+      return;
+    }
+    await createMessageReminder(message, when.toISOString());
+  }
+
+  async function markMessageUnread(message: ChatMessage) {
+    if (message.deletedForEveryone) {
+      return;
+    }
+    try {
+      await api(`/chat/conversations/${id}/unread`, {
+        method: 'POST',
+        body: JSON.stringify({ messageId: message.id }),
+      });
+      const unreadFromOthers = messagesRef.current.filter((item) => {
+        if (item.deletedForEveryone) return false;
+        if (me && item.senderId === me) return false;
+        return item.createdAt >= message.createdAt;
+      }).length;
+      holdAutoSeenRef.current = true;
+      setUnread(id, Math.max(1, unreadFromOthers), {
+        firstUnreadMessageId: message.id,
+      });
+      setReminderToast('Marked as unread');
+      window.setTimeout(() => setReminderToast(null), 3000);
+      setActionError('');
+      closeMessageOverlays();
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not mark as unread',
+      );
+    }
+  }
+
   function positionMessageMenu(anchor: HTMLElement, alignEnd: boolean) {
     const rect = anchor.getBoundingClientRect();
     const menuWidth = 220;
     const gap = 8;
-    const spaceBelow = window.innerHeight - rect.bottom - gap;
-    const placeAbove = spaceBelow < 260;
     let left = alignEnd ? rect.right - menuWidth : rect.left;
     left = Math.max(8, Math.min(left, window.innerWidth - menuWidth - 8));
-    const top = placeAbove ? rect.top - gap : rect.bottom + gap;
-    setMenuAnchor({ top, left, placeAbove });
+    // Always open below the message / anchor (same as reaction picker).
+    const top = rect.bottom + gap;
+    setMenuAnchor({ top, left, placeAbove: false });
   }
 
   function toggleMessageMenu(
@@ -2710,7 +3006,9 @@ export function ThreadView() {
       return;
     }
     setReactPickerId(null);
+    setReactPickerAnchor(null);
     setRemindMenuOpen(false);
+    setRemindCustomOpen(false);
     positionMessageMenu(anchor, alignEnd);
     setMenuMessageId(messageId);
   }
@@ -2844,6 +3142,11 @@ export function ThreadView() {
               ) : null}
               {title}
               {conversation.muted ? <span className="mute-pill">Muted</span> : null}
+              {conversation.isShared ? (
+                <span className="connect-pill" title="Shared with external collaborators">
+                  Shared
+                </span>
+              ) : null}
             </h2>
             <p className="muted thread-status">
               <span className={peerOnline || groupOnlineCount > 0 ? 'dot on' : 'dot'} />
@@ -2867,21 +3170,47 @@ export function ThreadView() {
             conversation.type === 'group' ? (
               canJoinOngoing ? (
                 <button
-                  className="ghost thread-tool-btn call join"
+                  className={`ghost thread-tool-btn call join${
+                    ongoingIsHuddle ? ' huddle' : ''
+                  }`}
                   type="button"
-                  aria-label="Join group call"
-                  title="Join call"
+                  aria-label={
+                    ongoingIsHuddle ? 'Join channel huddle' : 'Join group call'
+                  }
+                  title={ongoingIsHuddle ? 'Join huddle' : 'Join call'}
                   onClick={() => void joinCall(conversation.id)}
                 >
-                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-                    <path
-                      fill="currentColor"
-                      d="M6.6 10.8a15.5 15.5 0 0 0 6.6 6.6l2.2-2.2a1.2 1.2 0 0 1 1.2-.3 7.7 7.7 0 0 0 2.4.4 1.2 1.2 0 0 1 1.2 1.2V20a1.2 1.2 0 0 1-1.2 1.2A17.2 17.2 0 0 1 2.8 4 1.2 1.2 0 0 1 4 2.8h3.5A1.2 1.2 0 0 1 8.7 4a7.7 7.7 0 0 0 .4 2.4 1.2 1.2 0 0 1-.3 1.2z"
-                    />
-                  </svg>
+                  {ongoingIsHuddle ? (
+                    <HuddleIcon size={18} />
+                  ) : (
+                    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                      <path
+                        fill="currentColor"
+                        d="M6.6 10.8a15.5 15.5 0 0 0 6.6 6.6l2.2-2.2a1.2 1.2 0 0 1 1.2-.3 7.7 7.7 0 0 0 2.4.4 1.2 1.2 0 0 1 1.2 1.2V20a1.2 1.2 0 0 1-1.2 1.2A17.2 17.2 0 0 1 2.8 4 1.2 1.2 0 0 1 4 2.8h3.5A1.2 1.2 0 0 1 8.7 4a7.7 7.7 0 0 0 .4 2.4 1.2 1.2 0 0 1-.3 1.2z"
+                      />
+                    </svg>
+                  )}
                 </button>
               ) : (
                 <>
+                  <button
+                    className={`ghost thread-tool-btn call huddle${
+                      inThisHuddle ? ' active' : ''
+                    }`}
+                    type="button"
+                    aria-label={
+                      inThisHuddle ? 'In huddle' : 'Start huddle'
+                    }
+                    title={
+                      inThisHuddle
+                        ? 'You are in this huddle'
+                        : 'Huddle — ambient audio, no ringing'
+                    }
+                    disabled={callPhase !== 'idle' || Boolean(ongoingLobby?.active)}
+                    onClick={() => void startHuddle(conversation.id)}
+                  >
+                    <HuddleIcon size={18} />
+                  </button>
                   <button
                     className="ghost thread-tool-btn call"
                     type="button"
@@ -2891,7 +3220,7 @@ export function ThreadView() {
                         : 'Start voice call'
                     }
                     title={conversation.type === 'group' ? 'Group voice call' : 'Voice call'}
-                    disabled={callPhase !== 'idle'}
+                    disabled={callPhase !== 'idle' || Boolean(ongoingLobby?.active)}
                     onClick={() =>
                       void startCall(
                         conversation.id,
@@ -2916,7 +3245,7 @@ export function ThreadView() {
                         : 'Start video call'
                     }
                     title={conversation.type === 'group' ? 'Group video call' : 'Video call'}
-                    disabled={callPhase !== 'idle'}
+                    disabled={callPhase !== 'idle' || Boolean(ongoingLobby?.active)}
                     onClick={() =>
                       void startCall(
                         conversation.id,
@@ -3127,22 +3456,28 @@ export function ThreadView() {
 
       {canJoinOngoing ? (
         <button
-          className="wa-ongoing-call"
+          className={`wa-ongoing-call${ongoingIsHuddle ? ' is-huddle' : ''}`}
           type="button"
           onClick={() => void joinCall(conversation.id)}
           aria-label={
-            ongoingLobby?.media === 'video'
-              ? 'Join ongoing group video call as voice'
-              : 'Join ongoing group voice call'
+            ongoingIsHuddle
+              ? 'Join channel huddle'
+              : ongoingLobby?.media === 'video'
+                ? 'Join ongoing group video call as voice'
+                : 'Join ongoing group voice call'
           }
         >
           <span className="wa-ongoing-call-icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" width="18" height="18">
-              <path
-                fill="currentColor"
-                d="M6.6 10.8a15.5 15.5 0 0 0 6.6 6.6l2.2-2.2a1.2 1.2 0 0 1 1.2-.3 7.7 7.7 0 0 0 2.4.4 1.2 1.2 0 0 1 1.2 1.2V20a1.2 1.2 0 0 1-1.2 1.2A17.2 17.2 0 0 1 2.8 4 1.2 1.2 0 0 1 4 2.8h3.5A1.2 1.2 0 0 1 8.7 4a7.7 7.7 0 0 0 .4 2.4 1.2 1.2 0 0 1-.3 1.2z"
-              />
-            </svg>
+            {ongoingIsHuddle ? (
+              <HuddleIcon size={18} />
+            ) : (
+              <svg viewBox="0 0 24 24" width="18" height="18">
+                <path
+                  fill="currentColor"
+                  d="M6.6 10.8a15.5 15.5 0 0 0 6.6 6.6l2.2-2.2a1.2 1.2 0 0 1 1.2-.3 7.7 7.7 0 0 0 2.4.4 1.2 1.2 0 0 1 1.2 1.2V20a1.2 1.2 0 0 1-1.2 1.2A17.2 17.2 0 0 1 2.8 4 1.2 1.2 0 0 1 4 2.8h3.5A1.2 1.2 0 0 1 8.7 4a7.7 7.7 0 0 0 .4 2.4 1.2 1.2 0 0 1-.3 1.2z"
+                />
+              </svg>
+            )}
             <span className="wa-ongoing-call-pulse" />
           </span>
 
@@ -3170,22 +3505,28 @@ export function ThreadView() {
 
           <span className="wa-ongoing-call-meta">
             <strong>
-              {ongoingLobby?.media === 'video'
-                ? 'Ongoing video call'
-                : 'Ongoing voice call'}
+              {ongoingIsHuddle
+                ? 'Huddle live'
+                : ongoingLobby?.media === 'video'
+                  ? 'Ongoing video call'
+                  : 'Ongoing voice call'}
             </strong>
             <span>
               {ongoingLobby?.joinedIds.length ?? 0}{' '}
               {(ongoingLobby?.joinedIds.length ?? 0) === 1
-                ? 'participant'
-                : 'participants'}
-              {ongoingLobby?.media === 'video'
-                ? ' · Tap to join (voice)'
-                : ' · Tap to join'}
+                ? 'person'
+                : 'people'}
+              {ongoingIsHuddle
+                ? ' · Hop in anytime'
+                : ongoingLobby?.media === 'video'
+                  ? ' · Tap to join (voice)'
+                  : ' · Tap to join'}
             </span>
           </span>
 
-          <span className="wa-ongoing-call-join">Join</span>
+          <span className="wa-ongoing-call-join">
+            {ongoingIsHuddle ? 'Join huddle' : 'Join'}
+          </span>
         </button>
       ) : null}
 
@@ -3379,6 +3720,32 @@ export function ThreadView() {
         </p>
       ) : null}
 
+      {conversation.type === 'group' ? (
+        <ChannelTabs
+          conversationId={conversation.id}
+          conversation={conversation}
+          activeTab={channelTab}
+          onTabChange={(tab) => {
+            setChannelTab(tab);
+            setSearchOpen(false);
+            setToolsMenuOpen(false);
+            setMediaOpen(false);
+          }}
+          onOpenFiles={() => {
+            setChannelTab('messages');
+            openMedia('all');
+          }}
+          onOpenPins={() => {
+            setChannelTab('messages');
+            if (pinnedMessages.length > 0) {
+              setPinnedBannerOpen(true);
+            }
+          }}
+        />
+      ) : null}
+
+      {conversation.type !== 'group' || channelTab === 'messages' ? (
+        <>
       {conversation.type === 'group' && (conversation.bookmarks?.length ?? 0) > 0 ? (
         <div className="channel-bookmarks-bar" aria-label="Channel bookmarks">
           {conversation.bookmarks?.map((bookmark) => (
@@ -3524,6 +3891,7 @@ export function ThreadView() {
                   if (anchor) {
                     positionMessageMenu(anchor, mine);
                     setReactPickerId(null);
+                    setReactPickerAnchor(null);
                     setMenuMessageId(message.id);
                   }
                   if (navigator.vibrate) {
@@ -3591,6 +3959,7 @@ export function ThreadView() {
                   const anchor = btn ?? (event.currentTarget as HTMLElement);
                   positionMessageMenu(anchor, mine);
                   setReactPickerId(null);
+                  setReactPickerAnchor(null);
                   setMenuMessageId(message.id);
                 }}
               >
@@ -3941,127 +4310,6 @@ export function ThreadView() {
                     />
                   ) : null}
                 </span>
-                {reactPickerId === message.id ? (
-                  <div
-                    className={`reaction-picker${
-                      reactPickerExpanded ? ' reaction-picker-expanded' : ''
-                    }`}
-                    data-msg-actions={message.id}
-                    onMouseDown={(event) => event.stopPropagation()}
-                  >
-                    <div className="reaction-picker-quick">
-                      {QUICK_REACTIONS.map((emoji) => (
-                        <button
-                          key={emoji}
-                          type="button"
-                          onClick={() => void toggleReaction(message, emoji)}
-                        >
-                          {emoji}
-                        </button>
-                      ))}
-                      <button
-                        type="button"
-                        className="reaction-picker-more"
-                        aria-expanded={reactPickerExpanded}
-                        aria-label={
-                          reactPickerExpanded
-                            ? 'Hide more reactions'
-                            : 'Show more reactions'
-                        }
-                        onClick={() =>
-                          setReactPickerExpanded((open) => !open)
-                        }
-                      >
-                        {reactPickerExpanded ? '▴' : '+'}
-                      </button>
-                    </div>
-                    {reactPickerExpanded ? (
-                      <div className="reaction-picker-panel">
-                        <input
-                          className="reaction-picker-search"
-                          type="search"
-                          value={reactPickerQuery}
-                          placeholder="Search emoji"
-                          aria-label="Search emoji"
-                          onChange={(event) =>
-                            setReactPickerQuery(event.target.value)
-                          }
-                        />
-                        {workspace.customEmojis.length > 0 ? (
-                          <div className="reaction-picker-section">
-                            <p className="reaction-picker-label">Custom</p>
-                            <div className="reaction-picker-grid">
-                              {workspace.customEmojis
-                                .filter((row) => {
-                                  const q = reactPickerQuery.trim().toLowerCase();
-                                  if (!q) {
-                                    return true;
-                                  }
-                                  return (
-                                    row.shortcode.includes(q) ||
-                                    (row.emoji ?? '').includes(
-                                      reactPickerQuery.trim(),
-                                    )
-                                  );
-                                })
-                                .map((row) => (
-                                  <button
-                                    key={row.shortcode}
-                                    type="button"
-                                    title={`:${row.shortcode}:`}
-                                    onClick={() =>
-                                      void toggleReaction(
-                                        message,
-                                        row.emoji || `:${row.shortcode}:`,
-                                      )
-                                    }
-                                  >
-                                    {row.imageUrl ? (
-                                      <img
-                                        src={row.imageUrl}
-                                        alt={`:${row.shortcode}:`}
-                                        width={22}
-                                        height={22}
-                                      />
-                                    ) : (
-                                      row.emoji
-                                    )}
-                                  </button>
-                                ))}
-                            </div>
-                          </div>
-                        ) : null}
-                        <div className="reaction-picker-section">
-                          <p className="reaction-picker-label">All</p>
-                          <div className="reaction-picker-grid">
-                            {[...QUICK_REACTIONS, ...MORE_REACTIONS]
-                              .filter((emoji, index, all) => {
-                                if (all.indexOf(emoji) !== index) {
-                                  return false;
-                                }
-                                const q = reactPickerQuery.trim().toLowerCase();
-                                if (!q) {
-                                  return true;
-                                }
-                                return emoji.includes(reactPickerQuery.trim());
-                              })
-                              .map((emoji) => (
-                                <button
-                                  key={emoji}
-                                  type="button"
-                                  onClick={() =>
-                                    void toggleReaction(message, emoji)
-                                  }
-                                >
-                                  {emoji}
-                                </button>
-                              ))}
-                          </div>
-                        </div>
-                      </div>
-                    ) : null}
-                  </div>
-                ) : null}
               </div>
               {!pending &&
               !message.deletedForEveryone &&
@@ -4128,41 +4376,25 @@ export function ThreadView() {
 
       {menuMessageId && menuAnchor
         ? createPortal(
-            <>
-              <button
-                type="button"
-                className="msg-overlay-scrim"
-                aria-label="Close message menu"
-                onMouseDown={(event) => {
-                  event.preventDefault();
-                  closeMessageOverlays();
-                }}
-              />
-              {(() => {
-                const message = messages.find((item) => item.id === menuMessageId);
-                if (!message) return null;
-                const mine = message.senderId === me;
-                return (
+            (() => {
+              const message = messages.find((item) => item.id === menuMessageId);
+              if (!message) return null;
+              const mine = message.senderId === me;
+              return (
                   <div
                     className={`msg-menu msg-menu-fixed${
                       menuAnchor.placeAbove ? ' place-above' : ''
                     }`}
                     style={{ top: menuAnchor.top, left: menuAnchor.left }}
                     role="menu"
-                    onMouseDown={(event) => event.stopPropagation()}
+                    onPointerDown={(event) => event.stopPropagation()}
                   >
                     {!message.deletedForEveryone ? (
                       <>
                         <button
                           type="button"
                           role="menuitem"
-                          onClick={() => {
-                            setReactPickerExpanded(false);
-                            setReactPickerQuery('');
-                            setReactPickerId(message.id);
-                            setMenuMessageId(null);
-                            setMenuAnchor(null);
-                          }}
+                          onClick={() => openReactPicker(message.id, mine)}
                         >
                           <MsgMenuIcon path={MSG_MENU_ICONS.react} />
                           React
@@ -4232,55 +4464,162 @@ export function ThreadView() {
                           <MsgMenuIcon path={MSG_MENU_ICONS.save} />
                           {bookmarkedIds.has(message.id) ? 'Unsave' : 'Save'}
                         </button>
-                        {!remindMenuOpen ? (
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => void markMessageUnread(message)}
+                        >
+                          <MsgMenuIcon path={MSG_MENU_ICONS.unread} />
+                          Mark unread
+                        </button>
+                        <div className="msg-menu-item-has-sub">
                           <button
                             type="button"
                             role="menuitem"
-                            onClick={() => setRemindMenuOpen(true)}
+                            aria-expanded={remindMenuOpen}
+                            className={remindMenuOpen ? 'is-active' : undefined}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setRemindCustomOpen(false);
+                              setRemindMenuOpen((open) => {
+                                const next = !open;
+                                if (next) {
+                                  void refreshLater();
+                                }
+                                return next;
+                              });
+                            }}
                           >
                             <MsgMenuIcon path={MSG_MENU_ICONS.remind} />
-                            Remind me
+                            <span className="msg-menu-label">Remind me</span>
+                            <span
+                              className={`msg-menu-chevron${
+                                remindMenuOpen ? ' is-open' : ''
+                              }`}
+                              aria-hidden="true"
+                            >
+                              ▾
+                            </span>
                           </button>
-                        ) : (
-                          <>
-                            <button
-                              type="button"
-                              role="menuitem"
-                              onClick={() =>
-                                void createMessageReminder(
-                                  message,
-                                  reminderAtInOneHour(),
-                                )
-                              }
-                            >
-                              In 1 hour
-                            </button>
-                            <button
-                              type="button"
-                              role="menuitem"
-                              onClick={() =>
-                                void createMessageReminder(
-                                  message,
-                                  reminderAtTomorrow9am(),
-                                )
-                              }
-                            >
-                              Tomorrow 9am
-                            </button>
-                            <button
-                              type="button"
-                              role="menuitem"
-                              onClick={() =>
-                                void createMessageReminder(
-                                  message,
-                                  reminderAtIn3Days(),
-                                )
-                              }
-                            >
-                              In 3 days
-                            </button>
-                          </>
-                        )}
+                          {remindMenuOpen ? (
+                            <div className="msg-remind-nested" role="group">
+                              {remindersByMessageId[message.id] ? (
+                                <>
+                                  <div className="msg-remind-current">
+                                    Reminder set for{' '}
+                                    {formatScheduleWhen(
+                                      remindersByMessageId[message.id].remindAt,
+                                    )}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    role="menuitem"
+                                    className="msg-remind-nested-item msg-remind-cancel"
+                                    onClick={() =>
+                                      void cancelMessageReminder(message)
+                                    }
+                                  >
+                                    <span
+                                      className="msg-remind-nested-dot"
+                                      aria-hidden="true"
+                                    />
+                                    Cancel reminder
+                                  </button>
+                                  <div className="msg-menu-sep" role="separator" />
+                                  <p className="msg-remind-reschedule-label">
+                                    Reschedule
+                                  </p>
+                                </>
+                              ) : null}
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className="msg-remind-nested-item"
+                                onClick={() =>
+                                  void createMessageReminder(
+                                    message,
+                                    reminderAtInOneHour(),
+                                  )
+                                }
+                              >
+                                <span className="msg-remind-nested-dot" aria-hidden="true" />
+                                In 1 hour
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className="msg-remind-nested-item"
+                                onClick={() =>
+                                  void createMessageReminder(
+                                    message,
+                                    reminderAtTomorrow9am(),
+                                  )
+                                }
+                              >
+                                <span className="msg-remind-nested-dot" aria-hidden="true" />
+                                Tomorrow 9am
+                              </button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                className="msg-remind-nested-item"
+                                onClick={() =>
+                                  void createMessageReminder(
+                                    message,
+                                    reminderAtIn3Days(),
+                                  )
+                                }
+                              >
+                                <span className="msg-remind-nested-dot" aria-hidden="true" />
+                                In 3 days
+                              </button>
+                              {!remindCustomOpen ? (
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  className="msg-remind-nested-item"
+                                  onClick={() => {
+                                    setRemindCustomAt(
+                                      toDatetimeLocalValue(
+                                        new Date(Date.now() + 60 * 60 * 1000),
+                                      ),
+                                    );
+                                    setRemindCustomOpen(true);
+                                  }}
+                                >
+                                  <span className="msg-remind-nested-dot" aria-hidden="true" />
+                                  Pick date &amp; time…
+                                </button>
+                              ) : (
+                                <div className="msg-remind-custom msg-remind-nested-custom">
+                                  <label>
+                                    Custom reminder
+                                    <input
+                                      type="datetime-local"
+                                      value={remindCustomAt}
+                                      min={toDatetimeLocalValue(
+                                        new Date(Date.now() + 60_000),
+                                      )}
+                                      onChange={(event) =>
+                                        setRemindCustomAt(event.target.value)
+                                      }
+                                      onClick={(event) => event.stopPropagation()}
+                                    />
+                                  </label>
+                                  <button
+                                    type="button"
+                                    className="msg-remind-custom-set"
+                                    onClick={() =>
+                                      void createCustomMessageReminder(message)
+                                    }
+                                  >
+                                    Set reminder
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          ) : null}
+                        </div>
                         <div className="msg-menu-sep" role="separator" />
                       </>
                     ) : null}
@@ -4304,24 +4643,152 @@ export function ThreadView() {
                       </button>
                     ) : null}
                   </div>
-                );
-              })()}
-            </>,
+              );
+            })(),
             document.body,
           )
         : null}
 
-      {reactPickerId && !menuMessageId
+      {reactPickerId && reactPickerAnchor
         ? createPortal(
-            <button
-              type="button"
-              className="msg-overlay-scrim"
-              aria-label="Close reactions"
-              onMouseDown={(event) => {
-                event.preventDefault();
-                closeMessageOverlays();
-              }}
-            />,
+            (() => {
+              const message = messages.find((item) => item.id === reactPickerId);
+              if (!message) return null;
+              return (
+                <div
+                  className={`reaction-picker reaction-picker-fixed${
+                    reactPickerExpanded ? ' reaction-picker-expanded' : ''
+                  }${reactPickerAnchor.alignEnd ? ' align-end' : ''}`}
+                  style={{
+                    top: reactPickerAnchor.top,
+                    left: reactPickerAnchor.left,
+                  }}
+                  data-msg-actions={message.id}
+                  onPointerDown={(event) => event.stopPropagation()}
+                >
+                  <div className="reaction-picker-quick">
+                    {QUICK_REACTIONS.map((emoji) => (
+                      <button
+                        key={emoji}
+                        type="button"
+                        onClick={() => void toggleReaction(message, emoji)}
+                      >
+                        {emoji}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      className="reaction-picker-more"
+                      aria-expanded={reactPickerExpanded}
+                      aria-label={
+                        reactPickerExpanded
+                          ? 'Hide more reactions'
+                          : 'Show more reactions'
+                      }
+                      onClick={() => {
+                        setReactPickerExpanded((open) => {
+                          const next = !open;
+                          if (next) {
+                            // Defer so layout uses expanded width before clamping.
+                            window.requestAnimationFrame(() => {
+                              clampReactPickerInViewport();
+                            });
+                          }
+                          return next;
+                        });
+                      }}
+                    >
+                      {reactPickerExpanded ? '▾' : '+'}
+                    </button>
+                  </div>
+                  {reactPickerExpanded ? (
+                    <div className="reaction-picker-panel">
+                      <input
+                        className="reaction-picker-search"
+                        type="search"
+                        value={reactPickerQuery}
+                        placeholder="Search emoji"
+                        aria-label="Search emoji"
+                        onChange={(event) =>
+                          setReactPickerQuery(event.target.value)
+                        }
+                      />
+                      {workspace.customEmojis.length > 0 ? (
+                        <div className="reaction-picker-section">
+                          <p className="reaction-picker-label">Custom</p>
+                          <div className="reaction-picker-grid">
+                            {workspace.customEmojis
+                              .filter((row) => {
+                                const q = reactPickerQuery.trim().toLowerCase();
+                                if (!q) {
+                                  return true;
+                                }
+                                return (
+                                  row.shortcode.includes(q) ||
+                                  (row.emoji ?? '').includes(
+                                    reactPickerQuery.trim(),
+                                  )
+                                );
+                              })
+                              .map((row) => (
+                                <button
+                                  key={row.shortcode}
+                                  type="button"
+                                  title={`:${row.shortcode}:`}
+                                  onClick={() =>
+                                    void toggleReaction(
+                                      message,
+                                      row.emoji || `:${row.shortcode}:`,
+                                    )
+                                  }
+                                >
+                                  {row.imageUrl ? (
+                                    <img
+                                      src={row.imageUrl}
+                                      alt={`:${row.shortcode}:`}
+                                      width={22}
+                                      height={22}
+                                    />
+                                  ) : (
+                                    row.emoji
+                                  )}
+                                </button>
+                              ))}
+                          </div>
+                        </div>
+                      ) : null}
+                      <div className="reaction-picker-section">
+                        <p className="reaction-picker-label">All</p>
+                        <div className="reaction-picker-grid">
+                          {[...QUICK_REACTIONS, ...MORE_REACTIONS]
+                            .filter((emoji, index, all) => {
+                              if (all.indexOf(emoji) !== index) {
+                                return false;
+                              }
+                              const q = reactPickerQuery.trim().toLowerCase();
+                              if (!q) {
+                                return true;
+                              }
+                              return emoji.includes(reactPickerQuery.trim());
+                            })
+                            .map((emoji) => (
+                              <button
+                                key={emoji}
+                                type="button"
+                                onClick={() =>
+                                  void toggleReaction(message, emoji)
+                                }
+                              >
+                                {emoji}
+                              </button>
+                            ))}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })(),
             document.body,
           )
         : null}
@@ -4633,6 +5100,38 @@ export function ThreadView() {
                 }
               }}
             />
+            {!editingMessage &&
+            !composer.trim() &&
+            voicePhase === 'idle' &&
+            (smartRepliesBusy || smartReplies.length > 0) ? (
+              <div className="smart-replies" aria-label="Suggested replies">
+                {smartRepliesBusy && smartReplies.length === 0 ? (
+                  <span className="smart-replies-hint muted">Suggesting replies…</span>
+                ) : (
+                  <>
+                    <span className="smart-replies-label">
+                      {smartRepliesAi ? 'AI suggestions' : 'Quick replies'}
+                    </span>
+                    {smartReplies.map((reply) => (
+                      <button
+                        key={reply}
+                        type="button"
+                        className="smart-reply-chip"
+                        onClick={() => {
+                          setComposer(reply);
+                          window.setTimeout(
+                            () => composerInputRef.current?.focus(),
+                            20,
+                          );
+                        }}
+                      >
+                        {reply}
+                      </button>
+                    ))}
+                  </>
+                )}
+              </div>
+            ) : null}
             <div className="composer-shell">
               {!editingMessage ? (
                 <div className="composer-attach-wrap" ref={attachMenuRef}>
@@ -4833,6 +5332,8 @@ export function ThreadView() {
         )}
       </form>
       )}
+        </>
+      ) : null}
 
       <Modal
         open={Boolean(activeThreadRoot)}

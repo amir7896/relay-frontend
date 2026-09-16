@@ -13,7 +13,18 @@ import {
   otherMember,
 } from '../../lib/format';
 import { useDirectory } from '../../people/useDirectory';
-import type { ChannelInvite, Conversation, IncomingWebhook } from '../../api/types';
+import {
+  loadChannelNotificationMode,
+  saveChannelNotificationMode,
+  type ChannelNotifyMode,
+} from '../../lib/notifications';
+import type {
+  ChannelInvite,
+  Conversation,
+  IncomingWebhook,
+  OutgoingWebhook,
+  Paginated,
+} from '../../api/types';
 import type { MessengerOutletContext } from './MessengerPage';
 
 const DISAPPEARING_OPTIONS: Array<{ value: number; label: string }> = [
@@ -70,12 +81,27 @@ export function ConversationDetailsPage() {
   const [channelInviteUrl, setChannelInviteUrl] = useState('');
   const [inviteCopyHint, setInviteCopyHint] = useState('');
   const [inviteBusy, setInviteBusy] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState('');
+  const [inviteEmailBusy, setInviteEmailBusy] = useState(false);
+  const [inviteEmailHint, setInviteEmailHint] = useState('');
   const [webhooks, setWebhooks] = useState<IncomingWebhook[]>([]);
+  const [outgoingWebhooks, setOutgoingWebhooks] = useState<OutgoingWebhook[]>(
+    [],
+  );
   const [webhookName, setWebhookName] = useState('');
   const [webhookUsername, setWebhookUsername] = useState('');
   const [webhookBusy, setWebhookBusy] = useState(false);
   const [createdWebhookUrl, setCreatedWebhookUrl] = useState('');
   const [webhookCopyHint, setWebhookCopyHint] = useState('');
+  const [outgoingName, setOutgoingName] = useState('');
+  const [outgoingUrl, setOutgoingUrl] = useState('');
+  const [outgoingExcludeBots, setOutgoingExcludeBots] = useState(true);
+  const [outgoingBusy, setOutgoingBusy] = useState(false);
+  const [createdOutgoingSecret, setCreatedOutgoingSecret] = useState('');
+  const [outgoingSecretHint, setOutgoingSecretHint] = useState('');
+  const [channelNotifyMode, setChannelNotifyMode] =
+    useState<ChannelNotifyMode>('default');
+  const [channelNotifyBusy, setChannelNotifyBusy] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -88,20 +114,29 @@ export function ConversationDetailsPage() {
       setTopicDraft(next.topic ?? '');
       setDescriptionDraft(next.description ?? '');
       await ensureProfiles(next.members.map((member) => member.userId));
+      void loadChannelNotificationMode(id).then(setChannelNotifyMode);
       const myMembership = next.members.find((member) => member.userId === me);
       const canManageHooks =
         myMembership?.role === 'owner' || myMembership?.role === 'admin';
       if (next.type === 'group' && canManageHooks) {
         try {
-          const hooks = await api<IncomingWebhook[]>(
-            `/chat/conversations/${id}/incoming-webhooks`,
-          );
-          setWebhooks(hooks.data);
+          const [hooks, outgoing] = await Promise.all([
+            api<Paginated<IncomingWebhook>>(
+              `/chat/conversations/${id}/incoming-webhooks?page=1&limit=50`,
+            ),
+            api<Paginated<OutgoingWebhook>>(
+              `/chat/conversations/${id}/outgoing-webhooks?page=1&limit=50`,
+            ),
+          ]);
+          setWebhooks(hooks.data.items ?? []);
+          setOutgoingWebhooks(outgoing.data.items ?? []);
         } catch {
           setWebhooks([]);
+          setOutgoingWebhooks([]);
         }
       } else {
         setWebhooks([]);
+        setOutgoingWebhooks([]);
       }
     } catch (err) {
       setConversation(null);
@@ -120,10 +155,17 @@ export function ConversationDetailsPage() {
     setBookmarkError('');
     setChannelInviteUrl('');
     setInviteCopyHint('');
+    setInviteEmail('');
+    setInviteEmailHint('');
     setCreatedWebhookUrl('');
     setWebhookCopyHint('');
     setWebhookName('');
     setWebhookUsername('');
+    setOutgoingName('');
+    setOutgoingUrl('');
+    setOutgoingExcludeBots(true);
+    setCreatedOutgoingSecret('');
+    setOutgoingSecretHint('');
     setBookmarkTitle('');
     setBookmarkUrl('');
     void load();
@@ -304,6 +346,7 @@ export function ConversationDetailsPage() {
         ? path
         : `${window.location.origin}${path.startsWith('/') ? path : `/${path}`}`;
       setChannelInviteUrl(url);
+      setInviteCopyHint('Link ready — anyone already in this workspace can join with it.');
     } catch (err) {
       setActionError(
         err instanceof Error ? err.message : 'Could not create invite link',
@@ -316,7 +359,66 @@ export function ConversationDetailsPage() {
   async function copyChannelInviteLink() {
     if (!channelInviteUrl) return;
     const ok = await copyText(channelInviteUrl);
-    setInviteCopyHint(ok ? 'Link copied to clipboard' : 'Could not copy — select the URL and copy manually');
+    setInviteCopyHint(
+      ok
+        ? 'Link copied to clipboard'
+        : 'Could not copy — select the URL and copy manually',
+    );
+  }
+
+  async function sendChannelInviteEmail(event: FormEvent) {
+    event.preventDefault();
+    const email = inviteEmail.trim().toLowerCase();
+    setActionError('');
+    setInviteEmailHint('');
+    if (!email || !email.includes('@')) {
+      setActionError('Enter a valid email address');
+      return;
+    }
+    setInviteEmailBusy(true);
+    try {
+      const response = await api<{
+        mode: 'added' | 'invited';
+        email: string;
+        emailSent?: boolean;
+        inviteUrl?: string;
+        debugInviteUrl?: string;
+        workspaceInviteUrl?: string | null;
+      }>(`/chat/conversations/${id}/invites/email`, {
+        method: 'POST',
+        body: JSON.stringify({ email, expiresInHours: 168 }),
+      });
+      const link =
+        response.data.debugInviteUrl ||
+        response.data.inviteUrl ||
+        '';
+      if (link) {
+        setChannelInviteUrl(link);
+      }
+      if (response.data.mode === 'added') {
+        setInviteEmailHint(
+          response.data.emailSent
+            ? `${email} was added to the channel and emailed.`
+            : `${email} was added to the channel (email not sent — SMTP may be unset).`,
+        );
+        setInviteEmail('');
+        await load();
+        await refreshInbox();
+      } else {
+        setInviteEmailHint(
+          response.data.emailSent
+            ? `Invite emailed to ${email}. When they accept, they join the workspace and this channel.`
+            : `Invite created for ${email}. Email was not delivered — copy the link below (configure SMTP to send mail). When they accept, they join the workspace and this channel.`,
+        );
+        setInviteEmail('');
+      }
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not send channel invite',
+      );
+    } finally {
+      setInviteEmailBusy(false);
+    }
   }
 
   async function createIncomingWebhook(event: FormEvent) {
@@ -350,10 +452,10 @@ export function ConversationDetailsPage() {
       setWebhookName('');
       setWebhookUsername('');
       flashSaved('Incoming webhook created');
-      const list = await api<IncomingWebhook[]>(
-        `/chat/conversations/${id}/incoming-webhooks`,
+      const list = await api<Paginated<IncomingWebhook>>(
+        `/chat/conversations/${id}/incoming-webhooks?page=1&limit=50`,
       );
-      setWebhooks(list.data);
+      setWebhooks(list.data.items ?? []);
     } catch (err) {
       setActionError(
         err instanceof Error ? err.message : 'Could not create webhook',
@@ -394,6 +496,89 @@ export function ConversationDetailsPage() {
     } catch (err) {
       setActionError(
         err instanceof Error ? err.message : 'Could not revoke webhook',
+      );
+    }
+  }
+
+  async function createOutgoingWebhook(event: FormEvent) {
+    event.preventDefault();
+    const name = outgoingName.trim();
+    const targetUrl = outgoingUrl.trim();
+    setActionError('');
+    setOutgoingSecretHint('');
+    if (!name) {
+      setActionError('Outgoing webhook name is required');
+      return;
+    }
+    if (!/^https:\/\//i.test(targetUrl)) {
+      setActionError('Target URL must start with https://');
+      return;
+    }
+    setOutgoingBusy(true);
+    try {
+      const response = await api<OutgoingWebhook>(
+        `/chat/conversations/${id}/outgoing-webhooks`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            name,
+            targetUrl,
+            excludeBots: outgoingExcludeBots,
+          }),
+        },
+      );
+      setCreatedOutgoingSecret(response.data.signingSecret ?? '');
+      setOutgoingName('');
+      setOutgoingUrl('');
+      flashSaved('Outgoing webhook created');
+      const list = await api<Paginated<OutgoingWebhook>>(
+        `/chat/conversations/${id}/outgoing-webhooks?page=1&limit=50`,
+      );
+      setOutgoingWebhooks(list.data.items ?? []);
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not create outgoing webhook',
+      );
+    } finally {
+      setOutgoingBusy(false);
+    }
+  }
+
+  async function copyOutgoingSecret() {
+    if (!createdOutgoingSecret) return;
+    const ok = await copyText(createdOutgoingSecret);
+    setOutgoingSecretHint(
+      ok
+        ? 'Signing secret copied — store it securely; it is shown only once'
+        : 'Could not copy',
+    );
+  }
+
+  async function revokeOutgoingWebhook(webhookId: string) {
+    const ok = await confirmDialog({
+      title: 'Revoke outgoing webhook?',
+      message: 'Relay will stop POSTing channel messages to this URL.',
+      confirmLabel: 'Revoke',
+      danger: true,
+    });
+    if (!ok) return;
+    setActionError('');
+    try {
+      await api(`/chat/conversations/${id}/outgoing-webhooks/${webhookId}`, {
+        method: 'DELETE',
+      });
+      setOutgoingWebhooks((prev) =>
+        prev.map((hook) =>
+          hook.id === webhookId
+            ? { ...hook, revokedAt: new Date().toISOString() }
+            : hook,
+        ),
+      );
+    } catch (err) {
+      setActionError(
+        err instanceof Error
+          ? err.message
+          : 'Could not revoke outgoing webhook',
       );
     }
   }
@@ -450,6 +635,25 @@ export function ConversationDetailsPage() {
       void refreshInbox();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not update mute');
+    }
+  }
+
+  async function updateChannelNotifyMode(mode: ChannelNotifyMode) {
+    if (!id) return;
+    setChannelNotifyBusy(true);
+    setActionError('');
+    try {
+      const saved = await saveChannelNotificationMode(id, mode);
+      setChannelNotifyMode(saved);
+      flashSaved('Notification preference updated');
+    } catch (err) {
+      setActionError(
+        err instanceof Error
+          ? err.message
+          : 'Could not update channel notifications',
+      );
+    } finally {
+      setChannelNotifyBusy(false);
     }
   }
 
@@ -701,6 +905,23 @@ export function ConversationDetailsPage() {
                   {conversation.muted ? 'Unmute conversation' : 'Mute conversation'}
                 </button>
                 <label className="disappearing-field">
+                  <span>Notifications</span>
+                  <select
+                    value={channelNotifyMode}
+                    disabled={channelNotifyBusy}
+                    onChange={(event) =>
+                      void updateChannelNotifyMode(
+                        event.target.value as ChannelNotifyMode,
+                      )
+                    }
+                  >
+                    <option value="default">Default (workspace setting)</option>
+                    <option value="all">All messages</option>
+                    <option value="mentions">Mentions &amp; keywords</option>
+                    <option value="none">Nothing (keywords still alert)</option>
+                  </select>
+                </label>
+                <label className="disappearing-field">
                   <span>Disappearing messages</span>
                   <select
                     value={conversation.disappearingDurationSeconds ?? 0}
@@ -865,6 +1086,23 @@ export function ConversationDetailsPage() {
                 <button className="ghost full" type="button" onClick={() => void toggleMute()}>
                   {conversation.muted ? 'Unmute conversation' : 'Mute conversation'}
                 </button>
+                <label className="disappearing-field">
+                  <span>Notifications</span>
+                  <select
+                    value={channelNotifyMode}
+                    disabled={channelNotifyBusy}
+                    onChange={(event) =>
+                      void updateChannelNotifyMode(
+                        event.target.value as ChannelNotifyMode,
+                      )
+                    }
+                  >
+                    <option value="default">Default (workspace setting)</option>
+                    <option value="all">All messages</option>
+                    <option value="mentions">Mentions &amp; keywords</option>
+                    <option value="none">Nothing (keywords still alert)</option>
+                  </select>
+                </label>
                 {canManage ? (
                   <label className="disappearing-field">
                     <span>Disappearing messages</span>
@@ -1056,34 +1294,74 @@ export function ConversationDetailsPage() {
                       Announcement only
                     </span>
                   </label>
-                  <div className="modal-actions">
-                    <button
-                      className="ghost full"
-                      type="button"
-                      disabled={inviteBusy}
-                      onClick={() => void createChannelInvite()}
-                    >
-                      {inviteBusy ? 'Creating invite…' : 'Create invite link'}
-                    </button>
-                  </div>
-                  {channelInviteUrl ? (
-                    <label className="disappearing-field">
-                      <span>Invite URL</span>
-                      <input
-                        readOnly
-                        value={channelInviteUrl}
-                        onFocus={(event) => event.currentTarget.select()}
-                      />
+                  <div className="channel-invite-panel">
+                    <p className="muted" style={{ marginBottom: 4 }}>
+                      Invite people outside this workspace
+                    </p>
+                    <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
+                      Email someone who is not in the workspace yet. They join the
+                      workspace and this channel automatically (Slack-style). To add
+                      someone already in the workspace, use Add people below.
+                    </p>
+                    <div className="modal-actions">
                       <button
-                        className="ghost"
+                        className="ghost full"
                         type="button"
-                        onClick={() => void copyChannelInviteLink()}
+                        disabled={inviteBusy}
+                        onClick={() => void createChannelInvite()}
                       >
-                        Copy link
+                        {inviteBusy ? 'Creating link…' : 'Create channel invite link'}
                       </button>
-                      {inviteCopyHint ? <p className="muted">{inviteCopyHint}</p> : null}
-                    </label>
-                  ) : null}
+                    </div>
+                    {channelInviteUrl ? (
+                      <label className="disappearing-field invite-url-field">
+                        <span>Invite link</span>
+                        <textarea
+                          readOnly
+                          rows={3}
+                          className="invite-url-textarea"
+                          value={channelInviteUrl}
+                          onFocus={(event) => event.currentTarget.select()}
+                        />
+                        <button
+                          className="btn full"
+                          type="button"
+                          onClick={() => void copyChannelInviteLink()}
+                        >
+                          Copy link
+                        </button>
+                        {inviteCopyHint ? (
+                          <p className="muted">{inviteCopyHint}</p>
+                        ) : null}
+                      </label>
+                    ) : null}
+                    <form
+                      className="invite-form"
+                      onSubmit={(event) => void sendChannelInviteEmail(event)}
+                    >
+                      <label>
+                        Invite by email
+                        <input
+                          type="email"
+                          value={inviteEmail}
+                          placeholder="teammate@company.com"
+                          autoComplete="email"
+                          onChange={(event) => setInviteEmail(event.target.value)}
+                          required
+                        />
+                      </label>
+                      <button
+                        className="btn full"
+                        type="submit"
+                        disabled={inviteEmailBusy}
+                      >
+                        {inviteEmailBusy ? 'Sending…' : 'Send invite'}
+                      </button>
+                    </form>
+                    {inviteEmailHint ? (
+                      <p className="muted">{inviteEmailHint}</p>
+                    ) : null}
+                  </div>
                   <div className="incoming-webhooks-panel">
                     <p className="muted" style={{ marginBottom: 8 }}>
                       Incoming webhooks
@@ -1171,12 +1449,119 @@ export function ConversationDetailsPage() {
                       </ul>
                     ) : null}
                   </div>
+                  <div className="incoming-webhooks-panel">
+                    <p className="muted" style={{ marginBottom: 8 }}>
+                      Outgoing webhooks
+                    </p>
+                    <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
+                      Relay POSTs signed <code>message.created</code> events to your HTTPS
+                      URL when people chat here.
+                    </p>
+                    <form
+                      className="modal-form"
+                      onSubmit={(event) => void createOutgoingWebhook(event)}
+                    >
+                      <label>
+                        Name
+                        <input
+                          value={outgoingName}
+                          maxLength={80}
+                          placeholder="Ops bridge"
+                          onChange={(event) => setOutgoingName(event.target.value)}
+                          required
+                        />
+                      </label>
+                      <label>
+                        Target URL
+                        <input
+                          value={outgoingUrl}
+                          maxLength={500}
+                          placeholder="https://example.com/hooks/relay"
+                          onChange={(event) => setOutgoingUrl(event.target.value)}
+                          required
+                        />
+                      </label>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={outgoingExcludeBots}
+                          onChange={(event) =>
+                            setOutgoingExcludeBots(event.target.checked)
+                          }
+                        />{' '}
+                        Skip bot / incoming-webhook messages
+                      </label>
+                      <button className="btn full" type="submit" disabled={outgoingBusy}>
+                        {outgoingBusy ? 'Creating…' : 'Create outgoing webhook'}
+                      </button>
+                    </form>
+                    {createdOutgoingSecret ? (
+                      <label className="disappearing-field">
+                        <span>Signing secret (shown once)</span>
+                        <input
+                          readOnly
+                          value={createdOutgoingSecret}
+                          onFocus={(event) => event.currentTarget.select()}
+                        />
+                        <button
+                          className="ghost"
+                          type="button"
+                          onClick={() => void copyOutgoingSecret()}
+                        >
+                          Copy secret
+                        </button>
+                        {outgoingSecretHint ? (
+                          <p className="muted">{outgoingSecretHint}</p>
+                        ) : (
+                          <p className="muted">
+                            Verify <code>X-Relay-Signature: v1=…</code> over{' '}
+                            <code>timestamp.body</code>.
+                          </p>
+                        )}
+                      </label>
+                    ) : null}
+                    {outgoingWebhooks.length > 0 ? (
+                      <ul className="incoming-webhook-list">
+                        {outgoingWebhooks.map((hook) => (
+                          <li key={hook.id}>
+                            <div>
+                              <strong>{hook.name}</strong>
+                              <span className="muted">
+                                {' '}
+                                → {hook.targetUrl}
+                                {hook.revokedAt ? ' · revoked' : ''}
+                                {hook.lastDeliveredAt && !hook.revokedAt
+                                  ? ` · last delivery ${new Date(hook.lastDeliveredAt).toLocaleString()}`
+                                  : ''}
+                              </span>
+                            </div>
+                            {!hook.revokedAt ? (
+                              <button
+                                className="ghost danger-text"
+                                type="button"
+                                onClick={() => void revokeOutgoingWebhook(hook.id)}
+                              >
+                                Revoke
+                              </button>
+                            ) : null}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : null}
+                  </div>
                   <div className="add-people">
-                    <p className="muted">Add people</p>
+                    <p className="muted" style={{ marginBottom: 4 }}>
+                      Add people already in this workspace
+                    </p>
+                    <p className="muted" style={{ marginTop: 0, fontSize: 13 }}>
+                      Search teammates who are already workspace members. This does
+                      not send a workspace invite — it only adds them to this channel.
+                    </p>
                     <PeoplePicker
                       people={people}
                       mode="single"
                       exclude={memberIds}
+                      emptyHint="No workspace members match. If they are not in the workspace yet, use Invite by email above."
                       onPick={(person) => void addMember(person.userId)}
                     />
                   </div>

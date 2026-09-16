@@ -3,6 +3,8 @@ import { NavLink, Outlet, useMatch, useNavigate } from 'react-router-dom';
 import { api } from '../../api/client';
 import { useAuth } from '../../auth/AuthContext';
 import { useChatSocket } from '../../chat/ChatSocketContext';
+import { useVoiceCall } from '../../calls/VoiceCallContext';
+import { HuddleIcon } from '../../components/HuddleIcon';
 import { Modal } from '../../components/Modal';
 import { useConfirm, usePrompt } from '../../components/ConfirmProvider';
 import { PeoplePicker } from '../../components/PeoplePicker';
@@ -13,8 +15,9 @@ import {
   otherMember,
 } from '../../lib/format';
 import { RelativeTime } from '../../components/RelativeTime';
-import { notify, subscribeWebPush, shouldShowNotificationBanner, dismissNotificationPrompt, loadNotificationPrefs, shouldNotifyForMessage } from '../../lib/notifications';
+import { notify, subscribeWebPush, shouldShowNotificationBanner, dismissNotificationPrompt, loadNotificationPrefs, getMessageNotifyDecision } from '../../lib/notifications';
 import { usePwaInstall } from '../../hooks/usePwaInstall';
+import { CommandPaletteHintButton } from '../../components/CommandPalette';
 import { useDirectory } from '../../people/useDirectory';
 import { UserAvatar } from '../../components/UserAvatar';
 import { useOrganization } from '../../organizations/OrganizationContext';
@@ -34,8 +37,15 @@ export type MessengerOutletContext = {
   openNewChat: () => void;
   openNewGroup: () => void;
   clearUnread: (conversationId: string) => void;
+  setUnread: (
+    conversationId: string,
+    unreadCount: number,
+    opts?: { firstUnreadMessageId?: string | null },
+  ) => void;
   refreshInbox: () => Promise<void>;
   conversations: Conversation[];
+  laterItems: MessageReminder[];
+  refreshLater: () => Promise<void>;
 };
 
 function hitConversationTitle(
@@ -161,7 +171,6 @@ export function MessengerPage() {
     organizations.find((org) => org.id === activeOrganizationId) ??
     organizations[0];
   const isGuest = activeOrg?.role === 'guest';
-  const openedGeneralRef = useRef(false);
   const { people, byUserId, error: directoryError, ensureProfiles, refreshDirectory } =
     useDirectory();
   const [items, setItems] = useState<Conversation[]>([]);
@@ -195,13 +204,19 @@ export function MessengerPage() {
   const { showBanner: showInstallBanner, install, dismissBanner: dismissInstall } =
     usePwaInstall();
   const { subscribe, leaveConversation } = useChatSocket();
+  const { lobbiesByConversation } = useVoiceCall();
   const itemsRef = useRef<Conversation[]>([]);
   itemsRef.current = items;
   const myStatusRef = useRef<PresenceStatus>('online');
   const byUserIdRef = useRef(byUserId);
   byUserIdRef.current = byUserId;
+  /** Conversation id holding Slack-style mark-unread until the user leaves it. */
+  const holdUnreadRef = useRef<string | null>(null);
 
   const clearUnread = useCallback((conversationId: string) => {
+    if (holdUnreadRef.current === conversationId) {
+      return;
+    }
     setItems((current) =>
       current.map((item) =>
         item.id === conversationId &&
@@ -217,6 +232,35 @@ export function MessengerPage() {
     );
   }, []);
 
+  const setUnread = useCallback(
+    (
+      conversationId: string,
+      unreadCount: number,
+      opts?: { firstUnreadMessageId?: string | null },
+    ) => {
+      const count = Math.max(0, unreadCount);
+      holdUnreadRef.current = conversationId;
+      setItems((current) =>
+        current.map((item) =>
+          item.id === conversationId
+            ? {
+                ...item,
+                unreadCount: count,
+                hasUnreadMention:
+                  count > 0 ? item.hasUnreadMention : false,
+                firstUnreadMentionMessageId:
+                  count > 0
+                    ? (opts?.firstUnreadMessageId ??
+                      item.firstUnreadMentionMessageId)
+                    : null,
+              }
+            : item,
+        ),
+      );
+    },
+    [],
+  );
+
   const load = useCallback(async () => {
     try {
       const response = await api<Paginated<Conversation>>(
@@ -226,14 +270,18 @@ export function MessengerPage() {
       setItems(
         response.data.items.map((item) => {
           const normalized = normalizeConversation(item);
-          return item.id === activeId
-            ? {
-                ...normalized,
-                unreadCount: 0,
-                hasUnreadMention: false,
-                firstUnreadMentionMessageId: null,
-              }
-            : normalized;
+          if (
+            item.id === activeId &&
+            holdUnreadRef.current !== activeId
+          ) {
+            return {
+              ...normalized,
+              unreadCount: 0,
+              hasUnreadMention: false,
+              firstUnreadMentionMessageId: null,
+            };
+          }
+          return normalized;
         }),
       );
       setError('');
@@ -260,17 +308,20 @@ export function MessengerPage() {
     const isBrandNew = Boolean(existing && (!last || last.id !== message.id));
     const mentionsMe =
       Boolean(selfId) && (message.mentions ?? []).includes(selfId!);
-    // Slack-style: muted chats stay quiet unless you were @mentioned.
+    const notifyDecision = getMessageNotifyDecision({
+      conversationId: message.conversationId,
+      mentionsMe,
+      muted: Boolean(existing?.muted),
+      body: message.body,
+      myStatus: myStatusRef.current,
+    });
+    // Slack-style: muted / mentions-only / keywords handled in getMessageNotifyDecision.
     const shouldNotify =
       Boolean(existing) &&
       fromOther &&
       isBrandNew &&
       isLatestUpdate &&
-      (!existing?.muted || mentionsMe) &&
-      shouldNotifyForMessage({
-        mentionsMe,
-        myStatus: myStatusRef.current,
-      });
+      notifyDecision.notify;
 
     setItems((current) => {
       const index = current.findIndex((item) => item.id === message.conversationId);
@@ -341,7 +392,11 @@ export function MessengerPage() {
     const chatTitle = existing
       ? conversationTitle(existing, selfId, byUserIdRef.current)
       : 'New message';
-    const title = mentionsMe ? `${chatTitle} · mentioned you` : chatTitle;
+    const title = mentionsMe
+      ? `${chatTitle} · mentioned you`
+      : notifyDecision.matchedKeyword
+        ? `${chatTitle} · keyword match`
+        : chatTitle;
     const preview =
       message.attachment && message.type === 'image'
         ? 'Sent a photo'
@@ -350,7 +405,9 @@ export function MessengerPage() {
       ? preview.startsWith('@')
         ? preview
         : `Mention: ${preview}`
-      : preview;
+      : notifyDecision.matchedKeyword
+        ? `Keyword: ${preview}`
+        : preview;
     notify({
       title,
       body: body.length > 120 ? `${body.slice(0, 120)}…` : body,
@@ -361,6 +418,17 @@ export function MessengerPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  const refreshLater = useCallback(async () => {
+    try {
+      const response = await api<Paginated<MessageReminder>>(
+        '/chat/reminders?page=1&limit=50',
+      );
+      setLaterItems(response.data.items ?? []);
+    } catch {
+      // ignore badge errors
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -381,9 +449,11 @@ export function MessengerPage() {
     }
     async function refreshLaterBadge() {
       try {
-        const response = await api<MessageReminder[]>('/chat/reminders');
+        const response = await api<Paginated<MessageReminder>>(
+          '/chat/reminders?page=1&limit=50',
+        );
         if (cancelled) return;
-        setLaterItems(response.data ?? []);
+        setLaterItems(response.data.items ?? []);
       } catch {
         // ignore
       }
@@ -401,6 +471,12 @@ export function MessengerPage() {
   }, []);
 
   useEffect(() => {
+    if (
+      holdUnreadRef.current &&
+      holdUnreadRef.current !== activeConversationId
+    ) {
+      holdUnreadRef.current = null;
+    }
     if (!activeConversationId) {
       return;
     }
@@ -421,6 +497,9 @@ export function MessengerPage() {
               : item,
           ),
         );
+      }),
+      subscribe('chat:reminder', () => {
+        void refreshLater();
       }),
       subscribe(
         'chat:presence',
@@ -527,7 +606,7 @@ export function MessengerPage() {
     return () => {
       unsubs.forEach((unsub) => unsub());
     };
-  }, [applyInboxMessage, leaveConversation, navigate, subscribe]);
+  }, [applyInboxMessage, leaveConversation, navigate, refreshLater, subscribe]);
 
   useEffect(() => {
     void refreshDirectory();
@@ -596,6 +675,25 @@ export function MessengerPage() {
     void loadSidebarSections();
   }, [loadSidebarSections, activeOrganizationId]);
 
+  useEffect(() => {
+    const onCommand = (event: Event) => {
+      const detail = (event as CustomEvent<{ action?: string }>).detail;
+      if (detail?.action === 'new-channel') {
+        setModalError('');
+        setGroupMembers([]);
+        setGroupName('');
+        setGroupVisibility('private');
+        setGroupAnnounceOnly(false);
+        setGroupOpen(true);
+      } else if (detail?.action === 'new-dm') {
+        setModalError('');
+        setDmOpen(true);
+      }
+    };
+    window.addEventListener('relay:command', onCommand);
+    return () => window.removeEventListener('relay:command', onCommand);
+  }, []);
+
   const peopleHits = useMemo(() => {
     const term = query.trim().toLowerCase();
     if (term.length < 2) {
@@ -614,26 +712,6 @@ export function MessengerPage() {
       })
       .slice(0, 12);
   }, [people, query, me]);
-
-  useEffect(() => {
-    openedGeneralRef.current = false;
-  }, [activeOrganizationId]);
-
-  useEffect(() => {
-    if (hasThread || openedGeneralRef.current || items.length === 0) {
-      return;
-    }
-    const general = items.find(
-      (item) =>
-        item.type === 'group' &&
-        (item.name?.trim().toLowerCase() === 'general' ||
-          item.name?.trim().toLowerCase() === '#general'),
-    );
-    if (general) {
-      openedGeneralRef.current = true;
-      navigate(`/chat/${general.id}`, { replace: true });
-    }
-  }, [hasThread, items, navigate]);
 
   useEffect(() => {
     const term = query.trim();
@@ -697,8 +775,11 @@ export function MessengerPage() {
       setGroupOpen(true);
     },
     clearUnread,
+    setUnread,
     refreshInbox: load,
     conversations: items,
+    laterItems,
+    refreshLater,
   };
 
   function sectionIdForConversation(conversationId: string): string | null {
@@ -889,6 +970,16 @@ export function MessengerPage() {
     const mentionUnread =
       item.id !== activeConversationId && Boolean(item.hasUnreadMention);
     const isChannel = item.type === 'group';
+    const liveLobby = lobbiesByConversation[item.id];
+    const huddleLive =
+      Boolean(liveLobby?.active) &&
+      liveLobby?.mode === 'huddle' &&
+      (liveLobby?.joinedIds.length ?? 0) > 0;
+    const callLive =
+      isChannel &&
+      Boolean(liveLobby?.active) &&
+      liveLobby?.mode !== 'huddle' &&
+      (liveLobby?.joinedIds.length ?? 0) > 0;
 
     return (
       <NavLink
@@ -926,6 +1017,11 @@ export function MessengerPage() {
                 </span>
               ) : null}
               {isChannel ? title.replace(/^#/, '') : title}
+              {item.isShared ? (
+                <span className="connect-pill sm" title="Shared channel">
+                  Shared
+                </span>
+              ) : null}
             </strong>
             <small className="chat-row-preview">
               {item.muted ? (
@@ -977,6 +1073,28 @@ export function MessengerPage() {
                     </option>
                   ))}
                 </select>
+              ) : null}
+              {huddleLive ? (
+                <span
+                  className="chat-huddle-live"
+                  title={`Huddle live · ${liveLobby?.joinedIds.length ?? 0}`}
+                  aria-label="Huddle live in this channel"
+                >
+                  <HuddleIcon size={14} />
+                </span>
+              ) : callLive ? (
+                <span
+                  className="chat-call-live"
+                  title="Call in progress"
+                  aria-label="Call in progress"
+                >
+                  <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M6.6 10.8a15.5 15.5 0 0 0 6.6 6.6l2.2-2.2a1.2 1.2 0 0 1 1.2-.3 7.7 7.7 0 0 0 2.4.4 1.2 1.2 0 0 1 1.2 1.2V20a1.2 1.2 0 0 1-1.2 1.2A17.2 17.2 0 0 1 2.8 4 1.2 1.2 0 0 1 4 2.8h3.5A1.2 1.2 0 0 1 8.7 4a7.7 7.7 0 0 0 .4 2.4 1.2 1.2 0 0 1-.3 1.2z"
+                    />
+                  </svg>
+                </span>
               ) : null}
               <button
                 className={`pin-toggle${item.pinned ? ' is-pinned' : ''}`}
@@ -1121,10 +1239,12 @@ export function MessengerPage() {
     setModalError('');
     setBrowseBusy(true);
     try {
-      const response = await api<Conversation[]>('/chat/channels/public');
+      const response = await api<Paginated<Conversation>>(
+        '/chat/channels/public?page=1&limit=50',
+      );
       const joined = new Set(items.map((item) => item.id));
       setPublicChannels(
-        (response.data ?? [])
+        (response.data.items ?? [])
           .map(normalizeConversation)
           .filter((item) => !joined.has(item.id)),
       );
@@ -1172,8 +1292,7 @@ export function MessengerPage() {
     setModalError('');
     setLaterBusy(true);
     try {
-      const response = await api<MessageReminder[]>('/chat/reminders');
-      setLaterItems(response.data ?? []);
+      await refreshLater();
     } catch (err) {
       setModalError(
         err instanceof Error ? err.message : 'Could not load reminders',
@@ -1273,11 +1392,12 @@ export function MessengerPage() {
           </div>
         </div>
           <div className="inbox-search-wrap">
+            <CommandPaletteHintButton />
         <input
           className="inbox-search"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search — try from:jane has:file in:general"
+              placeholder="Filter list — or press ⌘K / Ctrl+K"
               aria-label="Search channels and messages"
               title="Operators: from:name · in:#channel · has:file|image|link|audio · after:7d · before:2024-01-01"
         />

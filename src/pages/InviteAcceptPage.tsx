@@ -18,6 +18,7 @@ type PublicInvite = {
   valid: boolean;
   organizationId?: string | null;
   organizationName?: string | null;
+  pendingChannelId?: string | null;
 };
 
 type AcceptInviteResult = {
@@ -25,11 +26,12 @@ type AcceptInviteResult = {
   organizations: OrganizationView[];
   activeOrganizationId: string;
   alreadyMember: boolean;
+  pendingChannelId?: string | null;
 };
 
 export function InviteAcceptPage() {
   const { token = '' } = useParams();
-  const { register, session, replaceSession } = useAuth();
+  const { register, session, replaceSession, logout } = useAuth();
   const navigate = useNavigate();
   const [invite, setInvite] = useState<PublicInvite | null>(null);
   const [loading, setLoading] = useState(true);
@@ -43,6 +45,23 @@ export function InviteAcceptPage() {
       .catch((err: unknown) => setError(err instanceof Error ? err.message : 'Invitation unavailable'))
       .finally(() => setLoading(false));
   }, [token]);
+
+  async function switchToInviteAccount() {
+    setBusy(true);
+    setError('');
+    try {
+      await logout();
+      const params = new URLSearchParams();
+      params.set('inviteToken', token);
+      if (invite?.email) {
+        params.set('email', invite.email);
+      }
+      navigate(`/login?${params.toString()}`, { replace: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not sign out');
+      setBusy(false);
+    }
+  }
 
   async function acceptWhileSignedIn() {
     setBusy(true);
@@ -60,7 +79,11 @@ export function InviteAcceptPage() {
           activeOrganizationId: response.data.activeOrganizationId,
         });
       }
-      navigate('/chat', { replace: true });
+      const channelId = response.data.pendingChannelId;
+      navigate(
+        channelId ? `/chat/${channelId}` : '/chat',
+        { replace: true },
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not accept invitation');
     } finally {
@@ -83,7 +106,7 @@ export function InviteAcceptPage() {
     if (hasFieldErrors(nextErrors)) return;
     setBusy(true);
     try {
-      await register({
+      const registered = await register({
         firstName: fields.firstName.trim(),
         lastName: fields.lastName.trim(),
         email: fields.email.trim().toLowerCase(),
@@ -91,12 +114,18 @@ export function InviteAcceptPage() {
         inviteToken: token,
       });
       const next = getSession();
-      navigate(
-        next?.organizations.length && next.activeOrganizationId
-          ? '/chat'
-          : '/onboarding',
-        { replace: true },
-      );
+      const channelId =
+        registered.pendingChannelId || invite?.pendingChannelId || null;
+      if (channelId) {
+        navigate(`/chat/${channelId}`, { replace: true });
+      } else {
+        navigate(
+          next?.organizations.length && next.activeOrganizationId
+            ? '/chat'
+            : '/onboarding',
+          { replace: true },
+        );
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not accept invitation');
     } finally {
@@ -149,7 +178,9 @@ export function InviteAcceptPage() {
   return (
     <main className="auth-page">
       <div className="auth-panel">
-        <p className="eyebrow">Workspace invitation</p>
+        <p className="eyebrow">
+          {invite.pendingChannelId ? 'Channel invitation' : 'Workspace invitation'}
+        </p>
         <h1>Join {invite.organizationName ?? 'the workspace'}</h1>
         <p className="invite-badge">
           Invitation valid until {new Date(invite.expiresAt).toLocaleDateString()}
@@ -159,27 +190,64 @@ export function InviteAcceptPage() {
           <>
             <p className="muted auth-lead">
               Signed in as <strong>{session?.user.email}</strong>. Join{' '}
-              <strong>{invite.organizationName ?? 'this workspace'}</strong> and
-              start in <strong>#general</strong>.
+              <strong>{invite.organizationName ?? 'this workspace'}</strong>
+              {invite.pendingChannelId
+                ? ' and you will be added to the invited channel automatically.'
+                : ' and start in #general.'}
             </p>
             {emailMismatch ? (
-              <p className="error">
-                This invite is for {invite.email}. Sign in with that email, or
-                ask for a new invite.
-              </p>
-            ) : null}
-            {error ? <p className="error">{error}</p> : null}
-            <button
-              className="btn lg full"
-              type="button"
-              disabled={busy || Boolean(emailMismatch)}
-              onClick={() => void acceptWhileSignedIn()}
-            >
-              {busy ? 'Joining…' : 'Join workspace'}
-            </button>
-            <p className="switch">
-              Wrong account? <Link to="/login">Sign in with another email</Link>
-            </p>
+              <>
+                <p className="error">
+                  This invite is for <strong>{invite.email}</strong>, but you are
+                  signed in as <strong>{session?.user.email}</strong>.
+                </p>
+                {error ? <p className="error">{error}</p> : null}
+                <button
+                  className="btn lg full"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void switchToInviteAccount()}
+                >
+                  {busy
+                    ? 'Signing out…'
+                    : `Sign out & continue as ${invite.email}`}
+                </button>
+                <p className="switch">
+                  Or{' '}
+                  <button
+                    type="button"
+                    className="linkish"
+                    disabled={busy}
+                    onClick={() => void switchToInviteAccount()}
+                  >
+                    create / sign in with that email
+                  </button>
+                </p>
+              </>
+            ) : (
+              <>
+                {error ? <p className="error">{error}</p> : null}
+                <button
+                  className="btn lg full"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void acceptWhileSignedIn()}
+                >
+                  {busy ? 'Joining…' : 'Join workspace'}
+                </button>
+                <p className="switch">
+                  Wrong account?{' '}
+                  <button
+                    type="button"
+                    className="linkish"
+                    disabled={busy}
+                    onClick={() => void switchToInviteAccount()}
+                  >
+                    Sign in with another email
+                  </button>
+                </p>
+              </>
+            )}
           </>
         ) : (
           <>

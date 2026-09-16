@@ -390,6 +390,7 @@ export function VoiceCallOverlay() {
       connectionState === 'reconnecting' ||
       connectionState === 'failed');
 
+  const isHuddle = call?.mode === 'huddle';
   const statusText =
     onHold
       ? 'On hold'
@@ -402,12 +403,16 @@ export function VoiceCallOverlay() {
             ? 'Calling group…'
             : 'Ringing…'
           : phase === 'connecting' || connectionState === 'connecting'
-            ? 'Connecting…'
+            ? isHuddle
+              ? 'Joining huddle…'
+              : 'Connecting…'
             : connectionState === 'reconnecting'
               ? 'Reconnecting…'
               : phase === 'active'
-                ? formatElapsed(elapsedSeconds)
-                : error || 'Call ended';
+                ? isHuddle
+                  ? `Huddle · ${formatElapsed(elapsedSeconds)}`
+                  : formatElapsed(elapsedSeconds)
+                : error || (isHuddle ? 'Huddle ended' : 'Call ended');
 
   const isHost = Boolean(me && (roster?.hostId ?? call?.hostId) === me);
 
@@ -433,7 +438,7 @@ export function VoiceCallOverlay() {
             {avatarUrl ? <img src={avatarUrl} alt="" /> : peerInitials}
           </span>
           <span className="voice-call-mini-meta">
-            <strong>{isGroup ? 'Group call' : peerName}</strong>
+            <strong>{isHuddle ? 'Huddle' : isGroup ? 'Group call' : peerName}</strong>
             <small>
               {onHold ? 'On hold' : statusText}
               {screenSharerId ? ' · Sharing screen' : ''}
@@ -474,11 +479,13 @@ export function VoiceCallOverlay() {
       <div className="voice-call-stage">
         <header className="voice-call-top">
           <span className="voice-call-brand">
-            {isGroup
-              ? `Relay Group ${isVideo ? 'Video' : 'Call'}`
-              : isVideo
-                ? 'Relay Video Call'
-                : 'Relay Call'}
+            {isHuddle
+              ? 'Relay Huddle'
+              : isGroup
+                ? `Relay Group ${isVideo ? 'Video' : 'Call'}`
+                : isVideo
+                  ? 'Relay Video Call'
+                  : 'Relay Call'}
           </span>
           {canMinimize ? (
             <div className="voice-call-top-actions">

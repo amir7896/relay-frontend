@@ -44,6 +44,7 @@ import type {
   CallInviteAck,
   CallLobbyInfo,
   CallMedia,
+  CallMode,
   CallParticipantEvent,
   CallPhase,
   CallRosterInfo,
@@ -93,7 +94,9 @@ type VoiceCallContextValue = {
     conversationId: string,
     peerUserId?: string,
     media?: CallMedia,
+    options?: { mode?: CallMode },
   ) => Promise<void>;
+  startHuddle: (conversationId: string) => Promise<void>;
   joinCall: (conversationId: string, withVideo?: boolean) => Promise<void>;
   refreshLobby: (conversationId: string) => Promise<void>;
   acceptCall: (withVideo?: boolean) => Promise<void>;
@@ -220,21 +223,37 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    const safeVibrate = (pattern: number | number[]) => {
+      try {
+        if (typeof navigator.vibrate !== 'function') return;
+        const activation = (
+          navigator as Navigator & {
+            userActivation?: { hasBeenActive?: boolean };
+          }
+        ).userActivation;
+        if (activation && activation.hasBeenActive === false) return;
+        navigator.vibrate(pattern);
+      } catch {
+        // Browsers block vibrate until the user interacts with the page.
+      }
+    };
+
     const stopVibrate = () => {
       if (vibrateTimerRef.current != null) {
         window.clearInterval(vibrateTimerRef.current);
         vibrateTimerRef.current = null;
       }
-      navigator.vibrate?.(0);
+      safeVibrate(0);
     };
 
     if (phase === 'incoming') {
       void unlockCallAudio().then(() => startCallRingtone('incoming'));
       if (typeof navigator.vibrate === 'function') {
-        navigator.vibrate([220, 120, 220, 120, 220]);
+        // Match the ~3.2s melodic ringtone cadence
+        safeVibrate([180, 90, 180, 90, 320, 140, 220]);
         vibrateTimerRef.current = window.setInterval(() => {
-          navigator.vibrate?.([220, 120, 220, 120, 220]);
-        }, 2400);
+          safeVibrate([180, 90, 180, 90, 320, 140, 220]);
+        }, 3200);
       }
       return () => {
         stopCallRingtone();
@@ -261,7 +280,17 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
       stopCallRingtone();
       speakingMonitorsRef.current.forEach((monitor) => monitor.stop());
       speakingMonitorsRef.current.clear();
-      navigator.vibrate?.(0);
+      try {
+        const activation = (
+          navigator as Navigator & {
+            userActivation?: { hasBeenActive?: boolean };
+          }
+        ).userActivation;
+        if (activation?.hasBeenActive === false) return;
+        navigator.vibrate?.(0);
+      } catch {
+        // ignore
+      }
     };
   }, []);
 
@@ -836,6 +865,7 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
       conversationId: string,
       peerUserId?: string,
       media: CallMedia = 'audio',
+      options?: { mode?: CallMode },
     ) => {
       if (!me) {
         setError('Sign in to place a call');
@@ -850,25 +880,35 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
         return;
       }
 
+      const mode = options?.mode === 'huddle' ? 'huddle' : 'ring';
+      const callMedia = mode === 'huddle' ? 'audio' : media;
+
       setError('');
       setMinimized(false);
-      wantVideoRef.current = media === 'video';
+      wantVideoRef.current = callMedia === 'video';
 
       try {
-        await ensureLocalStream(media === 'video');
+        await ensureLocalStream(callMedia === 'video');
         const ack = await emitAck<CallInviteAck>('call:invite', {
           conversationId,
-          media,
+          media: callMedia,
+          mode,
         });
         if (!ack?.callId) {
-          throw new Error('Call could not be created');
+          throw new Error(
+            mode === 'huddle'
+              ? 'Huddle could not be started'
+              : 'Call could not be created',
+          );
         }
-        const callMedia = ack.media === 'video' || media === 'video' ? 'video' : 'audio';
+        const resolvedMedia =
+          ack.media === 'video' || callMedia === 'video' ? 'video' : 'audio';
         const next: VoiceCallInfo = {
           callId: ack.callId,
           conversationId: ack.conversationId,
           kind: ack.kind,
-          media: callMedia,
+          media: resolvedMedia,
+          mode: ack.mode === 'huddle' ? 'huddle' : mode,
           peerUserId: ack.peerIds[0] || peerUserId || me,
           memberIds: ack.memberIds,
           joinedIds: ack.joinedIds,
@@ -876,7 +916,8 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
           hostId: me,
         };
         setConnectionState('connecting');
-        setPhase('outgoing');
+        // Huddles go live immediately (no ringtone / waiting for accept).
+        setPhase(mode === 'huddle' ? 'active' : 'outgoing');
         setCall(next);
         callRef.current = next;
         setRoster({
@@ -884,7 +925,10 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
           conversationId: ack.conversationId,
           hostId: me,
           joinedIds: ack.joinedIds,
-          ringingIds: ack.memberIds.filter((id) => !ack.joinedIds.includes(id)),
+          ringingIds:
+            mode === 'huddle'
+              ? []
+              : ack.memberIds.filter((id) => !ack.joinedIds.includes(id)),
           declinedIds: [],
           leftIds: [],
           memberIds: ack.memberIds,
@@ -893,12 +937,13 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
           forceMuted: false,
           screenSharerId: null,
         });
-        if (ack.kind === 'group') {
+        if (ack.kind === 'group' || mode === 'huddle') {
           upsertLobby({
             callId: ack.callId,
             conversationId: ack.conversationId,
-            kind: 'group',
-            media: callMedia,
+            kind: ack.kind,
+            media: resolvedMedia,
+            mode: ack.mode === 'huddle' ? 'huddle' : 'ring',
             hostId: me,
             memberIds: ack.memberIds,
             joinedIds: ack.joinedIds,
@@ -907,10 +952,23 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
         }
       } catch (err) {
         cleanupMedia();
-        resetToIdle('busy', socketErrorMessage(err, 'Could not start call'));
+        resetToIdle(
+          'busy',
+          socketErrorMessage(
+            err,
+            mode === 'huddle' ? 'Could not start huddle' : 'Could not start call',
+          ),
+        );
       }
     },
     [cleanupMedia, connected, emitAck, ensureLocalStream, me, resetToIdle, upsertLobby],
+  );
+
+  const startHuddle = useCallback(
+    async (conversationId: string) => {
+      await startCall(conversationId, undefined, 'audio', { mode: 'huddle' });
+    },
+    [startCall],
   );
 
   const acceptCall = useCallback(async (withVideo = false) => {
@@ -962,7 +1020,11 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
         }
       }
       if (!lobby?.active || !lobby.callId) {
-        setError('No active group call to join');
+        setError(
+          lobby?.mode === 'huddle'
+            ? 'No active huddle to join'
+            : 'No active group call to join',
+        );
         return;
       }
 
@@ -970,14 +1032,20 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
       setMinimized(false);
       setConnectionState('connecting');
       setPhase('connecting');
-      const sessionMedia = lobby.media === 'video' ? 'video' : 'audio';
+      const sessionMedia =
+        lobby.mode === 'huddle'
+          ? 'audio'
+          : lobby.media === 'video'
+            ? 'video'
+            : 'audio';
       const useVideo = withVideo && sessionMedia === 'video';
       wantVideoRef.current = useVideo;
       const next: VoiceCallInfo = {
         callId: lobby.callId,
         conversationId: lobby.conversationId,
-        kind: 'group',
+        kind: lobby.kind === 'private' ? 'private' : 'group',
         media: sessionMedia,
+        mode: lobby.mode === 'huddle' ? 'huddle' : 'ring',
         peerUserId: lobby.hostId,
         memberIds: lobby.memberIds,
         joinedIds: lobby.joinedIds,
@@ -1577,18 +1645,24 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
           return;
         }
 
-        // Always keep Join banner in sync for group rings
+        // Always keep Join banner in sync for group rings / huddles
         if (event.kind === 'group' && event.conversationId) {
           upsertLobby({
             callId: event.callId,
             conversationId: event.conversationId,
             kind: 'group',
             media: event.media === 'video' ? 'video' : 'audio',
+            mode: event.mode === 'huddle' ? 'huddle' : 'ring',
             hostId: event.fromUserId,
             memberIds: event.memberIds || [event.fromUserId, me],
             joinedIds: event.joinedIds || [event.fromUserId],
             active: true,
           });
+        }
+
+        // Ambient huddles never open the ringing overlay — hop in via Join.
+        if (event.mode === 'huddle') {
+          return;
         }
 
         // Host also sits in the conversation room — ignore own invite echo
@@ -1967,6 +2041,7 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
       audioOutputs,
       lobbiesByConversation,
       startCall,
+      startHuddle,
       joinCall,
       refreshLobby,
       acceptCall,
@@ -2012,6 +2087,7 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
       audioOutputs,
       lobbiesByConversation,
       startCall,
+      startHuddle,
       joinCall,
       refreshLobby,
       acceptCall,

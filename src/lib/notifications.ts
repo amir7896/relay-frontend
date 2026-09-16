@@ -4,6 +4,7 @@ const DISMISS_KEY = 'relay.notify.dismissed';
 const PREFS_KEY = 'relay.notify.prefs';
 
 export type NotificationMode = 'all' | 'mentions' | 'none';
+export type ChannelNotifyMode = 'default' | 'all' | 'mentions' | 'none';
 
 export type NotificationPrefs = {
   mode: NotificationMode;
@@ -12,6 +13,8 @@ export type NotificationPrefs = {
   quietEnd: string;
   timezone: string;
   respectStatus: boolean;
+  keywords: string[];
+  channels: Record<string, Exclude<ChannelNotifyMode, 'default'>>;
 };
 
 export const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
@@ -21,6 +24,8 @@ export const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
   quietEnd: '08:00',
   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
   respectStatus: true,
+  keywords: [],
+  channels: {},
 };
 
 let cachedPrefs: NotificationPrefs | null = null;
@@ -161,18 +166,42 @@ export async function subscribeWebPush(): Promise<
   return 'granted';
 }
 
+function normalizePrefs(input: Partial<NotificationPrefs> | null | undefined): NotificationPrefs {
+  const keywords = Array.isArray(input?.keywords)
+    ? input!.keywords
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .slice(0, 50)
+    : [];
+  const channels: NotificationPrefs['channels'] = {};
+  if (input?.channels && typeof input.channels === 'object') {
+    for (const [id, mode] of Object.entries(input.channels)) {
+      if (mode === 'all' || mode === 'mentions' || mode === 'none') {
+        channels[id] = mode;
+      }
+    }
+  }
+  return {
+    ...DEFAULT_NOTIFICATION_PREFS,
+    ...input,
+    keywords,
+    channels,
+  };
+}
+
 function readCachedPrefs(): NotificationPrefs {
   if (cachedPrefs) return cachedPrefs;
   try {
     const raw = localStorage.getItem(PREFS_KEY);
     if (raw) {
-      cachedPrefs = { ...DEFAULT_NOTIFICATION_PREFS, ...(JSON.parse(raw) as NotificationPrefs) };
+      cachedPrefs = normalizePrefs(JSON.parse(raw) as NotificationPrefs);
       return cachedPrefs;
     }
   } catch {
     // ignore
   }
-  return { ...DEFAULT_NOTIFICATION_PREFS };
+  return { ...DEFAULT_NOTIFICATION_PREFS, keywords: [], channels: {} };
 }
 
 function writeCachedPrefs(prefs: NotificationPrefs): void {
@@ -191,7 +220,7 @@ export function getCachedNotificationPrefs(): NotificationPrefs {
 export async function loadNotificationPrefs(): Promise<NotificationPrefs> {
   try {
     const response = await api<NotificationPrefs>('/chat/notification-prefs');
-    const prefs = { ...DEFAULT_NOTIFICATION_PREFS, ...response.data };
+    const prefs = normalizePrefs(response.data);
     writeCachedPrefs(prefs);
     return prefs;
   } catch {
@@ -202,13 +231,55 @@ export async function loadNotificationPrefs(): Promise<NotificationPrefs> {
 export async function saveNotificationPrefs(
   patch: Partial<NotificationPrefs>,
 ): Promise<NotificationPrefs> {
+  // Global PATCH rejects `channels` (forbidNonWhitelisted). Per-channel
+  // overrides use PUT /chat/conversations/:id/notification-prefs.
+  const { channels: _channels, ...globalPatch } = patch;
   const response = await api<NotificationPrefs>('/chat/notification-prefs', {
     method: 'PATCH',
-    body: JSON.stringify(patch),
+    body: JSON.stringify(globalPatch),
   });
-  const prefs = { ...DEFAULT_NOTIFICATION_PREFS, ...response.data };
+  const prefs = normalizePrefs(response.data);
   writeCachedPrefs(prefs);
   return prefs;
+}
+
+export async function loadChannelNotificationMode(
+  conversationId: string,
+): Promise<ChannelNotifyMode> {
+  try {
+    const response = await api<{ conversationId: string; mode: ChannelNotifyMode }>(
+      `/chat/conversations/${conversationId}/notification-prefs`,
+    );
+    const mode = response.data.mode;
+    if (mode === 'all' || mode === 'mentions' || mode === 'none' || mode === 'default') {
+      return mode;
+    }
+    return 'default';
+  } catch {
+    return readCachedPrefs().channels[conversationId] ?? 'default';
+  }
+}
+
+export async function saveChannelNotificationMode(
+  conversationId: string,
+  mode: ChannelNotifyMode,
+): Promise<ChannelNotifyMode> {
+  const response = await api<{ conversationId: string; mode: ChannelNotifyMode }>(
+    `/chat/conversations/${conversationId}/notification-prefs`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ mode }),
+    },
+  );
+  const prefs = readCachedPrefs();
+  const channels = { ...prefs.channels };
+  if (mode === 'default') {
+    delete channels[conversationId];
+  } else {
+    channels[conversationId] = mode;
+  }
+  writeCachedPrefs({ ...prefs, channels });
+  return response.data.mode;
 }
 
 function parseHm(value: string): number | null {
@@ -254,21 +325,75 @@ export function isInQuietHours(
   return minutes >= start || minutes < end;
 }
 
+function matchesKeyword(body: string | null | undefined, keywords: string[]): boolean {
+  const text = String(body || '').toLowerCase();
+  if (!text || !keywords.length) return false;
+  return keywords.some((keyword) => {
+    const needle = keyword.toLowerCase();
+    if (!needle) return false;
+    if (needle.includes(' ')) return text.includes(needle);
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^a-z0-9_])${escaped}([^a-z0-9_]|$)`, 'i').test(text);
+  });
+}
+
+function resolveEffectiveMode(
+  prefs: NotificationPrefs,
+  conversationId?: string,
+): NotificationMode {
+  if (!conversationId) return prefs.mode;
+  const override = prefs.channels[conversationId];
+  if (override === 'all' || override === 'mentions' || override === 'none') {
+    return override;
+  }
+  return prefs.mode;
+}
+
 /** Whether a foreground/desktop notification should fire for this message. */
-export function shouldNotifyForMessage(input: {
+export function getMessageNotifyDecision(input: {
+  conversationId?: string;
   mentionsMe: boolean;
+  muted?: boolean;
+  body?: string | null;
   myStatus?: 'online' | 'away' | 'busy' | 'dnd' | 'offline';
-}): boolean {
+}): { notify: boolean; matchedKeyword: boolean } {
   const prefs = readCachedPrefs();
-  if (prefs.mode === 'none') return false;
-  if (prefs.mode === 'mentions' && !input.mentionsMe) return false;
-  if (isInQuietHours(prefs) && !input.mentionsMe) return false;
+  const matchedKeyword = matchesKeyword(input.body, prefs.keywords);
+  const isHighlight = input.mentionsMe || matchedKeyword;
+  const effective = resolveEffectiveMode(prefs, input.conversationId);
+
+  if (input.muted && !isHighlight) {
+    return { notify: false, matchedKeyword };
+  }
+  if (effective === 'none' && !isHighlight) {
+    return { notify: false, matchedKeyword };
+  }
+  if (effective === 'mentions' && !isHighlight) {
+    return { notify: false, matchedKeyword };
+  }
+  if (isInQuietHours(prefs) && !isHighlight) {
+    return { notify: false, matchedKeyword };
+  }
   if (prefs.respectStatus) {
     const status = input.myStatus;
-    if (status === 'dnd' || status === 'busy') return false;
-    if (status === 'away' && !input.mentionsMe) return false;
+    if (status === 'dnd' || status === 'busy') {
+      return { notify: false, matchedKeyword };
+    }
+    if (status === 'away' && !isHighlight) {
+      return { notify: false, matchedKeyword };
+    }
   }
-  return true;
+  return { notify: true, matchedKeyword };
+}
+
+export function shouldNotifyForMessage(input: {
+  conversationId?: string;
+  mentionsMe: boolean;
+  muted?: boolean;
+  body?: string | null;
+  myStatus?: 'online' | 'away' | 'busy' | 'dnd' | 'offline';
+}): boolean {
+  return getMessageNotifyDecision(input).notify;
 }
 
 export function notify(options: {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api } from '../api/client';
-import type { BlockView } from '../api/types';
+import type { BlockView, Paginated } from '../api/types';
 import { useConfirm } from '../components/ConfirmProvider';
 import { displayName, initials } from '../lib/format';
 import { useDirectory } from '../people/useDirectory';
@@ -21,8 +21,10 @@ export function BlockedUsersPage() {
     setLoading(true);
     setError('');
     try {
-      const response = await api<BlockView[]>('/chat/blocks');
-      const items = response.data ?? [];
+      const response = await api<Paginated<BlockView>>(
+        '/chat/blocks?page=1&limit=100',
+      );
+      const items = response.data.items ?? [];
       setBlocks(items);
       await ensureProfiles(items.map((item) => item.userId));
     } catch (err) {

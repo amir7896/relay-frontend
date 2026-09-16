@@ -10,6 +10,7 @@ export type CallPhase =
 
 export type CallKind = 'private' | 'group';
 export type CallMedia = 'audio' | 'video';
+export type CallMode = 'ring' | 'huddle';
 
 export type CallEndReason =
   | 'hangup'
@@ -29,6 +30,7 @@ export type VoiceCallInfo = {
   conversationId: string;
   kind: CallKind;
   media: CallMedia;
+  mode?: CallMode;
   /** Primary peer for private UI; host for incoming group. */
   peerUserId: string;
   memberIds: string[];
@@ -42,6 +44,7 @@ export type CallInviteAck = {
   conversationId: string;
   kind: CallKind;
   media?: CallMedia;
+  mode?: CallMode;
   peerIds: string[];
   memberIds: string[];
   joinedIds: string[];
@@ -54,6 +57,7 @@ export type CallIncomingEvent = {
   fromUserId: string;
   kind?: CallKind;
   media?: CallMedia;
+  mode?: CallMode;
   memberIds?: string[];
   joinedIds?: string[];
 };
@@ -95,6 +99,7 @@ export type CallLobbyInfo = {
   conversationId: string;
   kind: CallKind;
   media?: CallMedia;
+  mode?: CallMode;
   hostId: string;
   memberIds: string[];
   joinedIds: string[];

@@ -13,6 +13,7 @@ import { VoiceCallProvider } from '../calls/VoiceCallContext';
 import { DemoTour } from './DemoTour';
 import { ThemeToggle } from './ThemeToggle';
 import { VoiceCallOverlay } from './VoiceCallOverlay';
+import { CommandPalette } from './CommandPalette';
 import { useWorkspace } from '../theme/WorkspaceContext';
 
 type NavItem = {
@@ -324,6 +325,7 @@ export function AppShell() {
             <VoiceCallProvider>
               <Outlet />
               <VoiceCallOverlay />
+              <CommandPalette />
               <DemoTour />
             </VoiceCallProvider>
           </ChatSocketProvider>

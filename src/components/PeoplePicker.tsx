@@ -9,6 +9,7 @@ export function PeoplePicker({
   onPick,
   exclude = [],
   mode = 'multi',
+  emptyHint,
 }: {
   people: UserProfile[];
   selected?: string[];
@@ -16,6 +17,7 @@ export function PeoplePicker({
   onPick?: (person: UserProfile) => void;
   exclude?: string[];
   mode?: 'single' | 'multi';
+  emptyHint?: string;
 }) {
   const [term, setTerm] = useState('');
   const selectedSet = useMemo(() => new Set(selected ?? []), [selected]);
@@ -72,7 +74,9 @@ export function PeoplePicker({
           );
         })}
         {visible.length === 0 ? (
-          <p className="muted empty">No people match that search.</p>
+          <p className="muted empty">
+            {emptyHint || 'No people match that search.'}
+          </p>
         ) : null}
       </div>
     </div>

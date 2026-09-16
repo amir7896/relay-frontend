@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
@@ -29,6 +30,8 @@ export function DirectoryProvider({ children }: { children: ReactNode }) {
   const me = session?.user.id;
   const [people, setPeople] = useState<UserProfile[]>([]);
   const [error, setError] = useState('');
+  const peopleRef = useRef(people);
+  peopleRef.current = people;
 
   const refreshDirectory = useCallback(async () => {
     try {
@@ -56,10 +59,11 @@ export function DirectoryProvider({ children }: { children: ReactNode }) {
 
   const ensureProfiles = useCallback(
     async (userIds: string[], options?: { refresh?: boolean }) => {
+      const known = new Set(peopleRef.current.map((person) => person.userId));
       const missing = [...new Set(userIds)].filter((userId) => {
         if (!userId) return false;
         if (options?.refresh) return true;
-        return !byUserId.has(userId);
+        return !known.has(userId);
       });
       if (missing.length === 0) {
         return;
@@ -89,7 +93,7 @@ export function DirectoryProvider({ children }: { children: ReactNode }) {
         return [...map.values()];
       });
     },
-    [byUserId],
+    [],
   );
 
   const others = useMemo(

@@ -20,6 +20,7 @@ import { usePwaInstall } from '../hooks/usePwaInstall';
 import { resetDemoTour } from '../components/DemoTour';
 import { useDirectory } from '../people/useDirectory';
 import type {
+  Paginated,
   SessionView,
   SlashCommand,
   UserGroup,
@@ -67,6 +68,7 @@ export function ProfilePage() {
   const [notifyStatus, setNotifyStatus] = useState(() => getNotificationPermission());
   const [notifyHint, setNotifyHint] = useState('');
   const [notifyPrefs, setNotifyPrefs] = useState<NotificationPrefs>(DEFAULT_NOTIFICATION_PREFS);
+  const [notifyKeywordsDraft, setNotifyKeywordsDraft] = useState('');
   const [notifyPrefsBusy, setNotifyPrefsBusy] = useState(false);
   const [installHint, setInstallHint] = useState('');
   const { canInstall, standalone, install } = usePwaInstall();
@@ -100,6 +102,8 @@ export function ProfilePage() {
     name: '',
     description: '',
     responseTemplate: '',
+    responseMode: 'in_channel' as 'in_channel' | 'ephemeral',
+    requestUrl: '',
   });
   const [slashSaved, setSlashSaved] = useState('');
   const [slashBusy, setSlashBusy] = useState(false);
@@ -148,6 +152,11 @@ export function ProfilePage() {
     ssoIssuerUrl: '',
     ssoClientId: '',
     ssoClientSecret: '',
+    ssoIdpSsoUrl: '',
+    ssoIdpCertificate: '',
+    hasClientSecret: false,
+    hasIdpCertificate: false,
+    configured: false,
   });
   const [inviteRole, setInviteRole] = useState<'member' | 'guest'>('member');
   const inviteEmailTrimmed = inviteEmail.trim();
@@ -198,6 +207,9 @@ export function ProfilePage() {
       ssoIssuerUrl: string | null;
       ssoClientId: string | null;
       hasClientSecret?: boolean;
+      ssoIdpSsoUrl?: string | null;
+      hasIdpCertificate?: boolean;
+      configured?: boolean;
     }>(`/organizations/${activeOrganizationId}/sso`)
       .then((response) => {
         setSsoDraft({
@@ -206,6 +218,11 @@ export function ProfilePage() {
           ssoIssuerUrl: response.data.ssoIssuerUrl ?? '',
           ssoClientId: response.data.ssoClientId ?? '',
           ssoClientSecret: '',
+          ssoIdpSsoUrl: response.data.ssoIdpSsoUrl ?? '',
+          ssoIdpCertificate: '',
+          hasClientSecret: Boolean(response.data.hasClientSecret),
+          hasIdpCertificate: Boolean(response.data.hasIdpCertificate),
+          configured: Boolean(response.data.configured),
         });
       })
       .catch(() => {
@@ -215,7 +232,10 @@ export function ProfilePage() {
 
   useEffect(() => {
     setNotifyStatus(getNotificationPermission());
-    void loadNotificationPrefs().then(setNotifyPrefs);
+    void loadNotificationPrefs().then((prefs) => {
+      setNotifyPrefs(prefs);
+      setNotifyKeywordsDraft(prefs.keywords.join(', '));
+    });
   }, []);
 
   useEffect(() => {
@@ -266,8 +286,10 @@ export function ProfilePage() {
 
   async function loadInvites() {
     try {
-      const response = await api<WorkspaceInvite[]>('/auth/invites');
-      setInvites(response.data);
+      const response = await api<Paginated<WorkspaceInvite>>(
+        '/auth/invites?page=1&limit=50',
+      );
+      setInvites(response.data.items ?? []);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not load invites');
     }
@@ -277,9 +299,9 @@ export function ProfilePage() {
     setMembersBusy(true);
     try {
       const response = await api<
-        Array<{ userId: string; role: string; joinedAt: string }>
-      >(`/organizations/${organizationId}/members`);
-      const rows = response.data ?? [];
+        Paginated<{ userId: string; role: string; joinedAt: string }>
+      >(`/organizations/${organizationId}/members?page=1&limit=100`);
+      const rows = response.data.items ?? [];
       const labeled = await Promise.all(
         rows.map(async (row) => {
           try {
@@ -465,8 +487,10 @@ export function ProfilePage() {
 
   async function loadSlashCommands() {
     try {
-      const response = await api<SlashCommand[]>('/chat/slash-commands');
-      setSlashCommands(response.data);
+      const response = await api<Paginated<SlashCommand>>(
+        '/chat/slash-commands?page=1&limit=100',
+      );
+      setSlashCommands(response.data.items ?? []);
     } catch {
       setSlashCommands([]);
     }
@@ -477,7 +501,16 @@ export function ProfilePage() {
     const name = slashDraft.name.trim().replace(/^\//, '');
     const description = slashDraft.description.trim();
     const responseTemplate = slashDraft.responseTemplate.trim();
-    if (!name || !description || !responseTemplate) {
+    const requestUrl = slashDraft.requestUrl.trim();
+    if (!name || !description) {
+      return;
+    }
+    if (!requestUrl && !responseTemplate) {
+      setError('Provide a response template or an HTTPS request URL');
+      return;
+    }
+    if (requestUrl && !/^https:\/\//i.test(requestUrl)) {
+      setError('Request URL must start with https://');
       return;
     }
     setSlashBusy(true);
@@ -486,9 +519,21 @@ export function ProfilePage() {
     try {
       await api<SlashCommand>('/chat/slash-commands', {
         method: 'POST',
-        body: JSON.stringify({ name, description, responseTemplate }),
+        body: JSON.stringify({
+          name,
+          description,
+          responseTemplate: responseTemplate || undefined,
+          responseMode: slashDraft.responseMode,
+          requestUrl: requestUrl || null,
+        }),
       });
-      setSlashDraft({ name: '', description: '', responseTemplate: '' });
+      setSlashDraft({
+        name: '',
+        description: '',
+        responseTemplate: '',
+        responseMode: 'in_channel',
+        requestUrl: '',
+      });
       setSlashSaved(`/${name} created — try it in any channel`);
       await loadSlashCommands();
     } catch (err) {
@@ -523,8 +568,10 @@ export function ProfilePage() {
 
   async function loadUserGroups() {
     try {
-      const response = await api<UserGroup[]>('/chat/user-groups');
-      setUserGroups(response.data);
+      const response = await api<Paginated<UserGroup>>(
+        '/chat/user-groups?page=1&limit=100',
+      );
+      setUserGroups(response.data.items ?? []);
     } catch {
       setUserGroups([]);
     }
@@ -1179,8 +1226,17 @@ export function ProfilePage() {
               />{' '}
               Silence alerts when Away / Busy / Do not disturb
         </label>
+            <label>
+              Keyword highlights
+              <input
+                value={notifyKeywordsDraft}
+                onChange={(event) => setNotifyKeywordsDraft(event.target.value)}
+                placeholder="urgent, P0, customer escalation"
+              />
+            </label>
             <p className="muted">
-              Mentions still break through quiet hours and Away. Do not disturb blocks calls too.
+              Mentions and keyword matches still break through quiet hours, Away, mute, and
+              mentions-only channels. Do not disturb blocks calls too.
             </p>
             <button
               className="btn"
@@ -1188,8 +1244,18 @@ export function ProfilePage() {
               disabled={notifyPrefsBusy}
               onClick={() => {
                 setNotifyPrefsBusy(true);
+                const keywords = notifyKeywordsDraft
+                  .split(',')
+                  .map((item) => item.trim())
+                  .filter(Boolean)
+                  .slice(0, 50);
                 void saveNotificationPrefs({
-                  ...notifyPrefs,
+                  mode: notifyPrefs.mode,
+                  quietHoursEnabled: notifyPrefs.quietHoursEnabled,
+                  quietStart: notifyPrefs.quietStart,
+                  quietEnd: notifyPrefs.quietEnd,
+                  respectStatus: notifyPrefs.respectStatus,
+                  keywords,
                   timezone:
                     notifyPrefs.timezone.trim() ||
                     Intl.DateTimeFormat().resolvedOptions().timeZone ||
@@ -1197,6 +1263,7 @@ export function ProfilePage() {
                 })
                   .then((savedPrefs) => {
                     setNotifyPrefs(savedPrefs);
+                    setNotifyKeywordsDraft(savedPrefs.keywords.join(', '));
                     setSaved('Notification preferences saved');
                   })
                   .catch((err: unknown) =>
@@ -1470,8 +1537,9 @@ export function ProfilePage() {
             <h2>Slash commands</h2>
             <p className="muted">
               Built-ins: <code>/shrug</code>, <code>/me</code>,{' '}
-              <code>/status</code>, <code>/help</code>. Add custom commands with
-              a template — use <code>{'{text}'}</code> for the rest of the line.
+              <code>/status</code>, <code>/help</code>. Custom commands can post
+              in-channel, reply privately (ephemeral), or call an HTTPS handler.
+              Templates support <code>{'{text}'}</code> and <code>{'{user}'}</code>.
             </p>
           </header>
           <form
@@ -1508,6 +1576,23 @@ export function ProfilePage() {
                 required
               />
             </label>
+            <label className="profile-plain-field">
+              Response mode
+              <select
+                value={slashDraft.responseMode}
+                onChange={(event) =>
+                  setSlashDraft((draft) => ({
+                    ...draft,
+                    responseMode: event.target.value as
+                      | 'in_channel'
+                      | 'ephemeral',
+                  }))
+                }
+              >
+                <option value="in_channel">In channel (visible message)</option>
+                <option value="ephemeral">Ephemeral (only you see it)</option>
+              </select>
+            </label>
             <label className="profile-plain-field" style={{ gridColumn: '1 / -1' }}>
               Response template
               <input
@@ -1520,9 +1605,26 @@ export function ProfilePage() {
                 }
                 placeholder="Shipping: {text}"
                 maxLength={2000}
-                required
               />
             </label>
+            <label className="profile-plain-field" style={{ gridColumn: '1 / -1' }}>
+              Interactive request URL (optional)
+              <input
+                value={slashDraft.requestUrl}
+                onChange={(event) =>
+                  setSlashDraft((draft) => ({
+                    ...draft,
+                    requestUrl: event.target.value,
+                  }))
+                }
+                placeholder="https://example.com/slash/deploy"
+                maxLength={500}
+              />
+            </label>
+            <p className="muted" style={{ gridColumn: '1 / -1', margin: 0 }}>
+              If set, Relay POSTs <code>{'{'} command, text, user_id, channel_id {'}'}</code> and
+              expects <code>{'{'} text, response_type? {'}'}</code>. Template is the fallback.
+            </p>
             <div className="profile-sheet-actions" style={{ gridColumn: '1 / -1' }}>
               <button className="btn" type="submit" disabled={slashBusy}>
                 {slashBusy ? 'Creating…' : 'Add command'}
@@ -1536,6 +1638,10 @@ export function ProfilePage() {
                   <span>
                     /{command.name}
                     {command.builtin ? ' · built-in' : ''}
+                    {!command.builtin
+                      ? ` · ${command.responseMode === 'ephemeral' ? 'ephemeral' : 'in channel'}`
+                      : ''}
+                    {command.requestUrl ? ' · interactive' : ''}
                   </span>
                   <small>{command.description}</small>
                 </div>
@@ -2309,8 +2415,8 @@ export function ProfilePage() {
           <header className="profile-sheet-head">
             <h2>Plan & SSO</h2>
             <p className="muted">
-              Seat limits and OIDC single sign-on (requires Pro or Enterprise;
-              SAML is not available yet).
+              Seat limits and workspace SSO via OIDC or SAML (requires Pro or
+              Enterprise).
             </p>
           </header>
           <div className="profile-fields">
@@ -2484,47 +2590,128 @@ export function ProfilePage() {
                 }
               >
                 <option value="oidc">OIDC</option>
-                <option value="saml">SAML</option>
+                <option value="saml">SAML 2.0</option>
               </select>
             </label>
-            <label>
-              Issuer URL
-              <input
-                value={ssoDraft.ssoIssuerUrl}
-                onChange={(event) =>
-                  setSsoDraft((current) => ({
-                    ...current,
-                    ssoIssuerUrl: event.target.value,
-                  }))
-                }
-              />
-            </label>
-            <label>
-              Client ID
-              <input
-                value={ssoDraft.ssoClientId}
-                onChange={(event) =>
-                  setSsoDraft((current) => ({
-                    ...current,
-                    ssoClientId: event.target.value,
-                  }))
-                }
-              />
-            </label>
-            <label>
-              Client secret
-              <input
-                type="password"
-                value={ssoDraft.ssoClientSecret}
-                placeholder="Leave blank to keep existing"
-                onChange={(event) =>
-                  setSsoDraft((current) => ({
-                    ...current,
-                    ssoClientSecret: event.target.value,
-                  }))
-                }
-              />
-            </label>
+            {ssoDraft.ssoProvider === 'oidc' ? (
+              <>
+                <label>
+                  Issuer URL
+                  <input
+                    value={ssoDraft.ssoIssuerUrl}
+                    onChange={(event) =>
+                      setSsoDraft((current) => ({
+                        ...current,
+                        ssoIssuerUrl: event.target.value,
+                      }))
+                    }
+                    placeholder="https://login.example.com"
+                  />
+                </label>
+                <label>
+                  Client ID
+                  <input
+                    value={ssoDraft.ssoClientId}
+                    onChange={(event) =>
+                      setSsoDraft((current) => ({
+                        ...current,
+                        ssoClientId: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <label>
+                  Client secret
+                  <input
+                    type="password"
+                    value={ssoDraft.ssoClientSecret}
+                    placeholder={
+                      ssoDraft.hasClientSecret
+                        ? 'Leave blank to keep existing'
+                        : 'Required'
+                    }
+                    onChange={(event) =>
+                      setSsoDraft((current) => ({
+                        ...current,
+                        ssoClientSecret: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <p className="muted">
+                  OIDC redirect URI:{' '}
+                  <code>/api/auth/sso/callback</code> (prepend your public API
+                  base URL).
+                </p>
+              </>
+            ) : (
+              <>
+                <label>
+                  IdP Entity ID / Issuer
+                  <input
+                    value={ssoDraft.ssoIssuerUrl}
+                    onChange={(event) =>
+                      setSsoDraft((current) => ({
+                        ...current,
+                        ssoIssuerUrl: event.target.value,
+                      }))
+                    }
+                    placeholder="https://idp.example.com/metadata"
+                  />
+                </label>
+                <label>
+                  IdP SSO URL (HTTP-Redirect)
+                  <input
+                    value={ssoDraft.ssoIdpSsoUrl}
+                    onChange={(event) =>
+                      setSsoDraft((current) => ({
+                        ...current,
+                        ssoIdpSsoUrl: event.target.value,
+                      }))
+                    }
+                    placeholder="https://idp.example.com/sso"
+                  />
+                </label>
+                <label>
+                  IdP X.509 certificate (PEM)
+                  <textarea
+                    value={ssoDraft.ssoIdpCertificate}
+                    rows={5}
+                    placeholder={
+                      ssoDraft.hasIdpCertificate
+                        ? 'Leave blank to keep existing certificate'
+                        : '-----BEGIN CERTIFICATE-----'
+                    }
+                    onChange={(event) =>
+                      setSsoDraft((current) => ({
+                        ...current,
+                        ssoIdpCertificate: event.target.value,
+                      }))
+                    }
+                  />
+                </label>
+                <p className="muted">
+                  SP Entity ID:{' '}
+                  <code>
+                    /api/auth/sso/saml/{activeOrganizationId}
+                  </code>
+                  <br />
+                  ACS URL:{' '}
+                  <code>
+                    /api/auth/sso/saml/{activeOrganizationId}/acs
+                  </code>
+                  <br />
+                  SP metadata:{' '}
+                  <a
+                    href={`/api/auth/sso/saml/${activeOrganizationId}/metadata`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    download XML
+                  </a>
+                </p>
+              </>
+            )}
             <button
               className="btn"
               type="button"
@@ -2533,20 +2720,58 @@ export function ProfilePage() {
                   ssoEnabled: ssoDraft.ssoEnabled,
                   ssoProvider: ssoDraft.ssoProvider,
                   ssoIssuerUrl: ssoDraft.ssoIssuerUrl,
-                  ssoClientId: ssoDraft.ssoClientId,
                 };
-                if (ssoDraft.ssoClientSecret.trim()) {
-                  payload.ssoClientSecret = ssoDraft.ssoClientSecret.trim();
+                if (ssoDraft.ssoProvider === 'oidc') {
+                  payload.ssoClientId = ssoDraft.ssoClientId;
+                  if (ssoDraft.ssoClientSecret.trim()) {
+                    payload.ssoClientSecret = ssoDraft.ssoClientSecret.trim();
+                  }
+                } else {
+                  payload.ssoIdpSsoUrl = ssoDraft.ssoIdpSsoUrl;
+                  if (ssoDraft.ssoIdpCertificate.trim()) {
+                    payload.ssoIdpCertificate =
+                      ssoDraft.ssoIdpCertificate.trim();
+                  }
                 }
                 void api(`/organizations/${activeOrganizationId}/sso`, {
                   method: 'PATCH',
                   body: JSON.stringify(payload),
                 })
-                  .then(() => {
-                    setSsoDraft((current) => ({
-                      ...current,
-                      ssoClientSecret: '',
-                    }));
+                  .then(async () => {
+                    try {
+                      const refreshed = await api<{
+                        ssoEnabled: boolean;
+                        ssoProvider: 'oidc' | 'saml' | null;
+                        ssoIssuerUrl: string | null;
+                        ssoClientId: string | null;
+                        hasClientSecret?: boolean;
+                        ssoIdpSsoUrl?: string | null;
+                        hasIdpCertificate?: boolean;
+                        configured?: boolean;
+                      }>(`/organizations/${activeOrganizationId}/sso`);
+                      setSsoDraft({
+                        ssoEnabled: refreshed.data.ssoEnabled,
+                        ssoProvider: refreshed.data.ssoProvider ?? 'oidc',
+                        ssoIssuerUrl: refreshed.data.ssoIssuerUrl ?? '',
+                        ssoClientId: refreshed.data.ssoClientId ?? '',
+                        ssoClientSecret: '',
+                        ssoIdpSsoUrl: refreshed.data.ssoIdpSsoUrl ?? '',
+                        ssoIdpCertificate: '',
+                        hasClientSecret: Boolean(
+                          refreshed.data.hasClientSecret,
+                        ),
+                        hasIdpCertificate: Boolean(
+                          refreshed.data.hasIdpCertificate,
+                        ),
+                        configured: Boolean(refreshed.data.configured),
+                      });
+                    } catch {
+                      setSsoDraft((current) => ({
+                        ...current,
+                        ssoClientSecret: '',
+                        ssoIdpCertificate: '',
+                      }));
+                    }
                     setSaved('SSO settings saved');
                   })
                   .catch((err: unknown) =>
@@ -2561,12 +2786,14 @@ export function ProfilePage() {
               Save SSO
             </button>
             <p className="muted">
-              Redirect URI for your IdP: <code>/api/auth/sso/callback</code>{' '}
-              (prepend your public API base URL). Client secret is write-only.
+              {ssoDraft.configured
+                ? 'SSO is ready — Test SSO login below.'
+                : 'Complete the fields above and save to enable Test SSO login.'}
             </p>
             <button
               className="ghost"
               type="button"
+              disabled={!ssoDraft.configured}
               onClick={() => {
                 window.location.href = `/api/auth/sso/${activeOrganizationId}/start`;
               }}

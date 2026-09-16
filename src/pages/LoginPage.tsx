@@ -1,4 +1,4 @@
-import { FormEvent, useState } from 'react';
+import { FormEvent, useEffect, useState } from 'react';
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
@@ -17,6 +17,7 @@ export function LoginPage() {
   const location = useLocation();
   const [searchParams] = useSearchParams();
   const inviteToken = searchParams.get('inviteToken');
+  const inviteEmailHint = searchParams.get('email') ?? '';
   const [error, setError] = useState('');
   const [fieldErrors, setFieldErrors] = useState<FieldErrors<keyof LoginFields>>(
     {},
@@ -27,6 +28,13 @@ export function LoginPage() {
     email: string;
   } | null>(null);
   const [otpCode, setOtpCode] = useState('');
+  const [emailDraft, setEmailDraft] = useState(inviteEmailHint);
+
+  useEffect(() => {
+    if (inviteEmailHint) {
+      setEmailDraft(inviteEmailHint);
+    }
+  }, [inviteEmailHint]);
   const fromRaw = (location.state as { from?: string } | null)?.from;
   const from =
     inviteToken
@@ -165,12 +173,16 @@ export function LoginPage() {
                   name="email"
                   type="email"
                   autoComplete="email"
+                  value={emailDraft}
                   className={fieldErrors.email ? 'input-invalid' : undefined}
                   aria-invalid={fieldErrors.email ? true : undefined}
                   aria-describedby={
                     fieldErrors.email ? 'login-email-error' : undefined
                   }
-                  onChange={() => clearField('email')}
+                  onChange={(event) => {
+                    setEmailDraft(event.target.value);
+                    clearField('email');
+                  }}
                 />
                 {fieldErrors.email ? (
                   <span className="field-error" id="login-email-error" role="alert">
