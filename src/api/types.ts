@@ -252,6 +252,22 @@ export type ThreadSummary = {
   hasUnread?: boolean;
 };
 
+export type MentionActivity = {
+  conversationId: string;
+  conversationName: string | null;
+  conversationType: 'private' | 'group';
+  message: ChatMessage;
+  unread: boolean;
+};
+
+export type DraftInboxItem = {
+  conversationId: string;
+  conversationName: string | null;
+  conversationType: 'private' | 'group';
+  body: string;
+  updatedAt: string;
+};
+
 export type ChatMessage = {
   id: string;
   conversationId: string;
@@ -344,8 +360,9 @@ export type MessageReminder = {
   conversationId: string;
   messageId: string;
   remindAt: string;
-  status: 'pending' | 'sent' | 'cancelled';
+  status: 'pending' | 'sent' | 'cancelled' | 'completed';
   notifiedAt: string | null;
+  completedAt?: string | null;
   createdAt: string;
   bodySnippet?: string;
   conversationName?: string | null;
@@ -528,6 +545,32 @@ export type AppCatalogItem = {
   icon: string;
   iconUrl?: string | null;
   installed?: boolean;
+  configurable?: boolean;
+  category?: 'integration' | 'bot';
+  oauthRequired?: boolean;
+  capabilities?: Array<'unfurl' | 'create_issue' | 'events' | 'meetings'>;
+  connected?: boolean;
+  connectionStatus?: string | null;
+  providerAccountName?: string | null;
+};
+
+export type InstalledApp = {
+  id: string;
+  organizationId: string;
+  appKey: string;
+  key: string;
+  name?: string;
+  description?: string;
+  config: Record<string, unknown>;
+  installedBy: string;
+  createdAt: string;
+  configurable?: boolean;
+  category?: 'integration' | 'bot';
+  oauthRequired?: boolean;
+  capabilities?: Array<'unfurl' | 'create_issue' | 'events' | 'meetings'>;
+  connected?: boolean;
+  connectionStatus?: string | null;
+  providerAccountName?: string | null;
 };
 
 export type ConnectInvite = {
@@ -538,6 +581,23 @@ export type ConnectInvite = {
   acceptedAt?: string | null;
   token?: string;
   inviteUrl?: string | null;
+  inviteKind?: 'guest_email' | 'workspace_share';
+  partnerOrganizationName?: string | null;
+};
+
+export type ConnectLink = {
+  id: string;
+  hostOrganizationId: string;
+  hostConversationId: string;
+  partnerOrganizationId: string;
+  partnerConversationId: string;
+  partnerOrganizationName: string | null;
+  hostOrganizationName: string | null;
+  status: 'pending' | 'active' | 'disconnected';
+  createdBy: string;
+  acceptedBy: string | null;
+  createdAt: string;
+  disconnectedAt: string | null;
 };
 
 export type ConnectStatus = {
@@ -546,4 +606,7 @@ export type ConnectStatus = {
   sharedExternalLabel: string | null;
   conversationName?: string | null;
   invites: ConnectInvite[];
+  links?: ConnectLink[];
+  connectRole?: 'host' | 'partner' | null;
+  hostConversationId?: string | null;
 };

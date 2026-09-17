@@ -167,6 +167,20 @@ export function CommandPalette() {
         run: () => navigate('/chat'),
       },
       {
+        id: 'action-unreads',
+        group: 'Actions',
+        title: 'Open Unreads',
+        subtitle: 'Jump to unread channels and DMs',
+        run: () => {
+          navigate('/chat');
+          window.setTimeout(() => {
+            window.dispatchEvent(
+              new CustomEvent('relay:command', { detail: { action: 'unreads' } }),
+            );
+          }, 50);
+        },
+      },
+      {
         id: 'action-new-channel',
         group: 'Actions',
         title: 'Create a channel',

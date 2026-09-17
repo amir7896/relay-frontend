@@ -1,4 +1,4 @@
-import { FormEvent, MouseEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FormEvent, MouseEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { NavLink, Outlet, useMatch, useNavigate } from 'react-router-dom';
 import { api } from '../../api/client';
 import { useAuth } from '../../auth/AuthContext';
@@ -18,6 +18,7 @@ import { RelativeTime } from '../../components/RelativeTime';
 import { notify, subscribeWebPush, shouldShowNotificationBanner, dismissNotificationPrompt, loadNotificationPrefs, getMessageNotifyDecision } from '../../lib/notifications';
 import { usePwaInstall } from '../../hooks/usePwaInstall';
 import { CommandPaletteHintButton } from '../../components/CommandPalette';
+import { clearMessageDraft } from '../../lib/messageDrafts';
 import { useDirectory } from '../../people/useDirectory';
 import { UserAvatar } from '../../components/UserAvatar';
 import { useOrganization } from '../../organizations/OrganizationContext';
@@ -25,13 +26,18 @@ import type {
   ChatMessage,
   Conversation,
   GlobalSearchHit,
+  MessageBookmark,
   MessageReminder,
   Paginated,
   PresenceStatus,
   SidebarSection,
+  MentionActivity,
+  DraftInboxItem,
   ThreadSummary,
   UserProfile,
 } from '../../api/types';
+
+type HomeView = 'unreads' | 'activity' | 'drafts' | 'threads' | 'later';
 
 export type MessengerOutletContext = {
   openNewChat: () => void;
@@ -61,7 +67,40 @@ function hitConversationTitle(
 }
 
 function messageSnippet(message: ChatMessage, me?: string) {
-  return previewText(message, me) ?? 'Message';
+  return singleLinePreview(previewText(message, me) ?? 'Message');
+}
+
+function singleLinePreview(text: string, max = 140) {
+  const cleaned = text.replace(/\s+/g, ' ').trim();
+  if (cleaned.length <= max) return cleaned;
+  return `${cleaned.slice(0, max - 1)}…`;
+}
+
+function InboxListRow({
+  className = '',
+  onClick,
+  children,
+}: {
+  className?: string;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      className={`home-feed-row${className ? ` ${className}` : ''}`}
+      onClick={onClick}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onClick();
+        }
+      }}
+    >
+      {children}
+    </div>
+  );
 }
 
 function previewText(message: ChatMessage | null | undefined, me?: string) {
@@ -190,13 +229,25 @@ export function MessengerPage() {
   const [browseOpen, setBrowseOpen] = useState(false);
   const [publicChannels, setPublicChannels] = useState<Conversation[]>([]);
   const [browseBusy, setBrowseBusy] = useState(false);
-  const [threadsOpen, setThreadsOpen] = useState(false);
+  const [homeView, setHomeView] = useState<HomeView | null>(null);
   const [threadItems, setThreadItems] = useState<ThreadSummary[]>([]);
   const [threadsBusy, setThreadsBusy] = useState(false);
   const [threadsUnreadTotal, setThreadsUnreadTotal] = useState(0);
-  const [laterOpen, setLaterOpen] = useState(false);
+  const [activityTab, setActivityTab] = useState<'mentions' | 'threads'>(
+    'mentions',
+  );
+  const [mentionItems, setMentionItems] = useState<MentionActivity[]>([]);
+  const [mentionsBusy, setMentionsBusy] = useState(false);
+  const [mentionsUnreadTotal, setMentionsUnreadTotal] = useState(0);
+  const [draftItems, setDraftItems] = useState<DraftInboxItem[]>([]);
+  const [draftsBusy, setDraftsBusy] = useState(false);
+  const [draftsCount, setDraftsCount] = useState(0);
+  const [laterTab, setLaterTab] = useState<'later' | 'saved'>('later');
   const [laterItems, setLaterItems] = useState<MessageReminder[]>([]);
+  const [savedItems, setSavedItems] = useState<MessageBookmark[]>([]);
   const [laterBusy, setLaterBusy] = useState(false);
+  const [savedBusy, setSavedBusy] = useState(false);
+  const [unreadsBusy, setUnreadsBusy] = useState(false);
   const [sidebarSections, setSidebarSections] = useState<SidebarSection[]>([]);
   const [sidebarBusy, setSidebarBusy] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -323,6 +374,30 @@ export function MessengerPage() {
       isLatestUpdate &&
       notifyDecision.notify;
 
+    if (
+      existing &&
+      existing.id !== activeId &&
+      fromOther &&
+      mentionsMe &&
+      isBrandNew &&
+      isLatestUpdate
+    ) {
+      setMentionsUnreadTotal((count) => count + 1);
+      setMentionItems((current) => {
+        const next: MentionActivity = {
+          conversationId: existing.id,
+          conversationName: existing.name,
+          conversationType: existing.type,
+          message,
+          unread: true,
+        };
+        return [
+          next,
+          ...current.filter((item) => item.message.id !== message.id),
+        ].slice(0, 40);
+      });
+    }
+
     setItems((current) => {
       const index = current.findIndex((item) => item.id === message.conversationId);
       if (index === -1) {
@@ -422,13 +497,88 @@ export function MessengerPage() {
   const refreshLater = useCallback(async () => {
     try {
       const response = await api<Paginated<MessageReminder>>(
-        '/chat/reminders?page=1&limit=50',
+        '/chat/reminders?page=1&limit=100&scope=all',
       );
       setLaterItems(response.data.items ?? []);
     } catch {
       // ignore badge errors
     }
   }, []);
+
+  const refreshSaved = useCallback(async () => {
+    try {
+      const response = await api<Paginated<MessageBookmark>>(
+        '/chat/bookmarks?page=1&limit=100',
+      );
+      setSavedItems(response.data.items ?? []);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeConversationId) {
+      setHomeView(null);
+    }
+  }, [activeConversationId]);
+
+  const laterPendingCount = useMemo(
+    () => laterItems.filter((item) => item.status === 'pending').length,
+    [laterItems],
+  );
+
+  const unreadConversations = useMemo(() => {
+    return items
+      .filter(
+        (item) =>
+          (item.unreadCount ?? 0) > 0 || Boolean(item.hasUnreadMention),
+      )
+      .slice()
+      .sort((a, b) => {
+        const aMention = a.hasUnreadMention ? 1 : 0;
+        const bMention = b.hasUnreadMention ? 1 : 0;
+        if (aMention !== bMention) return bMention - aMention;
+        const aTime = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0;
+        const bTime = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0;
+        return bTime - aTime;
+      });
+  }, [items]);
+
+  const unreadsTotal = useMemo(
+    () =>
+      unreadConversations.reduce(
+        (sum, item) => sum + Math.max(1, item.unreadCount || 0),
+        0,
+      ),
+    [unreadConversations],
+  );
+
+  const unreadChannels = useMemo(
+    () => unreadConversations.filter((item) => item.type === 'group'),
+    [unreadConversations],
+  );
+
+  const unreadDms = useMemo(
+    () => unreadConversations.filter((item) => item.type === 'private'),
+    [unreadConversations],
+  );
+
+  const laterSections = useMemo(() => {
+    const now = Date.now();
+    const overdue: MessageReminder[] = [];
+    const upcoming: MessageReminder[] = [];
+    const completed: MessageReminder[] = [];
+    for (const item of laterItems) {
+      if (item.status === 'completed' || item.status === 'sent') {
+        completed.push(item);
+        continue;
+      }
+      if (item.status !== 'pending') continue;
+      if (new Date(item.remindAt).getTime() <= now) overdue.push(item);
+      else upcoming.push(item);
+    }
+    return { overdue, upcoming, completed };
+  }, [laterItems]);
 
   useEffect(() => {
     let cancelled = false;
@@ -447,10 +597,38 @@ export function MessengerPage() {
         // ignore badge errors
       }
     }
+    async function refreshMentionsBadge() {
+      try {
+        const response = await api<Paginated<MentionActivity>>(
+          '/chat/mentions?page=1&limit=40',
+        );
+        if (cancelled) return;
+        const items = response.data.items ?? [];
+        setMentionItems(items);
+        setMentionsUnreadTotal(items.filter((item) => item.unread).length);
+      } catch {
+        // ignore
+      }
+    }
+    async function refreshDraftsBadge() {
+      try {
+        const response = await api<Paginated<DraftInboxItem>>(
+          '/chat/drafts?page=1&limit=40',
+        );
+        if (cancelled) return;
+        const items = (response.data.items ?? []).filter((item) =>
+          item.body.trim(),
+        );
+        setDraftItems(items);
+        setDraftsCount(items.length);
+      } catch {
+        // ignore
+      }
+    }
     async function refreshLaterBadge() {
       try {
         const response = await api<Paginated<MessageReminder>>(
-          '/chat/reminders?page=1&limit=50',
+          '/chat/reminders?page=1&limit=100&scope=all',
         );
         if (cancelled) return;
         setLaterItems(response.data.items ?? []);
@@ -458,8 +636,22 @@ export function MessengerPage() {
         // ignore
       }
     }
+    async function refreshSavedBadge() {
+      try {
+        const response = await api<Paginated<MessageBookmark>>(
+          '/chat/bookmarks?page=1&limit=100',
+        );
+        if (cancelled) return;
+        setSavedItems(response.data.items ?? []);
+      } catch {
+        // ignore
+      }
+    }
     void refreshThreadBadge();
+    void refreshMentionsBadge();
+    void refreshDraftsBadge();
     void refreshLaterBadge();
+    void refreshSavedBadge();
     return () => {
       cancelled = true;
     };
@@ -688,11 +880,15 @@ export function MessengerPage() {
       } else if (detail?.action === 'new-dm') {
         setModalError('');
         setDmOpen(true);
+      } else if (detail?.action === 'unreads') {
+        setHomeView('unreads');
+        setModalError('');
+        navigate('/chat');
       }
     };
     window.addEventListener('relay:command', onCommand);
     return () => window.removeEventListener('relay:command', onCommand);
-  }, []);
+  }, [navigate]);
 
   const peopleHits = useMemo(() => {
     const term = query.trim().toLowerCase();
@@ -1258,9 +1454,7 @@ export function MessengerPage() {
     }
   }
 
-  async function openThreadsHome() {
-    setThreadsOpen(true);
-    setModalError('');
+  async function loadThreadsHome() {
     setThreadsBusy(true);
     try {
       const response = await api<Paginated<ThreadSummary>>(
@@ -1287,19 +1481,171 @@ export function MessengerPage() {
     }
   }
 
-  async function openLaterInbox() {
-    setLaterOpen(true);
+  async function openThreadsHome() {
+    setHomeView('threads');
     setModalError('');
-    setLaterBusy(true);
+    if (activeIdRef.current) navigate('/chat');
+    await loadThreadsHome();
+  }
+
+  async function loadMentionsHome() {
+    setMentionsBusy(true);
     try {
-      await refreshLater();
+      const response = await api<Paginated<MentionActivity>>(
+        '/chat/mentions?page=1&limit=40',
+      );
+      const items = response.data.items ?? [];
+      setMentionItems(items);
+      setMentionsUnreadTotal(items.filter((item) => item.unread).length);
+      await ensureProfiles(items.map((item) => item.message.senderId));
     } catch (err) {
       setModalError(
-        err instanceof Error ? err.message : 'Could not load reminders',
+        err instanceof Error ? err.message : 'Could not load mentions',
       );
-      setLaterItems([]);
+      setMentionItems([]);
+    } finally {
+      setMentionsBusy(false);
+    }
+  }
+
+  async function openActivityHome(tab: 'mentions' | 'threads' = 'mentions') {
+    setActivityTab(tab);
+    setHomeView('activity');
+    setModalError('');
+    if (activeIdRef.current) navigate('/chat');
+    if (tab === 'mentions') {
+      await loadMentionsHome();
+    } else {
+      await loadThreadsHome();
+    }
+  }
+
+  async function openDraftsHome() {
+    setHomeView('drafts');
+    setModalError('');
+    if (activeIdRef.current) navigate('/chat');
+    setDraftsBusy(true);
+    try {
+      const response = await api<Paginated<DraftInboxItem>>(
+        '/chat/drafts?page=1&limit=40',
+      );
+      const items = (response.data.items ?? []).filter((item) =>
+        item.body.trim(),
+      );
+      setDraftItems(items);
+      setDraftsCount(items.length);
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not load drafts',
+      );
+      setDraftItems([]);
+    } finally {
+      setDraftsBusy(false);
+    }
+  }
+
+  function openUnreadsHome() {
+    setHomeView('unreads');
+    setModalError('');
+    if (activeIdRef.current) navigate('/chat');
+  }
+
+  function openUnreadConversation(conversation: Conversation) {
+    setHomeView(null);
+    const focusId = conversation.firstUnreadMentionMessageId;
+    if (focusId) {
+      navigate(
+        `/chat/${conversation.id}?focus=${encodeURIComponent(focusId)}`,
+      );
+      return;
+    }
+    navigate(`/chat/${conversation.id}`);
+  }
+
+  async function markConversationRead(conversationId: string) {
+    try {
+      await api(`/chat/conversations/${conversationId}/seen`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+    } catch {
+      // Still clear locally so the Unreads feed updates
+    }
+    if (holdUnreadRef.current === conversationId) {
+      holdUnreadRef.current = null;
+    }
+    clearUnread(conversationId);
+  }
+
+  async function markAllUnreadsRead() {
+    if (unreadConversations.length === 0 || unreadsBusy) return;
+    setUnreadsBusy(true);
+    setModalError('');
+    try {
+      const ids = unreadConversations.map((item) => item.id);
+      await Promise.all(
+        ids.map((conversationId) =>
+          api(`/chat/conversations/${conversationId}/seen`, {
+            method: 'POST',
+            body: JSON.stringify({}),
+          }).catch(() => null),
+        ),
+      );
+      holdUnreadRef.current = null;
+      setItems((current) =>
+        current.map((item) =>
+          ids.includes(item.id)
+            ? {
+                ...item,
+                unreadCount: 0,
+                hasUnreadMention: false,
+                firstUnreadMentionMessageId: null,
+              }
+            : item,
+        ),
+      );
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not mark all as read',
+      );
+    } finally {
+      setUnreadsBusy(false);
+    }
+  }
+
+  async function discardDraft(conversationId: string) {
+    try {
+      clearMessageDraft(conversationId);
+      setDraftItems((current) => {
+        const next = current.filter(
+          (item) => item.conversationId !== conversationId,
+        );
+        setDraftsCount(next.length);
+        return next;
+      });
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not discard draft',
+      );
+    }
+  }
+
+  async function openLaterInbox(tab: 'later' | 'saved' = 'later') {
+    setLaterTab(tab);
+    setHomeView('later');
+    setModalError('');
+    if (activeIdRef.current) navigate('/chat');
+    setLaterBusy(true);
+    setSavedBusy(true);
+    try {
+      await Promise.all([refreshLater(), refreshSaved()]);
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not load Later',
+      );
     } finally {
       setLaterBusy(false);
+      setSavedBusy(false);
     }
   }
 
@@ -1312,6 +1658,52 @@ export function MessengerPage() {
     } catch (err) {
       setModalError(
         err instanceof Error ? err.message : 'Could not cancel reminder',
+      );
+    }
+  }
+
+  async function completeLaterReminder(reminderId: string) {
+    try {
+      const response = await api<MessageReminder>(
+        `/chat/reminders/${reminderId}/complete`,
+        { method: 'POST', body: JSON.stringify({}) },
+      );
+      setLaterItems((current) =>
+        current.map((item) =>
+          item.id === reminderId ? { ...item, ...response.data } : item,
+        ),
+      );
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not complete reminder',
+      );
+    }
+  }
+
+  async function clearCompletedLater() {
+    try {
+      await api('/chat/reminders/completed', { method: 'DELETE' });
+      setLaterItems((current) =>
+        current.filter(
+          (item) => item.status !== 'completed' && item.status !== 'sent',
+        ),
+      );
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not clear completed',
+      );
+    }
+  }
+
+  async function unsaveBookmark(messageId: string) {
+    try {
+      await api(`/chat/bookmarks/${messageId}`, { method: 'DELETE' });
+      setSavedItems((current) =>
+        current.filter((item) => item.messageId !== messageId),
+      );
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not unsave message',
       );
     }
   }
@@ -1341,6 +1733,7 @@ export function MessengerPage() {
         'slack-messenger',
         hasThread ? 'has-thread' : '',
         hasDetails ? 'has-details' : '',
+        homeView ? 'has-home' : '',
       ]
         .filter(Boolean)
         .join(' ')}
@@ -1397,7 +1790,7 @@ export function MessengerPage() {
           className="inbox-search"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-              placeholder="Filter list — or press ⌘K / Ctrl+K"
+              placeholder="Search…"
               aria-label="Search channels and messages"
               title="Operators: from:name · in:#channel · has:file|image|link|audio · after:7d · before:2024-01-01"
         />
@@ -1434,59 +1827,110 @@ export function MessengerPage() {
           </div>
         ) : null}
         <div className="inbox-list">
-          <div className="inbox-section-head">
-            <p className="inbox-section-label">
-              Threads
-              {threadsUnreadTotal > 0 ? (
-                <span className="inbox-unread-pill">{threadsUnreadTotal}</span>
-              ) : null}
-            </p>
+          <nav className="inbox-nav" aria-label="Home">
             <button
               type="button"
-              className="inbox-section-add"
-              aria-label="Open threads"
-              title="Threads you follow"
+              className={`inbox-nav-row${
+                homeView === 'unreads' ? ' is-active' : ''
+              }${unreadsTotal > 0 ? ' has-unread' : ''}`}
+              onClick={() => openUnreadsHome()}
+            >
+              <span className="inbox-nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="18" height="18">
+                  <path
+                    fill="currentColor"
+                    d="M3.5 4.5A1.5 1.5 0 0 1 5 3h10a1.5 1.5 0 0 1 1.5 1.5v11A1.5 1.5 0 0 1 15 17H5a1.5 1.5 0 0 1-1.5-1.5v-11ZM6 6.25v1.5h8v-1.5H6Zm0 3.5v1.5h8v-1.5H6Zm0 3.5V14.75h5V13.25H6Z"
+                  />
+                </svg>
+              </span>
+              <span className="inbox-nav-label">Unreads</span>
+              {unreadsTotal > 0 ? (
+                <span className="inbox-nav-badge">{unreadsTotal}</span>
+              ) : null}
+            </button>
+            <button
+              type="button"
+              className={`inbox-nav-row${
+                homeView === 'activity' ? ' is-active' : ''
+              }${mentionsUnreadTotal > 0 ? ' has-unread' : ''}`}
+              onClick={() => void openActivityHome('mentions')}
+            >
+              <span className="inbox-nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="18" height="18">
+                  <path
+                    fill="currentColor"
+                    d="M10 2a6 6 0 0 0-6 6v2.3l-1.4 2.1A1 1 0 0 0 3.4 14h13.2a1 1 0 0 0 .8-1.6L16 10.3V8a6 6 0 0 0-6-6Zm0 16a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 10 18Z"
+                  />
+                </svg>
+              </span>
+              <span className="inbox-nav-label">Activity</span>
+              {mentionsUnreadTotal > 0 ? (
+                <span className="inbox-nav-badge">{mentionsUnreadTotal}</span>
+              ) : null}
+            </button>
+            <button
+              type="button"
+              className={`inbox-nav-row${
+                homeView === 'drafts' ? ' is-active' : ''
+              }${draftsCount > 0 ? ' has-unread' : ''}`}
+              onClick={() => void openDraftsHome()}
+            >
+              <span className="inbox-nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="18" height="18">
+                  <path
+                    fill="currentColor"
+                    d="M4 3.5A1.5 1.5 0 0 1 5.5 2h6.1L16 6.4V16.5A1.5 1.5 0 0 1 14.5 18h-9A1.5 1.5 0 0 1 4 16.5v-13ZM11 3v3.5h3.5L11 3Zm-5 7h8v1.5H6V10Zm0 3h5v1.5H6V13Z"
+                  />
+                </svg>
+              </span>
+              <span className="inbox-nav-label">Drafts & sent</span>
+              {draftsCount > 0 ? (
+                <span className="inbox-nav-badge">{draftsCount}</span>
+              ) : null}
+            </button>
+            <button
+              type="button"
+              className={`inbox-nav-row${
+                homeView === 'threads' ? ' is-active' : ''
+              }${threadsUnreadTotal > 0 ? ' has-unread' : ''}`}
               onClick={() => void openThreadsHome()}
             >
-              ↗
-            </button>
-          </div>
-          <button
-            type="button"
-            className="inbox-empty-link"
-            onClick={() => void openThreadsHome()}
-          >
-            {threadsUnreadTotal > 0
-              ? `${threadsUnreadTotal} unread in threads`
-              : 'View threads you follow'}
-          </button>
-
-          <div className="inbox-section-head">
-            <p className="inbox-section-label">
-              Later
-              {laterItems.length > 0 ? (
-                <span className="inbox-unread-pill">{laterItems.length}</span>
+              <span className="inbox-nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="18" height="18">
+                  <path
+                    fill="currentColor"
+                    d="M4 4h9a2 2 0 0 1 2 2v5.2a2 2 0 0 1-2 2H9.4L6 16.5V13.2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm12 2.5V12a2 2 0 0 1-2 2h-.2v1.8L16.6 14H16a3.5 3.5 0 0 0 3.5-3.5V8A2 2 0 0 0 18 6.1c-.3-.1-.7-.1-1-.1-.3 0-.7 0-1 .1Z"
+                  />
+                </svg>
+              </span>
+              <span className="inbox-nav-label">Threads</span>
+              {threadsUnreadTotal > 0 ? (
+                <span className="inbox-nav-badge">{threadsUnreadTotal}</span>
               ) : null}
-            </p>
+            </button>
             <button
               type="button"
-              className="inbox-section-add"
-              aria-label="Open Later reminders"
-              title="Reminders"
-              onClick={() => void openLaterInbox()}
+              className={`inbox-nav-row${
+                homeView === 'later' ? ' is-active' : ''
+              }${laterPendingCount > 0 ? ' has-unread' : ''}`}
+              onClick={() => void openLaterInbox('later')}
             >
-              ⏰
+              <span className="inbox-nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="18" height="18">
+                  <path
+                    fill="currentColor"
+                    d="M10 2a8 8 0 1 0 0 16 8 8 0 0 0 0-16Zm.75 4.25v3.4l2.6 1.55-.75 1.25L9.25 10.4V6.25h1.5Z"
+                  />
+                </svg>
+              </span>
+              <span className="inbox-nav-label">Later</span>
+              {laterPendingCount > 0 ? (
+                <span className="inbox-nav-badge">{laterPendingCount}</span>
+              ) : savedItems.length > 0 ? (
+                <span className="inbox-nav-meta">{savedItems.length}</span>
+              ) : null}
             </button>
-          </div>
-          <button
-            type="button"
-            className="inbox-empty-link"
-            onClick={() => void openLaterInbox()}
-          >
-            {laterItems.length > 0
-              ? `${laterItems.length} reminder${laterItems.length === 1 ? '' : 's'}`
-              : 'Reminders from message menus'}
-          </button>
+          </nav>
 
           <div className="inbox-section-head">
             <p className="inbox-section-label">Channels</p>
@@ -1699,7 +2143,667 @@ export function MessengerPage() {
           ) : null}
         </div>
       </aside>
-      <Outlet context={outletContext} />
+      {homeView ? (
+        <section className="inbox-home-pane" aria-label="Home">
+          <header className="inbox-home-head">
+            <button
+              type="button"
+              className="ghost inbox-home-back"
+              aria-label="Back to conversations"
+              onClick={() => setHomeView(null)}
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path
+                  fill="currentColor"
+                  d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"
+                />
+              </svg>
+            </button>
+            <h2>
+              {homeView === 'unreads'
+                ? 'Unreads'
+                : homeView === 'activity'
+                  ? 'Activity'
+                  : homeView === 'drafts'
+                    ? 'Drafts'
+                    : homeView === 'threads'
+                      ? 'Threads'
+                      : 'Later'}
+            </h2>
+          </header>
+          <div className="inbox-home-body">
+            {homeView === 'unreads' ? (
+              <>
+<div className="unreads-toolbar">
+          <p className="muted unreads-toolbar-copy">
+            {unreadsTotal > 0
+              ? `${unreadsTotal} unread across ${unreadConversations.length} conversation${
+                  unreadConversations.length === 1 ? '' : 's'
+                }`
+              : 'You’re caught up — no unread messages.'}
+          </p>
+          {unreadConversations.length > 0 ? (
+            <button
+              type="button"
+              className="ghost unreads-mark-all"
+              disabled={unreadsBusy}
+              onClick={() => void markAllUnreadsRead()}
+            >
+              {unreadsBusy ? 'Marking…' : 'Mark all as read'}
+            </button>
+          ) : null}
+        </div>
+
+        {unreadConversations.length === 0 ? (
+          <div className="unreads-empty">
+            <p className="muted">
+              New messages in channels and DMs will land here — same idea as
+              Slack Unreads.
+            </p>
+          </div>
+        ) : (
+          <div className="unreads-feed">
+            {unreadChannels.length > 0 ? (
+              <section className="unreads-section">
+                <h3 className="unreads-section-label">Channels</h3>
+                <ul className="unreads-list">
+                  {unreadChannels.map((conversation) => {
+                    const title = conversationTitle(
+                      conversation,
+                      me,
+                      byUserId,
+                    );
+                    const snippet = conversation.lastMessage
+                      ? messageSnippet(conversation.lastMessage, me)
+                      : 'New activity';
+                    return (
+                      <li key={conversation.id}>
+                        <div
+                          className={`unreads-row${
+                            conversation.hasUnreadMention ? ' has-mention' : ''
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            className="unreads-row-main"
+                            onClick={() => openUnreadConversation(conversation)}
+                          >
+                            <span className="unreads-row-title">
+                              <span className="unreads-hash" aria-hidden="true">
+                                #
+                              </span>
+                              {title.replace(/^#/, '')}
+                              {conversation.hasUnreadMention ? (
+                                <span className="unreads-mention-pill">@</span>
+                              ) : null}
+                            </span>
+                            <span className="unreads-row-snippet muted">
+                              {snippet}
+                            </span>
+                          </button>
+                          <div className="unreads-row-side">
+                            {conversation.lastMessageAt ? (
+                              <RelativeTime value={conversation.lastMessageAt} />
+                            ) : null}
+                            <span className="inbox-unread-pill">
+                              {Math.max(1, conversation.unreadCount || 0)}
+                            </span>
+                            <button
+                              type="button"
+                              className="ghost unreads-mark-one"
+                              title="Mark as read"
+                              aria-label={`Mark ${title} as read`}
+                              onClick={() =>
+                                void markConversationRead(conversation.id)
+                              }
+                            >
+                              ✓
+                            </button>
+                          </div>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            ) : null}
+
+            {unreadDms.length > 0 ? (
+              <section className="unreads-section">
+                <h3 className="unreads-section-label">Direct messages</h3>
+                <ul className="unreads-list">
+                  {unreadDms.map((conversation) => {
+                    const title = conversationTitle(
+                      conversation,
+                      me,
+                      byUserId,
+                    );
+                    const peer = otherMember(conversation, me);
+                    const snippet = conversation.lastMessage
+                      ? messageSnippet(conversation.lastMessage, me)
+                      : 'New activity';
+                    return (
+                      <li key={conversation.id}>
+                        <div
+                          className={`unreads-row${
+                            conversation.hasUnreadMention ? ' has-mention' : ''
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            className="unreads-row-main"
+                            onClick={() => openUnreadConversation(conversation)}
+                          >
+                            <UserAvatar
+                              profile={
+                                peer ? byUserId.get(peer.userId) : null
+                              }
+                              name={title}
+                              size="sm"
+                              className="unreads-dm-avatar"
+                            />
+                            <span className="unreads-row-copy">
+                              <span className="unreads-row-title">{title}</span>
+                              <span className="unreads-row-snippet muted">
+                                {snippet}
+                              </span>
+                            </span>
+                          </button>
+                          <div className="unreads-row-side">
+                            {conversation.lastMessageAt ? (
+                              <RelativeTime value={conversation.lastMessageAt} />
+                            ) : null}
+                            <span className="inbox-unread-pill">
+                              {Math.max(1, conversation.unreadCount || 0)}
+                            </span>
+                            <button
+                              type="button"
+                              className="ghost unreads-mark-one"
+                              title="Mark as read"
+                              aria-label={`Mark ${title} as read`}
+                              onClick={() =>
+                                void markConversationRead(conversation.id)
+                              }
+                            >
+                              ✓
+                            </button>
+                          </div>
+                        </div>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            ) : null}
+          </div>
+        )}
+        {modalError ? <p className="error">{modalError}</p> : null}
+              </>
+            ) : null}
+            {homeView === 'activity' ? (
+              <>
+<div className="later-tabs activity-tabs" role="tablist" aria-label="Activity views">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activityTab === 'mentions'}
+            className={activityTab === 'mentions' ? 'on' : ''}
+            onClick={() => {
+              setActivityTab('mentions');
+              void loadMentionsHome();
+            }}
+          >
+            Mentions
+            {mentionsUnreadTotal > 0 ? (
+              <span className="inbox-unread-pill">{mentionsUnreadTotal}</span>
+            ) : null}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={activityTab === 'threads'}
+            className={activityTab === 'threads' ? 'on' : ''}
+            onClick={() => {
+              setActivityTab('threads');
+              void loadThreadsHome();
+            }}
+          >
+            Threads
+            {threadsUnreadTotal > 0 ? (
+              <span className="inbox-unread-pill">{threadsUnreadTotal}</span>
+            ) : null}
+          </button>
+        </div>
+
+        {activityTab === 'mentions' ? (
+          <>
+            {mentionsBusy ? <p className="muted">Loading mentions…</p> : null}
+            {!mentionsBusy && mentionItems.length === 0 ? (
+              <p className="muted">
+                When someone @mentions you, it shows up here — just like Slack
+                Activity.
+              </p>
+            ) : null}
+            <ul className="threads-home-list activity-mentions-list">
+              {mentionItems.map((item) => {
+                const channelLabel =
+                  item.conversationType === 'group'
+                    ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
+                    : item.conversationName || 'Direct message';
+                const sender = displayName(byUserId.get(item.message.senderId));
+                return (
+                  <li key={item.message.id}>
+                    <InboxListRow
+                      className={item.unread ? 'unread' : ''}
+                      onClick={() => {
+                        setHomeView(null);
+                        const focus = encodeURIComponent(item.message.id);
+                        const thread = item.message.threadRootId
+                          ? `&thread=${encodeURIComponent(item.message.threadRootId)}`
+                          : '';
+                        navigate(
+                          `/chat/${item.conversationId}?focus=${focus}${thread}`,
+                        );
+                      }}
+                    >
+                      <div className="threads-home-meta">
+                        <UserAvatar
+                          profile={byUserId.get(item.message.senderId)}
+                          name={sender}
+                          size="sm"
+                        />
+                        <strong>{sender}</strong>
+                        <span className="muted">mentioned you in {channelLabel}</span>
+                        <RelativeTime value={item.message.createdAt} />
+                      </div>
+                      <span className="threads-home-snippet">
+                        {messageSnippet(item.message, me)}
+                      </span>
+                    </InboxListRow>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        ) : (
+          <>
+            {threadsBusy ? <p className="muted">Loading threads…</p> : null}
+            {!threadsBusy && threadItems.length === 0 ? (
+              <p className="muted">
+                Open or reply in a thread and it will show up here.
+              </p>
+            ) : null}
+            <ul className="threads-home-list">
+              {threadItems.map((item) => {
+                const channelLabel =
+                  item.conversationType === 'group'
+                    ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
+                    : item.conversationName || 'Direct message';
+                const latest = item.latestReply ?? item.root;
+                const unread = (item.unreadCount ?? 0) > 0;
+                return (
+                  <li key={item.root.id}>
+                    <InboxListRow
+                      className={unread ? 'unread' : ''}
+                      onClick={() => {
+                        setHomeView(null);
+                        navigate(
+                          `/chat/${item.conversationId}?thread=${item.root.id}`,
+                        );
+                      }}
+                    >
+                      <div className="threads-home-meta">
+                        <strong>{channelLabel}</strong>
+                        {unread ? (
+                          <span className="inbox-unread-pill">
+                            {item.unreadCount}
+                          </span>
+                        ) : null}
+                        <RelativeTime value={item.lastReplyAt} />
+                      </div>
+                      <span className="threads-home-snippet">
+                        {displayName(byUserId.get(item.root.senderId))}:{' '}
+                        {messageSnippet(item.root, me)}
+                      </span>
+                      <span className="threads-home-snippet muted">
+                        Latest · {displayName(byUserId.get(latest.senderId))}:{' '}
+                        {messageSnippet(latest, me)}
+                      </span>
+                    </InboxListRow>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )}
+        {modalError ? <p className="error">{modalError}</p> : null}
+              </>
+            ) : null}
+            {homeView === 'drafts' ? (
+              <>
+{draftsBusy ? <p className="muted">Loading drafts…</p> : null}
+        {!draftsBusy && draftItems.length === 0 ? (
+          <p className="muted">
+            Start typing in a channel and your unsent message will show up here
+            — same idea as Slack Drafts.
+          </p>
+        ) : null}
+        <ul className="threads-home-list drafts-home-list">
+          {draftItems.map((item) => {
+            const conversation = items.find(
+              (row) => row.id === item.conversationId,
+            );
+            const channelLabel = conversation
+              ? conversationTitle(conversation, me, byUserId)
+              : item.conversationType === 'group'
+                ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
+                : item.conversationName || 'Direct message';
+            return (
+              <li key={item.conversationId}>
+                <div className="drafts-home-row">
+                  <InboxListRow
+                    className="draft-open"
+                    onClick={() => {
+                      setHomeView(null);
+                      navigate(`/chat/${item.conversationId}`);
+                    }}
+                  >
+                    <div className="threads-home-meta">
+                      <strong>{channelLabel}</strong>
+                      <RelativeTime value={item.updatedAt} />
+                    </div>
+                    <span className="threads-home-snippet">{singleLinePreview(item.body)}</span>
+                  </InboxListRow>
+                  <button
+                    type="button"
+                    className="ghost drafts-discard"
+                    onClick={() => void discardDraft(item.conversationId)}
+                  >
+                    Discard
+                  </button>
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+        {modalError ? <p className="error">{modalError}</p> : null}
+              </>
+            ) : null}
+            {homeView === 'threads' ? (
+              <>
+{threadsBusy ? <p className="muted">Loading threads…</p> : null}
+        {!threadsBusy && threadItems.length === 0 ? (
+          <p className="muted">
+            Open or reply in a thread and it will show up here. Unfollow any
+            thread you no longer need.
+          </p>
+        ) : null}
+        <ul className="threads-home-list">
+          {threadItems.map((item) => {
+            const channelLabel =
+              item.conversationType === 'group'
+                ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
+                : item.conversationName || 'Direct message';
+            const latest = item.latestReply ?? item.root;
+            const unread = (item.unreadCount ?? 0) > 0;
+            return (
+              <li key={item.root.id}>
+                <InboxListRow
+                  className={unread ? 'unread' : ''}
+                  onClick={() => {
+                    setHomeView(null);
+                    navigate(
+                      `/chat/${item.conversationId}?thread=${item.root.id}`,
+                    );
+                  }}
+                >
+                  <div className="threads-home-meta">
+                    <strong className="threads-home-channel">{channelLabel}</strong>
+                    <span className="threads-home-meta-side">
+                      {unread ? (
+                        <span className="inbox-unread-pill">
+                          {item.unreadCount}
+                        </span>
+                      ) : null}
+                      <span className="muted">
+                        {item.replyCount}{' '}
+                        {item.replyCount === 1 ? 'reply' : 'replies'}
+                      </span>
+                    </span>
+                  </div>
+                  <span className="threads-home-snippet">
+                    {displayName(byUserId.get(item.root.senderId))}:{' '}
+                    {messageSnippet(item.root, me)}
+                  </span>
+                  <span className="threads-home-snippet muted">
+                    Latest · {displayName(byUserId.get(latest.senderId))}:{' '}
+                    {messageSnippet(latest, me)}
+                  </span>
+                </InboxListRow>
+              </li>
+            );
+          })}
+        </ul>
+        {modalError ? <p className="error">{modalError}</p> : null}
+              </>
+            ) : null}
+            {homeView === 'later' ? (
+              <>
+<div className="later-panel">
+          <div className="later-tabs" role="tablist" aria-label="Later views">
+            <button
+              type="button"
+              role="tab"
+              className={laterTab === 'later' ? 'on' : ''}
+              aria-selected={laterTab === 'later'}
+              onClick={() => setLaterTab('later')}
+            >
+              Reminders
+              {laterPendingCount > 0 ? (
+                <span className="later-tab-count">{laterPendingCount}</span>
+              ) : null}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              className={laterTab === 'saved' ? 'on' : ''}
+              aria-selected={laterTab === 'saved'}
+              onClick={() => {
+                setLaterTab('saved');
+                void refreshSaved();
+              }}
+            >
+              Saved
+              {savedItems.length > 0 ? (
+                <span className="later-tab-count">{savedItems.length}</span>
+              ) : null}
+            </button>
+          </div>
+
+          {laterTab === 'later' ? (
+            <>
+              {laterBusy ? <p className="muted">Loading reminders…</p> : null}
+              {!laterBusy &&
+              laterSections.overdue.length === 0 &&
+              laterSections.upcoming.length === 0 &&
+              laterSections.completed.length === 0 ? (
+                <p className="muted">
+                  Use <strong>Remind me</strong> on any message. Items land here
+                  with due dates until you complete or cancel them.
+                </p>
+              ) : null}
+
+              {(
+                [
+                  {
+                    key: 'overdue',
+                    label: 'Overdue',
+                    items: laterSections.overdue,
+                  },
+                  {
+                    key: 'upcoming',
+                    label: 'In progress',
+                    items: laterSections.upcoming,
+                  },
+                  {
+                    key: 'completed',
+                    label: 'Completed',
+                    items: laterSections.completed,
+                  },
+                ] as const
+              ).map((section) =>
+                section.items.length === 0 ? null : (
+                  <div key={section.key} className="later-section">
+                    <div className="later-section-head">
+                      <h4>
+                        {section.label}
+                        <span className="muted"> · {section.items.length}</span>
+                      </h4>
+                      {section.key === 'completed' ? (
+                        <button
+                          type="button"
+                          className="ghost later-clear-btn"
+                          onClick={() => void clearCompletedLater()}
+                        >
+                          Clear all
+                        </button>
+                      ) : null}
+                    </div>
+                    <ul className="threads-home-list later-inbox-list">
+                      {section.items.map((item) => {
+                        const channelLabel =
+                          item.conversationType === 'group'
+                            ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
+                            : item.conversationName?.trim() || 'Direct message';
+                        const dueLabel =
+                          item.status === 'completed'
+                            ? item.completedAt
+                              ? `Completed · ${formatScheduleWhen(item.completedAt)}`
+                              : 'Completed'
+                            : item.status === 'sent'
+                              ? `Notified · ${formatScheduleWhen(item.remindAt)}`
+                              : formatScheduleWhen(item.remindAt);
+                        return (
+                          <li key={item.id}>
+                            <div className="later-inbox-row">
+                              <InboxListRow
+                                onClick={() => {
+                                  setHomeView(null);
+                                  navigate(
+                                    `/chat/${item.conversationId}?focus=${item.messageId}`,
+                                  );
+                                }}
+                              >
+                                <div className="threads-home-meta">
+                                  <strong className="threads-home-channel">{channelLabel}</strong>
+                                  <span
+                                    className={`muted threads-home-meta-side${
+                                      section.key === 'overdue'
+                                        ? ' later-overdue'
+                                        : ''
+                                    }`}
+                                  >
+                                    {dueLabel}
+                                  </span>
+                                </div>
+                                <span className="threads-home-snippet">
+                                  {singleLinePreview(
+                                    item.bodySnippet?.trim() || 'Saved message',
+                                  )}
+                                </span>
+                              </InboxListRow>
+                              <div className="later-row-actions">
+                                {item.status === 'pending' ||
+                                item.status === 'sent' ? (
+                                  <button
+                                    type="button"
+                                    className="ghost"
+                                    onClick={() =>
+                                      void completeLaterReminder(item.id)
+                                    }
+                                  >
+                                    Complete
+                                  </button>
+                                ) : null}
+                                {item.status === 'pending' ? (
+                                  <button
+                                    type="button"
+                                    className="ghost later-cancel-btn"
+                                    onClick={() =>
+                                      void cancelLaterReminder(item.id)
+                                    }
+                                  >
+                                    Cancel
+                                  </button>
+                                ) : null}
+                              </div>
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                ),
+              )}
+            </>
+          ) : (
+            <>
+              {savedBusy ? <p className="muted">Loading saved messages…</p> : null}
+              {!savedBusy && savedItems.length === 0 ? (
+                <p className="muted">
+                  Save any message from the ⋮ menu. They show up here across
+                  chats.
+                </p>
+              ) : null}
+              <ul className="saved-messages-list later-saved-list">
+                {savedItems.map((item) => {
+                  const title =
+                    item.conversationName?.trim() ||
+                    (item.conversationType === 'group'
+                      ? 'Channel'
+                      : 'Direct message');
+                  const snippet =
+                    item.message?.body?.trim() ||
+                    item.message?.attachment?.name ||
+                    'Saved message';
+                  return (
+                    <li key={item.id}>
+                      <button
+                        type="button"
+                        className="saved-message-row"
+                        onClick={() => {
+                          setHomeView(null);
+                          navigate(
+                            `/chat/${item.conversationId}?focus=${encodeURIComponent(item.messageId)}`,
+                          );
+                        }}
+                      >
+                        <strong>{title}</strong>
+                        <span>{snippet}</span>
+                        <small>{formatScheduleWhen(item.createdAt)}</small>
+                      </button>
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => void unsaveBookmark(item.messageId)}
+                      >
+                        Unsave
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </>
+          )}
+          {modalError ? <p className="error">{modalError}</p> : null}
+        </div>
+              </>
+            ) : null}
+          </div>
+        </section>
+      ) : (
+        <Outlet context={outletContext} />
+      )}
 
       <Modal
         open={dmOpen}
@@ -1766,7 +2870,7 @@ export function MessengerPage() {
               checked={groupAnnounceOnly}
               onChange={(event) => setGroupAnnounceOnly(event.target.checked)}
             />{' '}
-            Announce-only (admins post, members read)
+            Announce-only — admins post, members read
           </label>
           <div className="modal-section">
             <p className="muted">
@@ -1822,127 +2926,15 @@ export function MessengerPage() {
         {modalError ? <p className="error">{modalError}</p> : null}
       </Modal>
 
-      <Modal
-        open={threadsOpen}
-        title="Threads"
-        onClose={() => {
-          setThreadsOpen(false);
-          setModalError('');
-        }}
-      >
-        {threadsBusy ? <p className="muted">Loading threads…</p> : null}
-        {!threadsBusy && threadItems.length === 0 ? (
-          <p className="muted">
-            Open or reply in a thread and it will show up here. Unfollow any
-            thread you no longer need.
-          </p>
-        ) : null}
-        <ul className="threads-home-list">
-          {threadItems.map((item) => {
-            const channelLabel =
-              item.conversationType === 'group'
-                ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
-                : item.conversationName || 'Direct message';
-            const latest = item.latestReply ?? item.root;
-            const unread = (item.unreadCount ?? 0) > 0;
-            return (
-              <li key={item.root.id}>
-                <button
-                  type="button"
-                  className={`threads-home-row${unread ? ' unread' : ''}`}
-                  onClick={() => {
-                    setThreadsOpen(false);
-                    navigate(
-                      `/chat/${item.conversationId}?thread=${item.root.id}`,
-                    );
-                  }}
-                >
-                  <div className="threads-home-meta">
-                    <strong>{channelLabel}</strong>
-                    <span className="muted">
-                      {unread ? (
-                        <span className="inbox-unread-pill">
-                          {item.unreadCount}
-                        </span>
-                      ) : null}{' '}
-                      {item.replyCount}{' '}
-                      {item.replyCount === 1 ? 'reply' : 'replies'}
-                    </span>
-                  </div>
-                  <p className="threads-home-snippet">
-                    {displayName(byUserId.get(item.root.senderId))}:{' '}
-                    {messageSnippet(item.root, me)}
-                  </p>
-                  <p className="threads-home-snippet muted">
-                    Latest · {displayName(byUserId.get(latest.senderId))}:{' '}
-                    {messageSnippet(latest, me)}
-                  </p>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-        {modalError ? <p className="error">{modalError}</p> : null}
-      </Modal>
+      
 
-      <Modal
-        open={laterOpen}
-        title="Later"
-        onClose={() => {
-          setLaterOpen(false);
-          setModalError('');
-        }}
-      >
-        {laterBusy ? <p className="muted">Loading reminders…</p> : null}
-        {!laterBusy && laterItems.length === 0 ? (
-          <p className="muted">
-            Remind yourself from any message&apos;s ⋮ menu. Pending reminders
-            show up here until they fire.
-          </p>
-        ) : null}
-        <ul className="threads-home-list later-inbox-list">
-          {laterItems.map((item) => {
-            const channelLabel =
-              item.conversationType === 'group'
-                ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
-                : item.conversationName?.trim() || 'Direct message';
-            return (
-              <li key={item.id}>
-                <div className="later-inbox-row">
-                  <button
-                    type="button"
-                    className="threads-home-row"
-                    onClick={() => {
-                      setLaterOpen(false);
-                      navigate(
-                        `/chat/${item.conversationId}?focus=${item.messageId}`,
-                      );
-                    }}
-                  >
-                    <div className="threads-home-meta">
-                      <strong>{channelLabel}</strong>
-                      <span className="muted">
-                        {formatScheduleWhen(item.remindAt)}
-                      </span>
-                    </div>
-                    <p className="threads-home-snippet">
-                      {item.bodySnippet?.trim() || 'Saved message'}
-                    </p>
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost later-cancel-btn"
-                    onClick={() => void cancelLaterReminder(item.id)}
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-        {modalError ? <p className="error">{modalError}</p> : null}
-      </Modal>
+      
+
+      
+
+      
+
+      
     </div>
   );
 }

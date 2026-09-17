@@ -81,14 +81,21 @@ export function ChannelTabs({
       {activeTab !== 'messages' &&
       activeTab !== 'files' &&
       activeTab !== 'pins' ? (
-        <div className="channel-tab-panel" role="tabpanel">
+        <div
+          className={`channel-tab-panel${
+            activeTab === 'lists' ? ' is-lists' : ''
+          }`}
+          role="tabpanel"
+        >
           {activeTab === 'canvas' ? <CanvasPanel conversationId={conversationId} /> : null}
           {activeTab === 'lists' ? <ListsPanel conversationId={conversationId} /> : null}
           {activeTab === 'clips' ? <ClipsPanel conversationId={conversationId} /> : null}
           {activeTab === 'workflows' ? (
             <WorkflowsPanel conversationId={conversationId} />
           ) : null}
-          {activeTab === 'apps' ? <AppsPanel /> : null}
+          {activeTab === 'apps' ? (
+            <AppsPanel conversationId={conversationId} />
+          ) : null}
           {activeTab === 'connect' ? (
             <ConnectPanel conversationId={conversationId} />
           ) : null}

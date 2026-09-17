@@ -1044,6 +1044,14 @@ export function ConversationDetailsPage() {
                   <dd>{conversation.description?.trim() || 'No description yet'}</dd>
                 </div>
                 <div>
+                  <dt>Announcement</dt>
+                  <dd>
+                    {conversation.announceOnly
+                      ? 'On — only owners & admins can post'
+                      : 'Off — everyone can post'}
+                  </dd>
+                </div>
+                <div>
                   <dt>Online</dt>
                   <dd>
                     {conversation.members.filter((m) => m.status !== 'offline').length} /{' '}
@@ -1293,6 +1301,9 @@ export function ConversationDetailsPage() {
                       />
                       Announcement only
                     </span>
+                    <small className="muted profile-check-hint">
+                      Members can read and react; only owners and admins can post.
+                    </small>
                   </label>
                   <div className="channel-invite-panel">
                     <p className="muted" style={{ marginBottom: 4 }}>

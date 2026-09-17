@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { api } from '../../../api/client';
-import type { ConnectInvite, ConnectStatus } from '../../../api/types';
+import type { ConnectInvite, ConnectLink, ConnectStatus } from '../../../api/types';
 
 function absoluteInviteUrl(pathOrUrl: string | null | undefined) {
   if (!pathOrUrl) return '';
@@ -12,10 +12,12 @@ function absoluteInviteUrl(pathOrUrl: string | null | undefined) {
 export function ConnectPanel({ conversationId }: { conversationId: string }) {
   const [status, setStatus] = useState<ConnectStatus | null>(null);
   const [email, setEmail] = useState('');
+  const [mode, setMode] = useState<'guest' | 'workspace'>('workspace');
   const [notice, setNotice] = useState('');
   const [lastInviteUrl, setLastInviteUrl] = useState('');
   const [busy, setBusy] = useState(false);
   const [revokingId, setRevokingId] = useState<string | null>(null);
+  const [disconnectingId, setDisconnectingId] = useState<string | null>(null);
 
   async function refresh() {
     const response = await api<ConnectStatus>(
@@ -52,7 +54,7 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
         `/chat/conversations/${conversationId}/connect/invite`,
         {
           method: 'POST',
-          body: JSON.stringify({ email: email.trim() }),
+          body: JSON.stringify({ email: email.trim(), mode }),
         },
       );
       await refresh();
@@ -64,7 +66,9 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
       setLastInviteUrl(url);
       setNotice(
         url
-          ? 'Invitation created. Copy the link and send it to your collaborator.'
+          ? mode === 'workspace'
+            ? 'Workspace share invite created. Send the link to an admin in the partner org.'
+            : 'Guest invite created. Copy the link and send it to your collaborator.'
           : 'Invitation created.',
       );
     } catch (err) {
@@ -101,11 +105,35 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
     }
   }
 
+  async function disconnectLink(linkId: string) {
+    setDisconnectingId(linkId);
+    setNotice('');
+    try {
+      await api(`/chat/conversations/${conversationId}/connect/links/${linkId}`, {
+        method: 'DELETE',
+      });
+      await refresh();
+      setNotice('Shared channel disconnected.');
+    } catch (err) {
+      setNotice(
+        err instanceof Error ? err.message : 'Could not disconnect shared channel.',
+      );
+    } finally {
+      setDisconnectingId(null);
+    }
+  }
+
   const connected = Boolean(status?.isShared);
+  const isPartner = status?.connectRole === 'partner';
   const pendingInvites =
     status?.invites?.filter((invite) => invite.status === 'pending') ?? [];
-  const acceptedInvites =
-    status?.invites?.filter((invite) => invite.status === 'accepted') ?? [];
+  const acceptedGuests =
+    status?.invites?.filter(
+      (invite) =>
+        invite.status === 'accepted' &&
+        (invite.inviteKind ?? 'guest_email') === 'guest_email',
+    ) ?? [];
+  const links: ConnectLink[] = status?.links ?? [];
 
   return (
     <section className="feature-panel connect-panel">
@@ -113,7 +141,9 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
         <div>
           <h3>Connect</h3>
           <p className="muted">
-            Invite people from another organization into this channel as guests.
+            {isPartner
+              ? 'This channel is shared with another workspace. Messages sync to the host channel.'
+              : 'Share this channel with another workspace, or invite an external guest.'}
           </p>
         </div>
       </div>
@@ -123,29 +153,74 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
           aria-hidden="true"
         />
         <div>
-          <strong>{connected ? 'Connected channel' : 'Not connected yet'}</strong>
+          <strong>
+            {connected
+              ? isPartner
+                ? 'Connected (partner workspace)'
+                : 'Connected channel'
+              : 'Not connected yet'}
+          </strong>
           <p className="muted">
             {status?.sharedExternalLabel
               ? `Shared with ${status.sharedExternalLabel}`
-              : 'Send a Connect invite to start collaborating across organizations.'}
+              : 'Create a workspace share or guest invite to collaborate across organizations.'}
           </p>
         </div>
       </div>
-      <form className="connect-invite" onSubmit={invite}>
-        <label>
-          Invite by email
-          <input
-            type="email"
-            value={email}
-            onChange={(event) => setEmail(event.target.value)}
-            placeholder="name@partner.com"
-            required
-          />
-        </label>
-        <button className="btn" type="submit" disabled={busy || !email.trim()}>
-          {busy ? 'Creating…' : 'Create Connect invite'}
-        </button>
-      </form>
+
+      {!isPartner ? (
+        <form className="connect-invite" onSubmit={invite}>
+          <fieldset className="connect-mode">
+            <legend>Invite type</legend>
+            <label className="connect-mode-option">
+              <input
+                type="radio"
+                name="connectMode"
+                checked={mode === 'workspace'}
+                onChange={() => setMode('workspace')}
+              />
+              <span>
+                <strong>Workspace share</strong>
+                <span className="muted">
+                  True multi-org channel — partner keeps their own workspace
+                </span>
+              </span>
+            </label>
+            <label className="connect-mode-option">
+              <input
+                type="radio"
+                name="connectMode"
+                checked={mode === 'guest'}
+                onChange={() => setMode('guest')}
+              />
+              <span>
+                <strong>Guest</strong>
+                <span className="muted">
+                  External person joins this workspace as a guest
+                </span>
+              </span>
+            </label>
+          </fieldset>
+          <label>
+            {mode === 'workspace' ? 'Partner contact email' : 'Invite by email'}
+            <input
+              type="email"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              placeholder="name@partner.com"
+              required
+            />
+          </label>
+          <button className="btn" type="submit" disabled={busy || !email.trim()}>
+            {busy
+              ? 'Creating…'
+              : mode === 'workspace'
+                ? 'Create workspace share invite'
+                : 'Create guest invite'}
+          </button>
+        </form>
+      ) : null}
+
       {lastInviteUrl ? (
         <div className="connect-link-box">
           <input type="text" readOnly value={lastInviteUrl} aria-label="Connect invite link" />
@@ -163,6 +238,35 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
           {notice}
         </p>
       ) : null}
+
+      {links.length > 0 ? (
+        <div className="connect-invite-list">
+          <h4>Connected workspaces</h4>
+          <ul>
+            {links.map((link) => (
+              <li key={link.id}>
+                <div>
+                  <strong>
+                    {isPartner
+                      ? link.hostOrganizationName || 'Host workspace'
+                      : link.partnerOrganizationName || 'Partner workspace'}
+                  </strong>
+                  <span className="muted"> · {link.status}</span>
+                </div>
+                <button
+                  type="button"
+                  className="ghost danger-text"
+                  disabled={disconnectingId === link.id}
+                  onClick={() => void disconnectLink(link.id)}
+                >
+                  {disconnectingId === link.id ? 'Disconnecting…' : 'Disconnect'}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
       {pendingInvites.length > 0 ? (
         <div className="connect-invite-list">
           <h4>Pending invites</h4>
@@ -172,10 +276,13 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
                 invite.inviteUrl ||
                   (invite.token ? `/connect-invite/${invite.token}` : ''),
               );
+              const kindLabel =
+                invite.inviteKind === 'workspace_share' ? 'Workspace' : 'Guest';
               return (
                 <li key={invite.id}>
                   <div>
                     <strong>{invite.email}</strong>
+                    <span className="muted"> · {kindLabel}</span>
                     {url ? (
                       <button
                         type="button"
@@ -200,9 +307,9 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
           </ul>
         </div>
       ) : null}
-      {acceptedInvites.length > 0 ? (
+      {acceptedGuests.length > 0 ? (
         <p className="muted">
-          Connected: {acceptedInvites.map((invite) => invite.email).join(', ')}
+          Guests: {acceptedGuests.map((invite) => invite.email).join(', ')}
         </p>
       ) : null}
     </section>

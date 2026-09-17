@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { api } from '../../api/client';
 import { useAuth } from '../../auth/AuthContext';
@@ -21,12 +21,14 @@ type ConnectInvitePreview = {
   organizationId: string | null;
   organizationName: string | null;
   status?: 'pending' | 'accepted' | 'revoked';
+  inviteKind?: 'guest_email' | 'workspace_share';
 };
 
 type AcceptConnectResult = {
   organizationId: string;
   conversationId: string | null;
   role?: string;
+  inviteKind?: 'guest_email' | 'workspace_share';
   organizations?: OrganizationView[];
   activeOrganizationId?: string;
 };
@@ -47,6 +49,15 @@ export function ConnectAcceptPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [fieldErrors, setFieldErrors] = useState<FieldErrors<keyof RegisterFields>>({});
+  const [partnerOrgId, setPartnerOrgId] = useState('');
+
+  const isWorkspaceShare = preview?.inviteKind === 'workspace_share';
+
+  const partnerChoices = useMemo(() => {
+    const orgs = session?.organizations ?? [];
+    const hostId = preview?.organizationId;
+    return orgs.filter((org) => !hostId || org.id !== hostId);
+  }, [session?.organizations, preview?.organizationId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -81,6 +92,15 @@ export function ConnectAcceptPage() {
     };
   }, [token]);
 
+  useEffect(() => {
+    if (!partnerOrgId && partnerChoices.length > 0) {
+      const active = session?.activeOrganizationId;
+      const preferred =
+        partnerChoices.find((org) => org.id === active)?.id ?? partnerChoices[0].id;
+      setPartnerOrgId(preferred);
+    }
+  }, [partnerChoices, partnerOrgId, session?.activeOrganizationId]);
+
   async function finishJoin(
     organizationId: string,
     conversationId: string | null,
@@ -114,6 +134,33 @@ export function ConnectAcceptPage() {
     setBusy(true);
     setError('');
     try {
+      if (isWorkspaceShare) {
+        if (!partnerOrgId) {
+          setError('Select the workspace that should connect to this channel');
+          setBusy(false);
+          return;
+        }
+        const partner = partnerChoices.find((org) => org.id === partnerOrgId);
+        const response = await api<AcceptConnectResult>(
+          `/chat/connect/invites/${encodeURIComponent(token)}/accept`,
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              partnerOrganizationId: partnerOrgId,
+              partnerOrganizationName: partner?.name ?? null,
+              hostOrganizationName: preview?.organizationName ?? null,
+            }),
+          },
+        );
+        await finishJoin(
+          response.data.organizationId,
+          response.data.conversationId,
+          response.data.organizations,
+          response.data.activeOrganizationId,
+        );
+        return;
+      }
+
       const response = await api<AcceptConnectResult>(
         `/chat/connect/invites/${encodeURIComponent(token)}/accept`,
         { method: 'POST', body: JSON.stringify({}) },
@@ -125,6 +172,13 @@ export function ConnectAcceptPage() {
         response.data.activeOrganizationId,
       );
     } catch (err) {
+      if (isWorkspaceShare) {
+        setError(
+          err instanceof Error ? err.message : 'Could not connect workspaces',
+        );
+        setBusy(false);
+        return;
+      }
       // Fallback: workspace invite accept path (same token).
       try {
         const joined = await api<AcceptInviteResult>(
@@ -171,6 +225,12 @@ export function ConnectAcceptPage() {
 
   async function onRegister(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (isWorkspaceShare) {
+      setError(
+        'Workspace share requires an existing account in the partner organization. Sign in first.',
+      );
+      return;
+    }
     const form = new FormData(event.currentTarget);
     const fields: RegisterFields = {
       firstName: String(form.get('firstName') ?? ''),
@@ -208,26 +268,71 @@ export function ConnectAcceptPage() {
   return (
     <main className="auth-page">
       <div className="auth-panel channel-invite-panel">
-        <p className="eyebrow">Slack Connect</p>
-        <h1>Join {channelLabel}</h1>
+        <p className="eyebrow">
+          {isWorkspaceShare ? 'Workspace Connect' : 'Slack Connect'}
+        </p>
+        <h1>
+          {isWorkspaceShare ? `Connect to ${channelLabel}` : `Join ${channelLabel}`}
+        </h1>
         {loading ? <p className="muted">Checking invite…</p> : null}
         {!loading && preview?.valid ? (
           <>
             <p className="muted">
-              You&apos;ve been invited to collaborate in {channelLabel} on{' '}
-              {workspaceLabel} as a guest.
-              {preview.email ? ` This invite is for ${preview.email}.` : ''}
+              {isWorkspaceShare ? (
+                <>
+                  Connect {channelLabel} from {workspaceLabel} into one of your
+                  workspaces. Both orgs keep membership; messages stay in sync.
+                  {preview.email ? ` Invite was sent to ${preview.email}.` : ''}
+                </>
+              ) : (
+                <>
+                  You&apos;ve been invited to collaborate in {channelLabel} on{' '}
+                  {workspaceLabel} as a guest.
+                  {preview.email ? ` This invite is for ${preview.email}.` : ''}
+                </>
+              )}
             </p>
             {session ? (
               <>
+                {isWorkspaceShare ? (
+                  partnerChoices.length > 0 ? (
+                    <label className="connect-partner-select">
+                      Connect from workspace
+                      <select
+                        value={partnerOrgId}
+                        onChange={(event) => setPartnerOrgId(event.target.value)}
+                      >
+                        {partnerChoices.map((org) => (
+                          <option key={org.id} value={org.id}>
+                            {org.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : (
+                    <p className="error">
+                      You need membership in a different workspace than the host
+                      to accept this share. Create or join another organization
+                      first.
+                    </p>
+                  )
+                ) : null}
                 <div className="modal-actions">
                   <button
                     className="btn full"
                     type="button"
-                    disabled={busy}
+                    disabled={
+                      busy ||
+                      (isWorkspaceShare &&
+                        (partnerChoices.length === 0 || !partnerOrgId))
+                    }
                     onClick={() => void acceptWhileSignedIn()}
                   >
-                    {busy ? 'Joining…' : `Join ${channelLabel}`}
+                    {busy
+                      ? 'Connecting…'
+                      : isWorkspaceShare
+                        ? `Connect ${channelLabel}`
+                        : `Join ${channelLabel}`}
                   </button>
                 </div>
                 <p className="muted">
@@ -242,6 +347,13 @@ export function ConnectAcceptPage() {
                   </button>
                 </p>
               </>
+            ) : isWorkspaceShare ? (
+              <p className="muted">
+                Sign in to the partner workspace, then open this link again.{' '}
+                <Link to={`/login?inviteToken=${encodeURIComponent(token)}`}>
+                  Sign in
+                </Link>
+              </p>
             ) : (
               <form className="auth-form" onSubmit={onRegister}>
                 <label>

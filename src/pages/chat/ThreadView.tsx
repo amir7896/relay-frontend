@@ -15,9 +15,11 @@ import { useChatSocket } from '../../chat/ChatSocketContext';
 import { useVoiceCall } from '../../calls/VoiceCallContext';
 import { HuddleIcon } from '../../components/HuddleIcon';
 import { Modal } from '../../components/Modal';
+import { MrkdwnEditor } from '../../components/MrkdwnEditor';
 import { useConfirm } from '../../components/ConfirmProvider';
 import { MessageTicks } from '../../components/MessageTicks';
 import { UserAvatar } from '../../components/UserAvatar';
+import { UserHoverCard } from '../../components/UserHoverCard';
 import {
   resolveMediaUrl,
   VoiceNotePlayer,
@@ -41,6 +43,7 @@ import {
   firstUrl,
   isPlaceholderBody,
   parseMentionQuery,
+  prefixComposerLines,
   renderMessageBody,
   wrapComposerSelection,
   type FormatMarker,
@@ -173,6 +176,8 @@ function normalizeMessage(message: ChatMessage): ChatMessage {
     replyCount: message.replyCount ?? 0,
     translatedText: message.translatedText ?? null,
     showOriginal: Boolean(message.showOriginal),
+    // Bot / webhook / legacy WS payloads may omit seenBy — never leave it undefined.
+    seenBy: Array.isArray(message.seenBy) ? message.seenBy : [],
   };
 }
 
@@ -591,7 +596,8 @@ export function ThreadView() {
   const [scheduleBusy, setScheduleBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
-  const [formatToolbarOpen, setFormatToolbarOpen] = useState(false);
+  const [formatToolbarOpen, setFormatToolbarOpen] = useState(true);
+  const [composerEmojiOpen, setComposerEmojiOpen] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasOlder, setHasOlder] = useState(false);
   const [messagePage, setMessagePage] = useState(1);
@@ -604,12 +610,9 @@ export function ThreadView() {
   const [activeThreadRoot, setActiveThreadRoot] = useState<ChatMessage | null>(null);
   const [threadReplies, setThreadReplies] = useState<ChatMessage[]>([]);
   const [threadComposer, setThreadComposer] = useState('');
-  const [threadReplyTo, setThreadReplyTo] = useState<ChatMessage | null>(null);
   const [threadBusy, setThreadBusy] = useState(false);
   const [threadLoading, setThreadLoading] = useState(false);
   const [alsoSendToChannel, setAlsoSendToChannel] = useState(false);
-  const [threadFollowing, setThreadFollowing] = useState(true);
-  const [threadFollowBusy, setThreadFollowBusy] = useState(false);
   const [translateBusyId, setTranslateBusyId] = useState<string | null>(null);
   const activeThreadRootRef = useRef<ChatMessage | null>(null);
   activeThreadRootRef.current = activeThreadRoot;
@@ -624,7 +627,7 @@ export function ThreadView() {
   const discardOnStopRef = useRef(false);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewUrlRef = useRef<string | null>(null);
-  const composerInputRef = useRef<HTMLInputElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const touchStartRef = useRef<{ x: number; y: number; id: string } | null>(null);
   const scroller = useRef<HTMLDivElement | null>(null);
@@ -664,10 +667,19 @@ export function ThreadView() {
     callPhase !== 'idle';
 
   const myMemberRole = conversation?.members.find((member) => member.userId === me)?.role;
+  const canManageChannel =
+    myMemberRole === 'owner' || myMemberRole === 'admin';
   const announceOnlyLocked = Boolean(
-    conversation?.announceOnly &&
-      myMemberRole !== 'owner' &&
-      myMemberRole !== 'admin',
+    conversation?.announceOnly && !canManageChannel,
+  );
+  const channelTopic = conversation?.topic?.trim() || '';
+  const channelDescription = conversation?.description?.trim() || '';
+  const showTopicBanner = Boolean(
+    conversation?.type === 'group' &&
+      (channelTopic ||
+        channelDescription ||
+        conversation?.announceOnly ||
+        canManageChannel),
   );
 
   const ongoingCallParticipants = useMemo(() => {
@@ -750,6 +762,13 @@ export function ThreadView() {
     );
   }, [conversation, byUserId]);
 
+  const memberByUserId = useMemo(() => {
+    const map = new Map(
+      (conversation?.members ?? []).map((member) => [member.userId, member]),
+    );
+    return map;
+  }, [conversation?.members]);
+
   const mentionQuery = parseMentionQuery(composer);
   const filteredMentions = mentionQuery
     ? [
@@ -789,6 +808,17 @@ export function ThreadView() {
     : [];
 
   const threadMentionQuery = parseMentionQuery(threadComposer);
+
+  useEffect(() => {
+    if (!activeThreadRoot) {
+      setThreadComposer('');
+      setAlsoSendToChannel(false);
+      return;
+    }
+    setThreadComposer('');
+    setAlsoSendToChannel(false);
+  }, [activeThreadRoot?.id]);
+
   const filteredThreadMentions = threadMentionQuery
     ? [
         ...(['channel', 'here'] as const)
@@ -1142,6 +1172,20 @@ export function ThreadView() {
           }
           return without;
         });
+        // Standup / daily-meeting prompts: open the thread panel so replies collect like Slack.
+        // Skip summaries (those are already threaded under the prompt).
+        if (
+          normalized.botUsername?.trim() &&
+          !normalized.threadRootId &&
+          !activeThreadRootRef.current &&
+          /stand-?up|daily meeting|check-in/i.test(normalized.botUsername) &&
+          /reply in this thread/i.test(normalized.body || '')
+        ) {
+          queueMicrotask(() => {
+            setActiveThreadRoot(normalized);
+            void loadThreadReplies(normalized.id);
+          });
+        }
         // Scheduled delivery lands as a normal message — refresh pending list.
         if (scheduledMessagesRef.current.length > 0) {
           void loadScheduled();
@@ -1226,7 +1270,8 @@ export function ThreadView() {
             if (message.senderId === event.userId) {
               return message;
             }
-            if (message.seenBy.includes(event.userId)) {
+            const seenBy = Array.isArray(message.seenBy) ? message.seenBy : [];
+            if (seenBy.includes(event.userId)) {
               return message;
             }
             const readAt = new Date(event.lastReadAt).getTime();
@@ -1236,7 +1281,7 @@ export function ThreadView() {
             }
             return {
               ...message,
-              seenBy: [...message.seenBy, event.userId],
+              seenBy: [...seenBy, event.userId],
             };
           }),
         );
@@ -1249,7 +1294,8 @@ export function ThreadView() {
         const readAt = new Date(event.lastReadAt).getTime();
         setMessages((current) =>
           current.map((message) => {
-            if (!message.seenBy.includes(event.userId)) {
+            const seenBy = Array.isArray(message.seenBy) ? message.seenBy : [];
+            if (!seenBy.includes(event.userId)) {
               return message;
             }
             const createdAt = new Date(message.createdAt).getTime();
@@ -1257,7 +1303,7 @@ export function ThreadView() {
             if (Number.isFinite(readAt) && createdAt > readAt) {
               return {
                 ...message,
-                seenBy: message.seenBy.filter((userId) => userId !== event.userId),
+                seenBy: seenBy.filter((userId) => userId !== event.userId),
               };
             }
             return message;
@@ -1992,8 +2038,64 @@ export function ThreadView() {
     });
   }
 
-  function onComposerKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+  function applyComposerPrefix(prefix: string) {
+    const input = composerInputRef.current;
+    const start = input?.selectionStart ?? composer.length;
+    const end = input?.selectionEnd ?? composer.length;
+    const next = prefixComposerLines(composer, start, end, prefix);
+    setComposer(next.value);
+    window.requestAnimationFrame(() => {
+      const el = composerInputRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next.selectionStart, next.selectionEnd);
+    });
+  }
+
+  function insertComposerSnippet(snippet: string) {
+    const input = composerInputRef.current;
+    const start = input?.selectionStart ?? composer.length;
+    const end = input?.selectionEnd ?? composer.length;
+    const from = Math.min(start, end);
+    const to = Math.max(start, end);
+    const nextValue = `${composer.slice(0, from)}${snippet}${composer.slice(to)}`;
+    const caret = from + snippet.length;
+    setComposer(nextValue);
+    setComposerEmojiOpen(false);
+    window.requestAnimationFrame(() => {
+      const el = composerInputRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(caret, caret);
+    });
+  }
+
+  function insertComposerLink() {
+    const input = composerInputRef.current;
+    const start = input?.selectionStart ?? composer.length;
+    const end = input?.selectionEnd ?? composer.length;
+    const selected = composer.slice(start, end).trim();
+    const url = window.prompt(
+      'Link URL',
+      selected.startsWith('http') ? selected : 'https://',
+    );
+    if (!url?.trim()) return;
+    const href = url.trim();
+    if (selected && !selected.startsWith('http')) {
+      const value = `${composer.slice(0, start)}${selected} (${href})${composer.slice(end)}`;
+      setComposer(value);
+      return;
+    }
+    insertComposerSnippet(href);
+  }
+
+  function onComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
     const mod = event.metaKey || event.ctrlKey;
+    if (event.key === 'Enter' && !event.shiftKey && !mod) {
+      event.preventDefault();
+      event.currentTarget.form?.requestSubmit();
+      return;
+    }
     if (!mod) {
       return;
     }
@@ -2678,11 +2780,11 @@ export function ThreadView() {
         ...items.map((item) => item.senderId),
       ]);
       try {
+        // Slack auto-follows when you open a thread; no Follow button in the UI.
         await api(`/chat/conversations/${id}/threads/${threadRootId}/follow`, {
           method: 'POST',
           body: JSON.stringify({}),
         });
-        setThreadFollowing(true);
         await api(`/chat/conversations/${id}/threads/${threadRootId}/read`, {
           method: 'POST',
           body: JSON.stringify({}),
@@ -2697,40 +2799,15 @@ export function ThreadView() {
     }
   }
 
-  async function toggleThreadFollow() {
-    if (!id || !activeThreadRoot || threadFollowBusy) {
-      return;
-    }
-    setThreadFollowBusy(true);
-    try {
-      if (threadFollowing) {
-        await api(
-          `/chat/conversations/${id}/threads/${activeThreadRoot.id}/follow`,
-          { method: 'DELETE' },
-        );
-        setThreadFollowing(false);
-      } else {
-        await api(
-          `/chat/conversations/${id}/threads/${activeThreadRoot.id}/follow`,
-          { method: 'POST', body: JSON.stringify({}) },
-        );
-        setThreadFollowing(true);
-      }
-    } catch (err) {
-      setActionError(
-        err instanceof Error ? err.message : 'Could not update thread follow',
-      );
-    } finally {
-      setThreadFollowBusy(false);
-    }
-  }
-
   async function sendThreadReply(event?: FormEvent) {
     event?.preventDefault();
-    if (!id || !activeThreadRoot || !threadComposer.trim() || announceOnlyLocked) {
+    if (!id || !activeThreadRoot || announceOnlyLocked) {
       return;
     }
     const body = threadComposer.trim();
+    if (!body) {
+      return;
+    }
     const mentionUserIds = extractMentionIds(body, mentionCandidates);
     setThreadBusy(true);
     setActionError('');
@@ -2739,7 +2816,6 @@ export function ThreadView() {
         body: string;
         type: string;
         threadRootId: string;
-        replyToMessageId?: string;
         mentionUserIds?: string[];
         alsoSendToChannel?: boolean;
       } = {
@@ -2749,9 +2825,6 @@ export function ThreadView() {
         mentionUserIds,
         alsoSendToChannel: alsoSendToChannel || undefined,
       };
-      if (threadReplyTo) {
-        payload.replyToMessageId = threadReplyTo.id;
-      }
       const response = await api<ChatMessage>(
         `/chat/conversations/${id}/messages`,
         {
@@ -2762,8 +2835,6 @@ export function ThreadView() {
       const normalized = normalizeMessage(response.data);
       setThreadReplies((current) => upsertMessage(current, normalized));
       setThreadComposer('');
-      setThreadReplyTo(null);
-      setThreadFollowing(true);
       setMessages((current) =>
         current.map((item) =>
           item.id === activeThreadRoot.id
@@ -2956,6 +3027,41 @@ export function ThreadView() {
     await createMessageReminder(message, when.toISOString());
   }
 
+  async function createIssueFromMessage(
+    message: ChatMessage,
+    appKey: 'github' | 'jira',
+  ) {
+    if (!id) return;
+    try {
+      const result = await api<{
+        externalUrl: string;
+        title: string;
+        message?: ChatMessage;
+      }>(`/chat/conversations/${id}/apps/${appKey}/issues`, {
+        method: 'POST',
+        body: JSON.stringify({ messageId: message.id }),
+      });
+      if (result.data.message) {
+        setMessages((current) => {
+          if (current.some((item) => item.id === result.data.message!.id)) {
+            return current;
+          }
+          return [...current, result.data.message!];
+        });
+      }
+      setReminderToast(`Created ${result.data.title}`);
+      window.setTimeout(() => setReminderToast(null), 4000);
+      setActionError('');
+      closeMessageOverlays();
+    } catch (err) {
+      setActionError(
+        err instanceof Error
+          ? err.message
+          : `Could not create ${appKey} issue. Connect the app in the Apps tab first.`,
+      );
+    }
+  }
+
   async function markMessageUnread(message: ChatMessage) {
     if (message.deletedForEveryone) {
       return;
@@ -3049,6 +3155,35 @@ export function ThreadView() {
     closeMessageOverlays();
   }
 
+  function closeThreadPanel() {
+    setActiveThreadRoot(null);
+    setThreadReplies([]);
+    setThreadComposer('');
+    setAlsoSendToChannel(false);
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete('thread');
+        return next;
+      },
+      { replace: true },
+    );
+  }
+
+  function openThreadPanel(message: ChatMessage) {
+    setActiveThreadRoot(message);
+    closeMessageOverlays();
+    void loadThreadReplies(message.id);
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.set('thread', message.id);
+        return next;
+      },
+      { replace: true },
+    );
+  }
+
   async function openEditHistory(message: ChatMessage) {
     if (!id || !message.editedAt) {
       return;
@@ -3101,7 +3236,10 @@ export function ThreadView() {
   }
 
   return (
-    <div className="thread">
+    <div
+      className={`thread${activeThreadRoot ? ' has-side-thread' : ''}`}
+    >
+      <div className="thread-stage">
       <header className="thread-head">
         <div className="thread-head-main">
           <button
@@ -3142,6 +3280,14 @@ export function ThreadView() {
               ) : null}
               {title}
               {conversation.muted ? <span className="mute-pill">Muted</span> : null}
+              {conversation.announceOnly ? (
+                <span
+                  className="announce-pill"
+                  title="Only owners and admins can post"
+                >
+                  Announcement
+                </span>
+              ) : null}
               {conversation.isShared ? (
                 <span className="connect-pill" title="Shared with external collaborators">
                   Shared
@@ -3152,16 +3298,6 @@ export function ThreadView() {
               <span className={peerOnline || groupOnlineCount > 0 ? 'dot on' : 'dot'} />
               {statusLabel}
             </p>
-            {conversation.type === 'group' && conversation.topic?.trim() ? (
-              <button
-                type="button"
-                className="muted thread-topic thread-topic-btn"
-                title="View topic details"
-                onClick={() => setTopicDetailsOpen(true)}
-              >
-                {conversation.topic}
-              </button>
-            ) : null}
           </div>
         </div>
         <div className="thread-tools" ref={toolsMenuRef}>
@@ -3193,24 +3329,6 @@ export function ThreadView() {
                 </button>
               ) : (
                 <>
-                  <button
-                    className={`ghost thread-tool-btn call huddle${
-                      inThisHuddle ? ' active' : ''
-                    }`}
-                    type="button"
-                    aria-label={
-                      inThisHuddle ? 'In huddle' : 'Start huddle'
-                    }
-                    title={
-                      inThisHuddle
-                        ? 'You are in this huddle'
-                        : 'Huddle — ambient audio, no ringing'
-                    }
-                    disabled={callPhase !== 'idle' || Boolean(ongoingLobby?.active)}
-                    onClick={() => void startHuddle(conversation.id)}
-                  >
-                    <HuddleIcon size={18} />
-                  </button>
                   <button
                     className="ghost thread-tool-btn call"
                     type="button"
@@ -3453,6 +3571,45 @@ export function ThreadView() {
           ) : null}
         </div>
       </header>
+
+      {showTopicBanner ? (
+        <div className="thread-topic-banner" role="note">
+          {conversation.announceOnly ? (
+            <span className="thread-topic-banner-chip">Announcement</span>
+          ) : null}
+          <button
+            type="button"
+            className="thread-topic-banner-main"
+            title="View channel topic"
+            onClick={() => setTopicDetailsOpen(true)}
+          >
+            <strong className={channelTopic ? undefined : 'is-empty'}>
+              {channelTopic ||
+                (canManageChannel ? 'Add a channel topic' : 'No topic set')}
+            </strong>
+            {channelDescription ? (
+              <span className="thread-topic-banner-desc muted">
+                {channelDescription}
+              </span>
+            ) : conversation.announceOnly ? (
+              <span className="thread-topic-banner-desc muted">
+                {canManageChannel
+                  ? 'Only you and other admins can post here'
+                  : 'Only owners and admins can post here'}
+              </span>
+            ) : null}
+          </button>
+          {canManageChannel ? (
+            <button
+              type="button"
+              className="ghost thread-topic-banner-edit"
+              onClick={() => navigate(`/chat/${id}/details`)}
+            >
+              Edit
+            </button>
+          ) : null}
+        </div>
+      ) : null}
 
       {canJoinOngoing ? (
         <button
@@ -3821,8 +3978,9 @@ export function ThreadView() {
           const isBot = Boolean(message.botUsername?.trim());
           const mine = !isBot && message.senderId === me;
           const pending = isPendingMessage(message);
+          const seenBy = Array.isArray(message.seenBy) ? message.seenBy : [];
           const seen = Boolean(
-            mine && me && !pending && message.seenBy.some((userId) => userId !== me),
+            mine && me && !pending && seenBy.some((userId) => userId !== me),
           );
           const menuOpen = !pending && menuMessageId === message.id;
           const showImage =
@@ -3858,6 +4016,8 @@ export function ThreadView() {
             <div
               key={message.id}
               className={`${mine ? 'wa-row mine' : 'wa-row theirs'}${
+                isBot ? ' is-bot' : ''
+              }${
                 highlightId === message.id ? ' highlight' : ''
               }${
                 !mine && me && (message.mentions ?? []).includes(me)
@@ -3932,7 +4092,12 @@ export function ThreadView() {
                 touchStartRef.current = null;
               }}
             >
-              {!mine ? (
+              <UserHoverCard
+                userId={message.senderId}
+                profile={isBot ? null : byUserId.get(message.senderId)}
+                member={memberByUserId.get(message.senderId)}
+                isBot={isBot}
+              >
                 <UserAvatar
                   profile={isBot ? null : byUserId.get(message.senderId)}
                   name={
@@ -3942,7 +4107,7 @@ export function ThreadView() {
                   size="sm"
                   className="wa-msg-avatar"
                 />
-              ) : null}
+              </UserHoverCard>
               <div className={`wa-msg${mine ? ' mine' : ' theirs'}`}>
               <div
                 className={`${mine ? 'wa-bubble mine' : 'wa-bubble theirs'}${
@@ -3963,12 +4128,29 @@ export function ThreadView() {
                   setMenuMessageId(message.id);
                 }}
               >
-                {!mine && (conversation.type === 'group' || isBot) ? (
-                  <span className={`wa-author${isBot ? ' wa-author-bot' : ''}`}>
-                    {botLabel || displayName(byUserId.get(message.senderId))}
-                    {isBot ? <span className="wa-bot-badge">APP</span> : null}
-                  </span>
-                ) : null}
+                <span className={`wa-author${isBot ? ' wa-author-bot' : ''}`}>
+                  {isBot ? (
+                    <>
+                      {botLabel || displayName(byUserId.get(message.senderId))}
+                      <span className="wa-bot-badge">APP</span>
+                    </>
+                  ) : (
+                    <UserHoverCard
+                      userId={message.senderId}
+                      profile={byUserId.get(message.senderId)}
+                      member={memberByUserId.get(message.senderId)}
+                    >
+                      <span className="wa-author-name">
+                        {mine
+                          ? 'You'
+                          : displayName(byUserId.get(message.senderId))}
+                      </span>
+                    </UserHoverCard>
+                  )}
+                  <time className="wa-author-time" dateTime={message.createdAt}>
+                    {clock(message.createdAt)}
+                  </time>
+                </span>
                 {message.forwarded && !message.deletedForEveryone ? (
                   <span className="wa-forwarded">Forwarded</span>
                 ) : null}
@@ -4354,17 +4536,17 @@ export function ThreadView() {
               ) : null}
               {!pending &&
               !message.deletedForEveryone &&
-              (message.replyCount ?? 0) > 0 ? (
+              ((message.replyCount ?? 0) > 0 || isBot) ? (
                 <button
                   type="button"
                   className="wa-thread-replies"
-                  onClick={() => {
-                    setActiveThreadRoot(message);
-                    void loadThreadReplies(message.id);
-                  }}
+                  onClick={() => openThreadPanel(message)}
                 >
-                  {message.replyCount}{' '}
-                  {message.replyCount === 1 ? 'reply' : 'replies'}
+                  {(message.replyCount ?? 0) > 0
+                    ? `${message.replyCount} ${
+                        message.replyCount === 1 ? 'reply' : 'replies'
+                      }`
+                    : 'Reply in thread'}
                 </button>
               ) : null}
               </div>
@@ -4410,11 +4592,7 @@ export function ThreadView() {
                         <button
                           type="button"
                           role="menuitem"
-                          onClick={() => {
-                            setActiveThreadRoot(message);
-                            closeMessageOverlays();
-                            void loadThreadReplies(message.id);
-                          }}
+                          onClick={() => openThreadPanel(message)}
                         >
                           <MsgMenuIcon path={MSG_MENU_ICONS.thread} />
                           Reply in thread
@@ -4463,6 +4641,26 @@ export function ThreadView() {
                         >
                           <MsgMenuIcon path={MSG_MENU_ICONS.save} />
                           {bookmarkedIds.has(message.id) ? 'Unsave' : 'Save'}
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() =>
+                            void createIssueFromMessage(message, 'github')
+                          }
+                        >
+                          <MsgMenuIcon path={MSG_MENU_ICONS.forward} />
+                          Create GitHub issue
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() =>
+                            void createIssueFromMessage(message, 'jira')
+                          }
+                        >
+                          <MsgMenuIcon path={MSG_MENU_ICONS.forward} />
+                          Create Jira issue
                         </button>
                         <button
                           type="button"
@@ -4939,16 +5137,30 @@ export function ThreadView() {
           </Link>
         </div>
       ) : announceOnlyLocked ? (
-        <div className="blocked-chat-composer announce-only-banner" role="status">
+        <div className="announce-only-composer" role="status">
+          <div className="announce-only-faux-input" aria-hidden="true">
+            Message #{(conversation.name || 'channel').replace(/^#/, '')}
+          </div>
           <p>
-            This is an announcement channel. Only owners and admins can post.
+            This is an <strong>announcement</strong> channel. Only owners and
+            admins can post — you can still read and react.
           </p>
         </div>
       ) : (
+      <div className="composer-stack">
+      {conversation.announceOnly && canManageChannel ? (
+        <p className="announce-admin-hint muted" role="note">
+          Announcement channel — members can read, only admins can post.
+        </p>
+      ) : null}
       <form
         className={`composer${editingMessage ? ' edit-mode' : ''}${
           voicePhase !== 'idle' ? ' voice-mode' : ''
-        }${formatToolbarOpen ? ' format-open' : ''}`}
+        }${formatToolbarOpen ? ' format-open' : ''}${
+          conversation.announceOnly && canManageChannel
+            ? ' announce-admin-composer'
+            : ''
+        }`}
         onSubmit={(event) => {
           if (voicePhase !== 'idle') {
             event.preventDefault();
@@ -5132,81 +5344,111 @@ export function ThreadView() {
                 )}
               </div>
             ) : null}
-            <div className="composer-shell">
-              {!editingMessage ? (
-                <div className="composer-attach-wrap" ref={attachMenuRef}>
+            <div className="composer-box">
+              {formatToolbarOpen ? (
+                <div
+                  className="composer-format-bar"
+                  role="toolbar"
+                  aria-label="Text formatting"
+                >
                   <button
-                    className={`composer-attach${attachMenuOpen ? ' open' : ''}`}
                     type="button"
-                    aria-label="Attach"
-                    title="Attach"
-                    aria-expanded={attachMenuOpen}
-                    disabled={uploading}
-                    onClick={() => setAttachMenuOpen((open) => !open)}
+                    className="composer-format-btn"
+                    title="Bold (Ctrl/⌘+B)"
+                    aria-label="Bold"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => applyComposerFormat('*', 'bold')}
                   >
-                    {uploading ? (
-                      <span className="composer-attach-busy">…</span>
-                    ) : (
-                      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-                        <path
-                          d="M14.5 5.5 7.8 12.2a3.2 3.2 0 1 0 4.5 4.5l7.2-7.2a4.8 4.8 0 0 0-6.8-6.8L5.5 10a1.2 1.2 0 0 0 1.7 1.7l7.2-7.2"
-                          fill="none"
-                          stroke="currentColor"
-                          strokeWidth="1.8"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        />
-                      </svg>
-                    )}
+                    <strong>B</strong>
                   </button>
-                  {attachMenuOpen ? (
-                    <div className="composer-attach-menu" role="menu">
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setAttachMenuOpen(false);
-                          fileInputRef.current?.click();
-                        }}
-                      >
-                        Photo
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setAttachMenuOpen(false);
-                          docInputRef.current?.click();
-                        }}
-                      >
-                        Document
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          setAttachMenuOpen(false);
-                          setPollOpen(true);
-                        }}
-                      >
-                        Poll
-                      </button>
-                    </div>
-                  ) : null}
+                  <button
+                    type="button"
+                    className="composer-format-btn"
+                    title="Italic (Ctrl/⌘+I)"
+                    aria-label="Italic"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => applyComposerFormat('_', 'italic')}
+                  >
+                    <em>I</em>
+                  </button>
+                  <button
+                    type="button"
+                    className="composer-format-btn"
+                    title="Strikethrough"
+                    aria-label="Strikethrough"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => applyComposerFormat('~', 'strike')}
+                  >
+                    <s>S</s>
+                  </button>
+                  <button
+                    type="button"
+                    className="composer-format-btn"
+                    title="Link"
+                    aria-label="Insert link"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={insertComposerLink}
+                  >
+                    🔗
+                  </button>
+                  <span className="composer-format-sep" aria-hidden="true" />
+                  <button
+                    type="button"
+                    className="composer-format-btn"
+                    title="Bulleted list"
+                    aria-label="Bulleted list"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => applyComposerPrefix('- ')}
+                  >
+                    •
+                  </button>
+                  <button
+                    type="button"
+                    className="composer-format-btn"
+                    title="Numbered list"
+                    aria-label="Numbered list"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => applyComposerPrefix('1. ')}
+                  >
+                    1.
+                  </button>
+                  <button
+                    type="button"
+                    className="composer-format-btn"
+                    title="Quote"
+                    aria-label="Quote"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => applyComposerPrefix('> ')}
+                  >
+                    “
+                  </button>
+                  <button
+                    type="button"
+                    className="composer-format-btn"
+                    title="Code"
+                    aria-label="Inline code"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => applyComposerFormat('`', 'code')}
+                  >
+                    {'</>'}
+                  </button>
+                  <button
+                    type="button"
+                    className="composer-format-btn"
+                    title="Code block"
+                    aria-label="Code block"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => applyComposerPrefix('```\n')}
+                  >
+                    ▢
+                  </button>
                 </div>
               ) : null}
-              <button
-                className={`composer-format-toggle${formatToolbarOpen ? ' active' : ''}`}
-                type="button"
-                aria-label="Text formatting"
-                title="Formatting"
-                aria-pressed={formatToolbarOpen}
-                onClick={() => setFormatToolbarOpen((open) => !open)}
-              >
-                Aa
-              </button>
-              <input
+
+              <textarea
                 ref={composerInputRef}
+                className="composer-input"
+                rows={composer.trim() || replyTo || editingMessage ? 3 : 2}
                 value={composer}
                 onChange={(event) => setComposer(event.target.value)}
                 onKeyDown={onComposerKeyDown}
@@ -5216,280 +5458,483 @@ export function ThreadView() {
                   editingMessage
                     ? 'Edit message'
                     : replyTo
-                      ? 'Type a reply'
-                      : 'Type a message'
+                      ? 'Type a reply…'
+                      : conversation.type === 'group'
+                        ? `Message #${(conversation.name || 'channel').replace(/^#/, '')}`
+                        : `Message ${title}`
                 }
                 autoComplete="off"
               />
-              {!editingMessage && !composer.trim() ? (
-                <button
-                  className="composer-voice"
-                  type="button"
-                  aria-label="Record voice note"
-                  title="Record voice note"
-                  disabled={uploading}
-                  onClick={() => void startVoiceRecording()}
-                >
-                  <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-                    <path
-                      fill="currentColor"
-                      d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2z"
-                    />
-                  </svg>
-                </button>
-              ) : (
-                <>
+
+              <div className="composer-actions">
+                <div className="composer-actions-left">
+                  {!editingMessage ? (
+                    <div className="composer-attach-wrap" ref={attachMenuRef}>
+                      <button
+                        className={`composer-tool${attachMenuOpen ? ' open' : ''}`}
+                        type="button"
+                        aria-label="Attach"
+                        title="Attach"
+                        aria-expanded={attachMenuOpen}
+                        disabled={uploading}
+                        onClick={() => setAttachMenuOpen((open) => !open)}
+                      >
+                        {uploading ? '…' : '+'}
+                      </button>
+                      {attachMenuOpen ? (
+                        <div className="composer-attach-menu" role="menu">
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              setAttachMenuOpen(false);
+                              fileInputRef.current?.click();
+                            }}
+                          >
+                            Photo
+                          </button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              setAttachMenuOpen(false);
+                              docInputRef.current?.click();
+                            }}
+                          >
+                            Document
+                          </button>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              setAttachMenuOpen(false);
+                              setPollOpen(true);
+                            }}
+                          >
+                            Poll
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {!editingMessage &&
+                  (conversation.type === 'group' ||
+                    conversation.type === 'private') ? (
+                    <button
+                      className={`composer-tool${inThisHuddle ? ' open' : ''}`}
+                      type="button"
+                      aria-label={inThisHuddle ? 'In huddle' : 'Start huddle'}
+                      title={
+                        inThisHuddle
+                          ? 'You are in this huddle'
+                          : 'Huddle — ambient audio, no ringing'
+                      }
+                      disabled={
+                        callPhase !== 'idle' || Boolean(ongoingLobby?.active)
+                      }
+                      onClick={() => void startHuddle(conversation.id)}
+                    >
+                      <HuddleIcon size={18} />
+                    </button>
+                  ) : null}
+
                   {!editingMessage ? (
                     <button
-                      className={`composer-schedule${scheduleOpen ? ' active' : ''}`}
+                      className="composer-tool"
                       type="button"
-                      aria-label="Schedule message"
-                      title="Schedule message"
-                      aria-pressed={scheduleOpen}
-                      disabled={!composer.trim()}
-                      onClick={() => {
-                        setScheduleAt(defaultScheduleLocalValue());
-                        setScheduleOpen((open) => !open);
-                      }}
+                      aria-label="Record voice note"
+                      title="Record voice note"
+                      disabled={uploading}
+                      onClick={() => void startVoiceRecording()}
                     >
-                      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
                         <path
                           fill="currentColor"
-                          d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 11h4v-2h-3V7h-2z"
+                          d="M12 14a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v5a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2z"
                         />
                       </svg>
                     </button>
                   ) : null}
+
+                  <span className="composer-actions-sep" aria-hidden="true" />
+
+                  <div className="composer-emoji-wrap">
+                    <button
+                      className={`composer-tool${composerEmojiOpen ? ' open' : ''}`}
+                      type="button"
+                      aria-label="Emoji"
+                      title="Emoji"
+                      aria-expanded={composerEmojiOpen}
+                      onClick={() => setComposerEmojiOpen((open) => !open)}
+                    >
+                      🙂
+                    </button>
+                    {composerEmojiOpen ? (
+                      <div className="composer-emoji-menu" role="menu">
+                        {QUICK_REACTIONS.map((emoji) => (
+                          <button
+                            key={emoji}
+                            type="button"
+                            role="menuitem"
+                            onClick={() => insertComposerSnippet(emoji)}
+                          >
+                            {emoji}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+
                   <button
-                    className="composer-send"
-                    type="submit"
-                    aria-label={editingMessage ? 'Save edit' : 'Send message'}
-                    title={editingMessage ? 'Save' : 'Send'}
-                    disabled={editingMessage ? !composer.trim() : !composer.trim()}
+                    className="composer-tool"
+                    type="button"
+                    aria-label="Mention someone"
+                    title="Mention"
+                    onClick={() => insertComposerSnippet('@')}
                   >
-                    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
-                      <path
-                        fill="currentColor"
-                        d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"
-                      />
-                    </svg>
+                    @
                   </button>
-                </>
-              )}
-            </div>
-            {formatToolbarOpen ? (
-              <div
-                className="composer-format-bar"
-                role="toolbar"
-                aria-label="Text formatting"
-              >
-                <button
-                  type="button"
-                  className="composer-format-btn"
-                  title="Bold (Ctrl/⌘+B)"
-                  aria-label="Bold"
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => applyComposerFormat('*', 'bold')}
-                >
-                  <strong>B</strong>
-                </button>
-                <button
-                  type="button"
-                  className="composer-format-btn"
-                  title="Italic (Ctrl/⌘+I)"
-                  aria-label="Italic"
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => applyComposerFormat('_', 'italic')}
-                >
-                  <em>I</em>
-                </button>
-                <button
-                  type="button"
-                  className="composer-format-btn"
-                  title="Strikethrough (Ctrl/⌘+Shift+X)"
-                  aria-label="Strikethrough"
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => applyComposerFormat('~', 'strike')}
-                >
-                  <s>S</s>
-                </button>
-                <button
-                  type="button"
-                  className="composer-format-btn"
-                  title="Code (Ctrl/⌘+Shift+E)"
-                  aria-label="Inline code"
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={() => applyComposerFormat('`', 'code')}
-                >
-                  {'</>'}
-                </button>
-                <span className="composer-format-hint muted">
-                  Select text, then tap a style
-                </span>
+
+                  <button
+                    className={`composer-tool composer-format-toggle${
+                      formatToolbarOpen ? ' active' : ''
+                    }`}
+                    type="button"
+                    aria-label="Text formatting"
+                    title="Formatting"
+                    aria-pressed={formatToolbarOpen}
+                    onClick={() => setFormatToolbarOpen((open) => !open)}
+                  >
+                    Aa
+                  </button>
+                </div>
+
+                <div className="composer-actions-right">
+                  {editingMessage || composer.trim() ? (
+                    <div className="composer-send-group">
+                      <button
+                        className="composer-send"
+                        type="submit"
+                        aria-label={editingMessage ? 'Save edit' : 'Send message'}
+                        title={editingMessage ? 'Save' : 'Send'}
+                        disabled={!composer.trim()}
+                      >
+                        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                          <path
+                            fill="currentColor"
+                            d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"
+                          />
+                        </svg>
+                      </button>
+                      {!editingMessage ? (
+                        <button
+                          className={`composer-send-more${scheduleOpen ? ' active' : ''}`}
+                          type="button"
+                          aria-label="Schedule message"
+                          title="Schedule message"
+                          aria-pressed={scheduleOpen}
+                          disabled={!composer.trim()}
+                          onClick={() => {
+                            setScheduleAt(defaultScheduleLocalValue());
+                            setScheduleOpen((open) => !open);
+                          }}
+                        >
+                          ▾
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
               </div>
-            ) : null}
+            </div>
           </>
         )}
       </form>
+      </div>
       )}
-        </>
+      </>
       ) : null}
+      </div>
 
-      <Modal
-        open={Boolean(activeThreadRoot)}
-        title="Thread"
-        onClose={() => {
-          setActiveThreadRoot(null);
-          setThreadReplies([]);
-          setThreadComposer('');
-          setThreadReplyTo(null);
-          setAlsoSendToChannel(false);
-        }}
-      >
-        {activeThreadRoot ? (
-          <div className="thread-panel">
-            <div className="thread-panel-root">
-              <div className="thread-panel-root-head">
-                <strong>
-                  {displayName(byUserId.get(activeThreadRoot.senderId))}
-                </strong>
-                <button
-                  type="button"
-                  className="ghost thread-follow-btn"
-                  disabled={threadFollowBusy}
-                  onClick={() => void toggleThreadFollow()}
-                >
-                  {threadFollowing ? 'Following' : 'Follow'}
-                </button>
+      {activeThreadRoot ? (
+        <aside className="thread-side-panel" aria-label="Thread">
+          <header className="thread-side-head">
+            <div className="thread-side-head-main">
+              <button
+                type="button"
+                className="ghost thread-tool-btn thread-side-back"
+                aria-label="Close thread"
+                title="Back"
+                onClick={closeThreadPanel}
+              >
+                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                  <path
+                    fill="currentColor"
+                    d="M15.41 7.41 14 6l-6 6 6 6 1.41-1.41L10.83 12z"
+                  />
+                </svg>
+              </button>
+              <div className="thread-side-titles">
+                <h3>Thread</h3>
+                <p className="muted">{title}</p>
               </div>
-              <p className="wa-text">
-                <MentionedText
-                  body={activeThreadRoot.body}
-                  mentionLabels={mentionRenderLabels}
-                  userGroupHandles={userGroupHandles}
-                  selfId={me}
-                  messageId={activeThreadRoot.id}
-                />
-              </p>
-              <small className="muted">{clock(activeThreadRoot.createdAt)}</small>
             </div>
-            {threadLoading && threadReplies.length === 0 ? (
-              <p className="muted">Loading replies…</p>
-            ) : null}
-            {!threadLoading && threadReplies.length === 0 ? (
-              <p className="muted">No replies yet. Start the thread below.</p>
-            ) : null}
-            <ul className="thread-panel-list">
-              {threadReplies.map((reply) => (
-                <li key={reply.id}>
-                  <div
-                    className={
-                      reply.senderId === me ? 'wa-bubble mine' : 'wa-bubble theirs'
+            <button
+              type="button"
+              className="ghost icon-btn thread-side-close"
+              aria-label="Close thread"
+              title="Close"
+              onClick={closeThreadPanel}
+            >
+              ×
+            </button>
+          </header>
+
+          <div className="slack-thread">
+            <div className="slack-thread-scroll">
+              <article className="slack-thread-msg is-root">
+                <UserHoverCard
+                  userId={activeThreadRoot.senderId}
+                  profile={
+                    activeThreadRoot.botUsername
+                      ? null
+                      : byUserId.get(activeThreadRoot.senderId)
+                  }
+                  member={memberByUserId.get(activeThreadRoot.senderId)}
+                  isBot={Boolean(activeThreadRoot.botUsername)}
+                >
+                  <UserAvatar
+                    profile={
+                      activeThreadRoot.botUsername
+                        ? null
+                        : byUserId.get(activeThreadRoot.senderId)
                     }
-                  >
-                    <span className="wa-author">
-                      {displayName(byUserId.get(reply.senderId))}
-                    </span>
-                    <p className="wa-text">
-                      <MentionedText
-                        body={reply.body}
-                        mentionLabels={mentionRenderLabels}
-                        userGroupHandles={userGroupHandles}
-                        selfId={me}
-                        messageId={reply.id}
-                      />
-                    </p>
-                    {reply.translatedText ? (
-                      <div className="wa-translation">
-                        <p className="wa-text wa-translated">
-                          {reply.showOriginal
-                            ? reply.body
-                            : reply.translatedText}
-                        </p>
-                        <button
-                          type="button"
-                          className="wa-translation-toggle"
-                          onClick={() => toggleShowOriginal(reply)}
-                        >
-                          {reply.showOriginal
-                            ? 'Show translation'
-                            : 'Show original'}
-                        </button>
-                      </div>
-                    ) : null}
-                    <span className="wa-meta">
-                      <time dateTime={reply.createdAt}>
-                        {clock(reply.createdAt)}
-                      </time>
-                    </span>
-                  </div>
-                  {!announceOnlyLocked ? (
-                    <button
-                      type="button"
-                      className="ghost thread-reply-to-btn"
-                      onClick={() => setThreadReplyTo(reply)}
+                    name={
+                      activeThreadRoot.botUsername?.trim() ||
+                      displayName(byUserId.get(activeThreadRoot.senderId))
+                    }
+                    imageUrl={
+                      activeThreadRoot.botUsername
+                        ? activeThreadRoot.botIconUrl
+                        : null
+                    }
+                    size="sm"
+                    className="slack-thread-avatar"
+                  />
+                </UserHoverCard>
+                <div className="slack-thread-msg-body">
+                  <header className="slack-thread-msg-head">
+                    <span
+                      className={`slack-thread-author${
+                        activeThreadRoot.botUsername ? ' is-bot' : ''
+                      }`}
                     >
-                      Reply
-                    </button>
-                  ) : null}
-                </li>
-              ))}
-            </ul>
+                      {activeThreadRoot.botUsername?.trim() ? (
+                        <>
+                          {activeThreadRoot.botUsername.trim()}
+                          <span className="wa-bot-badge">APP</span>
+                        </>
+                      ) : (
+                        <UserHoverCard
+                          userId={activeThreadRoot.senderId}
+                          profile={byUserId.get(activeThreadRoot.senderId)}
+                          member={memberByUserId.get(activeThreadRoot.senderId)}
+                        >
+                          <span className="slack-thread-author-name">
+                            {displayName(
+                              byUserId.get(activeThreadRoot.senderId),
+                            )}
+                          </span>
+                        </UserHoverCard>
+                      )}
+                    </span>
+                    <time dateTime={activeThreadRoot.createdAt}>
+                      {clock(activeThreadRoot.createdAt)}
+                    </time>
+                  </header>
+                  <div className="slack-thread-text">
+                    <MentionedText
+                      body={activeThreadRoot.body}
+                      mentionLabels={mentionRenderLabels}
+                      userGroupHandles={userGroupHandles}
+                      selfId={me}
+                      messageId={activeThreadRoot.id}
+                    />
+                  </div>
+                </div>
+              </article>
+
+              {threadReplies.length > 0 || threadLoading ? (
+                <div className="slack-thread-divider" role="presentation">
+                  <span>
+                    {threadReplies.length}{' '}
+                    {threadReplies.length === 1 ? 'reply' : 'replies'}
+                  </span>
+                </div>
+              ) : null}
+
+              {threadLoading && threadReplies.length === 0 ? (
+                <p className="muted slack-thread-empty">Loading replies…</p>
+              ) : null}
+
+              <ul className="slack-thread-list">
+                {threadReplies.map((reply) => {
+                  const isBot = Boolean(reply.botUsername?.trim());
+                  return (
+                    <li key={reply.id}>
+                      <article className="slack-thread-msg">
+                        <UserHoverCard
+                          userId={reply.senderId}
+                          profile={
+                            isBot ? null : byUserId.get(reply.senderId)
+                          }
+                          member={memberByUserId.get(reply.senderId)}
+                          isBot={isBot}
+                        >
+                          <UserAvatar
+                            profile={
+                              isBot ? null : byUserId.get(reply.senderId)
+                            }
+                            name={
+                              reply.botUsername?.trim() ||
+                              displayName(byUserId.get(reply.senderId))
+                            }
+                            imageUrl={isBot ? reply.botIconUrl : null}
+                            size="sm"
+                            className="slack-thread-avatar"
+                          />
+                        </UserHoverCard>
+                        <div className="slack-thread-msg-body">
+                          <header className="slack-thread-msg-head">
+                            <span
+                              className={`slack-thread-author${
+                                isBot ? ' is-bot' : ''
+                              }`}
+                            >
+                              {isBot ? (
+                                <>
+                                  {reply.botUsername?.trim() ||
+                                    displayName(byUserId.get(reply.senderId))}
+                                  <span className="wa-bot-badge">APP</span>
+                                </>
+                              ) : (
+                                <UserHoverCard
+                                  userId={reply.senderId}
+                                  profile={byUserId.get(reply.senderId)}
+                                  member={memberByUserId.get(reply.senderId)}
+                                >
+                                  <span className="slack-thread-author-name">
+                                    {displayName(byUserId.get(reply.senderId))}
+                                  </span>
+                                </UserHoverCard>
+                              )}
+                            </span>
+                            <time dateTime={reply.createdAt}>
+                              {clock(reply.createdAt)}
+                            </time>
+                          </header>
+                          <div className="slack-thread-text">
+                            <MentionedText
+                              body={reply.body}
+                              mentionLabels={mentionRenderLabels}
+                              userGroupHandles={userGroupHandles}
+                              selfId={me}
+                              messageId={reply.id}
+                            />
+                          </div>
+                          {reply.translatedText ? (
+                            <div className="wa-translation">
+                              <p className="wa-text wa-translated">
+                                {reply.showOriginal
+                                  ? reply.body
+                                  : reply.translatedText}
+                              </p>
+                              <button
+                                type="button"
+                                className="wa-translation-toggle"
+                                onClick={() => toggleShowOriginal(reply)}
+                              >
+                                {reply.showOriginal
+                                  ? 'Show translation'
+                                  : 'Show original'}
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
+                      </article>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+
             {announceOnlyLocked ? (
-              <p className="muted">Only owners and admins can reply here.</p>
+              <p className="muted announce-thread-lock">
+                Only owners and admins can reply in announcement channels.
+              </p>
             ) : (
               <form
-                className="thread-panel-composer"
+                className="slack-thread-composer"
                 onSubmit={(event) => void sendThreadReply(event)}
               >
-                {threadReplyTo ? (
-                  <div className="reply-bar">
-                    <div>
-                      <strong>
-                        Replying to{' '}
-                        {displayName(byUserId.get(threadReplyTo.senderId))}
-                      </strong>
-                      <span>{replySnippet(threadReplyTo)}</span>
-                    </div>
-                    <button
-                      className="ghost icon-btn"
-                      type="button"
-                      aria-label="Cancel reply"
-                      onClick={() => setThreadReplyTo(null)}
-                    >
-                      ×
-                    </button>
-                  </div>
-                ) : null}
-                <div className="thread-panel-composer-row">
-                  <input
+                <div className="composer-box">
+                  <MrkdwnEditor
+                    hint={null}
+                    rows={3}
                     value={threadComposer}
-                    onChange={(event) => setThreadComposer(event.target.value)}
-                    placeholder="Reply in thread…"
                     disabled={threadBusy}
+                    onChange={setThreadComposer}
+                    onModEnter={() => void sendThreadReply()}
+                    placeholder="Reply…"
+                    className="slack-thread-editor"
                   />
-                  <button
-                    className="btn"
-                    type="submit"
-                    disabled={threadBusy || !threadComposer.trim()}
-                  >
-                    Send
-                  </button>
+                  <div className="composer-actions">
+                    <div className="composer-actions-left">
+                      {conversation?.type === 'group' ? (
+                        <label className="thread-also-channel profile-check">
+                          <span className="profile-check-row">
+                            <input
+                              type="checkbox"
+                              checked={alsoSendToChannel}
+                              onChange={(event) =>
+                                setAlsoSendToChannel(event.target.checked)
+                              }
+                            />
+                            Also send to{' '}
+                            {title.startsWith('#') ? title : `#${title}`}
+                          </span>
+                        </label>
+                      ) : (
+                        <span />
+                      )}
+                    </div>
+                    <div className="composer-actions-right">
+                      {threadComposer.trim() ? (
+                        <div className="composer-send-group">
+                          <button
+                            className="composer-send"
+                            type="submit"
+                            disabled={threadBusy || !threadComposer.trim()}
+                            aria-label="Send"
+                          >
+                            <svg
+                              viewBox="0 0 24 24"
+                              width="18"
+                              height="18"
+                              aria-hidden="true"
+                            >
+                              <path
+                                fill="currentColor"
+                                d="M2.01 21 23 12 2.01 3 2 10l15 2-15 2z"
+                              />
+                            </svg>
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
                 </div>
-                {conversation?.type === 'group' ? (
-                  <label className="thread-also-channel profile-check">
-                    <span className="profile-check-row">
-                      <input
-                        type="checkbox"
-                        checked={alsoSendToChannel}
-                        onChange={(event) =>
-                          setAlsoSendToChannel(event.target.checked)
-                        }
-                      />
-                      Also send to channel
-                    </span>
-                  </label>
-                ) : null}
                 {filteredThreadMentions.length > 0 && threadMentionQuery ? (
                   <ul className="mention-picker">
                     {filteredThreadMentions.slice(0, 8).map((member) => (
@@ -5514,8 +5959,8 @@ export function ThreadView() {
               </form>
             )}
           </div>
-        ) : null}
-      </Modal>
+        </aside>
+      ) : null}
 
       <Modal
         open={savedOpen}
@@ -5878,6 +6323,14 @@ export function ThreadView() {
                 <dt>Description</dt>
                 <dd style={{ textAlign: 'left', whiteSpace: 'pre-wrap' }}>
                   {conversation.description?.trim() || 'No description yet'}
+                </dd>
+              </div>
+              <div>
+                <dt>Posting</dt>
+                <dd>
+                  {conversation.announceOnly
+                    ? 'Announcement only — owners & admins'
+                    : 'Everyone can post'}
                 </dd>
               </div>
               {(conversation.bookmarks?.length ?? 0) > 0 ? (
