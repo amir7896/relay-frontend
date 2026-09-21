@@ -233,10 +233,18 @@ export type MessageBookmark = {
   id: string;
   conversationId: string;
   messageId: string;
+  collectionId: string | null;
   createdAt: string;
   message: ChatMessage;
   conversationName: string | null;
   conversationType: 'private' | 'group';
+};
+
+export type BookmarkCollection = {
+  id: string;
+  name: string;
+  createdAt: string;
+  bookmarkCount: number;
 };
 
 export type ThreadSummary = {
@@ -444,6 +452,7 @@ export type Presence = {
   status: PresenceStatus;
   lastSeenAt: string | null;
   customStatus?: string | null;
+  statusClearsAt?: string | null;
 };
 
 export type ChatAnalytics = {
@@ -504,6 +513,18 @@ export type ConversationCanvas = {
   updatedAt: string | null;
 };
 
+export type CanvasComment = {
+  id: string;
+  conversationId: string;
+  authorId: string;
+  anchorText: string;
+  anchorOffset: number;
+  body: string;
+  resolvedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export type ChannelListItemStatus = 'todo' | 'doing' | 'done';
 
 export type ChannelListItem = {
@@ -512,6 +533,7 @@ export type ChannelListItem = {
   title: string;
   status: ChannelListItemStatus;
   assigneeId: string | null;
+  dueAt: string | null;
   sortOrder: number;
   createdAt: string;
 };

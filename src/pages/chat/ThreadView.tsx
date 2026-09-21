@@ -572,6 +572,10 @@ export function ThreadView() {
   const [error, setError] = useState('');
   const [actionError, setActionError] = useState('');
   const [slashNotice, setSlashNotice] = useState('');
+  const [slashCommands, setSlashCommands] = useState<
+    Array<{ name: string; description: string; builtin?: boolean }>
+  >([]);
+  const [slashHighlight, setSlashHighlight] = useState(0);
   const [topicDetailsOpen, setTopicDetailsOpen] = useState(false);
   const [userGroups, setUserGroups] = useState<UserGroup[]>([]);
   const [loading, setLoading] = useState(true);
@@ -834,6 +838,42 @@ export function ThreadView() {
   }, [conversation?.members]);
 
   const mentionQuery = parseMentionQuery(composer);
+  const slashQuery = useMemo(() => {
+    if (editingMessage) return null;
+    const match = composer.match(/^\/([a-zA-Z0-9_]*)$/);
+    if (!match) return null;
+    return match[1].toLowerCase();
+  }, [composer, editingMessage]);
+
+  const filteredSlashCommands = useMemo(() => {
+    if (slashQuery === null) return [];
+    const q = slashQuery;
+    return slashCommands
+      .filter(
+        (item) =>
+          !q ||
+          item.name.startsWith(q) ||
+          item.description.toLowerCase().includes(q),
+      )
+      .slice(0, 10);
+  }, [slashCommands, slashQuery]);
+
+  useEffect(() => {
+    setSlashHighlight(0);
+  }, [slashQuery, filteredSlashCommands.length]);
+
+  useEffect(() => {
+    function onComposerSlash(event: Event) {
+      const detail = (event as CustomEvent<{ command?: string }>).detail;
+      const command = detail?.command?.trim();
+      if (!command) return;
+      insertSlashCommand(command);
+    }
+    window.addEventListener('relay:composer-slash', onComposerSlash);
+    return () =>
+      window.removeEventListener('relay:composer-slash', onComposerSlash);
+  }, []);
+
   const filteredMentions = mentionQuery
     ? [
         ...(['channel', 'here'] as const)
@@ -1055,6 +1095,19 @@ export function ThreadView() {
     void api<Paginated<UserGroup>>('/chat/user-groups?page=1&limit=100')
       .then((response) => setUserGroups(response.data.items ?? []))
       .catch(() => setUserGroups([]));
+    void api<
+      Paginated<{ name: string; description: string; builtin?: boolean }>
+    >('/chat/slash-commands?page=1&limit=100')
+      .then((response) => setSlashCommands(response.data.items ?? []))
+      .catch(() =>
+        setSlashCommands([
+          { name: 'remind', description: 'Remind yourself (/remind 1h …)', builtin: true },
+          { name: 'poll', description: 'Create a poll', builtin: true },
+          { name: 'assign', description: 'Assign a list task', builtin: true },
+          { name: 'status', description: 'Set your status', builtin: true },
+          { name: 'help', description: 'List slash commands', builtin: true },
+        ]),
+      );
     void loadBookmarks();
     if (holdAutoSeenRef.current) {
       return;
@@ -1836,6 +1889,18 @@ export function ThreadView() {
 
     if (/^\/[a-zA-Z]/.test(body)) {
       setSlashNotice('');
+      let raw = body;
+      if (/^\/assign\b/i.test(raw)) {
+        for (const member of mentionCandidates) {
+          if (member.userId.startsWith('__')) continue;
+          const handle = member.label.replace(/\s+/g, '');
+          if (!handle) continue;
+          raw = raw.replace(
+            new RegExp(`@${handle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'),
+            `<@${member.userId}>`,
+          );
+        }
+      }
       try {
         const response = await api<{
           kind: 'message' | 'ephemeral' | 'status';
@@ -1844,12 +1909,19 @@ export function ThreadView() {
           customStatus?: string | null;
         }>(`/chat/conversations/${id}/slash`, {
           method: 'POST',
-          body: JSON.stringify({ raw: body }),
+          body: JSON.stringify({ raw }),
         });
         if (response.data.kind === 'message' && response.data.message) {
-          setMessages((current) => upsertMessage(current, response.data.message!));
-        } else if (response.data.ephemeral) {
+          setMessages((current) =>
+            upsertMessage(current, normalizeMessage(response.data.message!)),
+          );
+        }
+        if (response.data.ephemeral) {
           setSlashNotice(response.data.ephemeral);
+        } else if (response.data.kind === 'status' && response.data.customStatus) {
+          setSlashNotice(`Status set to “${response.data.customStatus}”`);
+        } else if (response.data.kind === 'status') {
+          setSlashNotice('Status cleared');
         }
         setComposer('');
         clearMessageDraft(id);
@@ -2246,7 +2318,55 @@ export function ThreadView() {
     insertComposerSnippet(href);
   }
 
+  function insertSlashCommand(name: string) {
+    if (name === 'assign') {
+      setComposer('/assign ');
+    } else if (name === 'remind') {
+      setComposer('/remind 1h ');
+    } else if (name === 'poll') {
+      setComposer('/poll ');
+    } else if (name === 'status') {
+      setComposer('/status ');
+    } else {
+      setComposer(`/${name} `);
+    }
+    window.setTimeout(() => composerInputRef.current?.focus(), 20);
+  }
+
   function onComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (filteredSlashCommands.length > 0 && slashQuery !== null) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        setSlashHighlight(
+          (index) => (index + 1) % filteredSlashCommands.length,
+        );
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        setSlashHighlight(
+          (index) =>
+            (index - 1 + filteredSlashCommands.length) %
+            filteredSlashCommands.length,
+        );
+        return;
+      }
+      if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey)) {
+        event.preventDefault();
+        const pick =
+          filteredSlashCommands[
+            Math.min(slashHighlight, filteredSlashCommands.length - 1)
+          ];
+        if (pick) insertSlashCommand(pick.name);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setComposer('');
+        return;
+      }
+    }
+
     const mod = event.metaKey || event.ctrlKey;
     if (event.key === 'Enter' && !event.shiftKey && !mod) {
       event.preventDefault();
@@ -2963,7 +3083,7 @@ export function ThreadView() {
         ...items.map((item) => item.senderId),
       ]);
       try {
-        // Slack auto-follows when you open a thread; no Follow button in the UI.
+        // Slack auto-follows when you open a thread.
         await api(`/chat/conversations/${id}/threads/${threadRootId}/follow`, {
           method: 'POST',
           body: JSON.stringify({}),
@@ -2979,6 +3099,22 @@ export function ThreadView() {
       setThreadReplies([]);
     } finally {
       setThreadLoading(false);
+    }
+  }
+
+  async function unfollowActiveThread() {
+    if (!id || !activeThreadRoot) return;
+    try {
+      await api(
+        `/chat/conversations/${id}/threads/${activeThreadRoot.id}/follow`,
+        { method: 'DELETE' },
+      );
+      setActionError('');
+      closeThreadPanel();
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not unfollow thread',
+      );
     }
   }
 
@@ -5357,6 +5493,23 @@ export function ThreadView() {
         </div>
       ) : null}
 
+      {filteredSlashCommands.length > 0 && slashQuery !== null ? (
+        <ul className="mention-picker slash-picker" role="listbox" aria-label="Slash commands">
+          {filteredSlashCommands.map((item, index) => (
+            <li key={item.name}>
+              <button
+                type="button"
+                className={index === slashHighlight ? 'is-active' : undefined}
+                onClick={() => insertSlashCommand(item.name)}
+              >
+                <strong>/{item.name}</strong>
+                <small className="muted"> {item.description}</small>
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+
       {filteredMentions.length > 0 && mentionQuery ? (
         <ul className="mention-picker">
           {filteredMentions.slice(0, 8).map((member) => (
@@ -5992,15 +6145,25 @@ export function ThreadView() {
                 <p className="muted">{title}</p>
               </div>
             </div>
-            <button
-              type="button"
-              className="ghost icon-btn thread-side-close"
-              aria-label="Close thread"
-              title="Close"
-              onClick={closeThreadPanel}
-            >
-              ×
-            </button>
+            <div className="thread-side-head-actions">
+              <button
+                type="button"
+                className="ghost thread-unfollow-btn"
+                title="Unfollow this thread"
+                onClick={() => void unfollowActiveThread()}
+              >
+                Unfollow
+              </button>
+              <button
+                type="button"
+                className="ghost icon-btn thread-side-close"
+                aria-label="Close thread"
+                title="Close"
+                onClick={closeThreadPanel}
+              >
+                ×
+              </button>
+            </div>
           </header>
 
           <div className="slack-thread">

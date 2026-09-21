@@ -1186,6 +1186,14 @@ button.linkish:disabled {
   color: var(--muted);
 }
 
+.inbox-custom-section.is-dragging {
+  opacity: 0.55;
+}
+
+.inbox-starred-section .inbox-section-toggle {
+  font-weight: 700;
+}
+
 .inbox-section-actions {
   display: flex;
   align-items: center;
@@ -8274,6 +8282,17 @@ body.nav-open {
   border: 0;
   background: transparent;
   color: var(--text);
+  cursor: pointer;
+}
+
+.mention-picker button:hover,
+.mention-picker button.is-active {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.slash-picker strong {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9rem;
 }
 
 .composer.voice-mode {
@@ -8917,8 +8936,82 @@ html[data-theme='dark'] .voice-note.mine .voice-note-play {
   white-space: nowrap;
 }
 
-.later-saved-list {
-  margin: 0;
+.following-thread-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: start;
+}
+
+.following-unfollow-btn,
+.thread-unfollow-btn {
+  font-size: 0.78rem;
+  white-space: nowrap;
+  margin-top: 4px;
+}
+
+.thread-side-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.saved-folder-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.saved-folder-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.saved-folder-chips button {
+  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.saved-folder-chips button.on {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.saved-folder-create {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.saved-folder-create input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  padding: 6px 10px;
+}
+
+.saved-folder-move select {
+  max-width: 140px;
+  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 4px 6px;
 }
 
 .threads-home-meta {
@@ -10337,6 +10430,118 @@ html[data-theme='dark'] .voice-note.mine .voice-note-play {
   margin: 0 auto;
 }
 
+.canvas-panel-with-comments {
+  max-width: 1200px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 300px);
+  gap: 18px;
+  align-items: start;
+}
+
+.canvas-main {
+  min-width: 0;
+}
+
+.canvas-comments {
+  position: sticky;
+  top: 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 12px;
+  padding: 14px;
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: calc(100vh - 140px);
+  overflow: auto;
+}
+
+.canvas-comments-head h4 {
+  margin: 0 0 4px;
+  font-size: 0.95rem;
+}
+
+.canvas-comment-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.canvas-comment-composer input,
+.canvas-comment-composer textarea {
+  width: 100%;
+  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  padding: 8px 10px;
+  resize: vertical;
+}
+
+.canvas-comment-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.canvas-comment-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.canvas-comment-item {
+  border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  padding-top: 10px;
+}
+
+.canvas-comment-item.is-resolved {
+  opacity: 0.72;
+}
+
+.canvas-comment-item p {
+  margin: 6px 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.canvas-comment-anchor {
+  margin: 0;
+  padding: 6px 8px;
+  border-left: 3px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.canvas-comment-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.canvas-resolved-comments summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+@media (max-width: 900px) {
+  .canvas-panel-with-comments {
+    grid-template-columns: 1fr;
+  }
+
+  .canvas-comments {
+    position: static;
+    max-height: none;
+  }
+}
+
 .canvas-head-actions {
   display: flex;
   flex-direction: column;
@@ -10713,6 +10918,35 @@ html[data-theme='dark'] .voice-note.mine .voice-note-play {
   font-size: 0.82rem;
 }
 
+.lists-view-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 75%, transparent);
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  flex-shrink: 0;
+}
+
+.lists-view-toggle button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.lists-view-toggle button.on {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  color: color-mix(in srgb, var(--accent) 75%, var(--text));
+}
+
 .workflows-panel,
 .connect-panel {
   width: 100%;
@@ -10917,11 +11151,23 @@ html[data-theme='dark'] .voice-note.mine .voice-note-play {
 
 .list-add-item {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(140px, 200px) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(120px, 180px) auto auto;
   gap: 8px;
   align-items: stretch;
   flex-shrink: 0;
   width: 100%;
+}
+
+.list-add-due {
+  box-sizing: border-box;
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 8px 10px;
 }
 
 .list-add-assignee {
@@ -10988,8 +11234,216 @@ html[data-theme='dark'] .voice-note.mine .voice-note-play {
   white-space: nowrap;
 }
 
+.list-card-due {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.list-card-due-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  border: 1px solid color-mix(in srgb, var(--border) 80%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.78rem;
+  padding: 5px 8px;
+}
+
+.list-card-due-label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.list-card-due-label.is-overdue {
+  color: #c62828;
+}
+
 .list-card.is-mine {
   border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+/* —— List week calendar —— */
+.list-week {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+.list-week-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  flex-shrink: 0;
+}
+
+.list-week-nav {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.list-week-nav .ghost {
+  min-width: 36px;
+  padding: 6px 10px;
+  font-weight: 700;
+}
+
+.list-week-range {
+  font-size: 0.95rem;
+  letter-spacing: -0.01em;
+}
+
+.list-week-hint {
+  margin: 0;
+  font-size: 0.78rem;
+  width: 100%;
+}
+
+.list-week-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 8px;
+  min-height: 220px;
+  align-items: stretch;
+}
+
+.list-week-day,
+.list-week-undated {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 180px;
+  min-width: 0;
+  padding: 8px;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.list-week-day.is-today {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.list-week-day.drop-target,
+.list-week-undated.drop-target {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+}
+
+.list-week-day-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.list-week-day-head strong {
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.list-week-day-head span {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.list-week-day-head em {
+  margin-left: auto;
+  font-style: normal;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--muted);
+  min-width: 1.2rem;
+  text-align: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--muted) 12%, transparent);
+}
+
+.list-week-day-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+.list-week-undated-items {
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.list-week-chip {
+  display: block;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--border) 65%, transparent);
+  background: color-mix(in srgb, var(--bg) 88%, var(--panel));
+  cursor: grab;
+  user-select: none;
+  min-width: 0;
+}
+
+.list-week-undated-items .list-week-chip {
+  max-width: 220px;
+}
+
+.list-week-chip:active,
+.list-week-chip.dragging {
+  cursor: grabbing;
+  opacity: 0.6;
+}
+
+.list-week-chip.status-doing {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.list-week-chip.status-done {
+  opacity: 0.7;
+  text-decoration: line-through;
+}
+
+.list-week-chip-title {
+  display: block;
+  font-size: 0.78rem;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list-week-empty {
+  margin: auto 0 0;
+  font-size: 0.75rem;
+  text-align: center;
+}
+
+.list-week-undated {
+  min-height: 88px;
 }
 
 .list-board {
@@ -11274,7 +11728,8 @@ html[data-theme='dark'] .voice-note.mine .voice-note-play {
     grid-template-columns: minmax(0, 1fr) auto;
   }
 
-  .list-add-assignee {
+  .list-add-assignee,
+  .list-add-due {
     grid-column: 1 / -1;
   }
 
@@ -11282,6 +11737,11 @@ html[data-theme='dark'] .voice-note.mine .voice-note-play {
     grid-template-columns: repeat(3, minmax(220px, 1fr));
     align-content: start;
     min-height: 280px;
+  }
+
+  .list-week-grid {
+    grid-template-columns: repeat(7, minmax(110px, 1fr));
+    overflow-x: auto;
   }
 
   .list-column {
@@ -11344,6 +11804,30 @@ html[data-theme='dark'] .voice-note.mine .voice-note-play {
 
   .list-add-assignee {
     grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .list-week-grid {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    overflow: visible;
+  }
+
+  .list-week-day {
+    min-height: 0;
+  }
+
+  .lists-panel-head {
+    flex-wrap: wrap;
+  }
+
+  .lists-view-toggle {
+    order: 2;
+  }
+
+  .lists-inline-notice {
+    order: 3;
+    width: 100%;
+    margin-left: 0;
   }
 
   .list-board {

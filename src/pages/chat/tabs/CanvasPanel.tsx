@@ -3,6 +3,7 @@ import { displayName } from '../../../lib/format';
 import type {
   Conversation,
   ConversationCanvas,
+  CanvasComment,
   LinkPreview,
   MessageAttachment,
 } from '../../../api/types';
@@ -159,6 +160,10 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
   const [members, setMembers] = useState<{ userId: string; label: string }[]>(
     [],
   );
+  const [comments, setComments] = useState<CanvasComment[]>([]);
+  const [commentDraft, setCommentDraft] = useState('');
+  const [commentAnchor, setCommentAnchor] = useState('');
+  const [commentsBusy, setCommentsBusy] = useState(false);
   const dirtyRef = useRef(false);
   const skipRemoteRef = useRef(false);
   const loadedRef = useRef(false);
@@ -202,23 +207,33 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
     setMode('edit');
     setMentionQuery(null);
     setLinkCards([]);
+    setComments([]);
+    setCommentDraft('');
+    setCommentAnchor('');
     setCanvas(normalizeCanvas(null, conversationId));
     Promise.all([
       api<ConversationCanvas | null>(
         `/chat/conversations/${conversationId}/canvas`,
       ),
       api<Conversation>(`/chat/conversations/${conversationId}`),
+      api<CanvasComment[]>(
+        `/chat/conversations/${conversationId}/canvas/comments`,
+      ).catch(() => ({ data: [] as CanvasComment[] })),
     ])
-      .then(([canvasRes, convRes]) => {
+      .then(([canvasRes, convRes, commentsRes]) => {
         if (!active) return;
         dirtyRef.current = false;
         setCanvas(normalizeCanvas(canvasRes.data, conversationId));
+        setComments(Array.isArray(commentsRes.data) ? commentsRes.data : []);
         const nextMembers = (convRes.data?.members ?? []).map((member) => ({
           userId: member.userId,
           label: displayName(byUserId.get(member.userId)),
         }));
         setMembers(nextMembers);
-        void ensureProfiles(nextMembers.map((m) => m.userId));
+        void ensureProfiles([
+          ...nextMembers.map((m) => m.userId),
+          ...(commentsRes.data ?? []).map((c) => c.authorId),
+        ]);
       })
       .catch(() => {
         if (active) setStatus('Canvas is not available yet.');
@@ -474,15 +489,98 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
     }
   }
 
+  function captureAnchorFromSelection() {
+    const el = bodyRef.current;
+    if (!el) return;
+    const start = el.selectionStart ?? 0;
+    const end = el.selectionEnd ?? start;
+    const selected = el.value.slice(start, end).trim();
+    if (selected) {
+      setCommentAnchor(selected.slice(0, 240));
+      return;
+    }
+    const lineStart = el.value.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+    const lineEnd = el.value.indexOf('\n', start);
+    const line = el.value
+      .slice(lineStart, lineEnd === -1 ? undefined : lineEnd)
+      .trim();
+    setCommentAnchor(line.slice(0, 240));
+  }
+
+  async function submitComment() {
+    const body = commentDraft.trim();
+    if (!body) return;
+    setCommentsBusy(true);
+    try {
+      const response = await api<CanvasComment>(
+        `/chat/conversations/${conversationId}/canvas/comments`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            body,
+            anchorText: commentAnchor.trim(),
+            anchorOffset: 0,
+          }),
+        },
+      );
+      setComments((current) => [response.data, ...current]);
+      setCommentDraft('');
+      void ensureProfiles([response.data.authorId]);
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : 'Could not add comment');
+    } finally {
+      setCommentsBusy(false);
+    }
+  }
+
+  async function toggleResolveComment(comment: CanvasComment) {
+    try {
+      const response = await api<CanvasComment>(
+        `/chat/conversations/${conversationId}/canvas/comments/${comment.id}/resolve`,
+        { method: 'POST' },
+      );
+      setComments((current) =>
+        current.map((item) =>
+          item.id === comment.id ? response.data : item,
+        ),
+      );
+    } catch (err) {
+      setStatus(
+        err instanceof Error ? err.message : 'Could not update comment',
+      );
+    }
+  }
+
+  async function removeComment(comment: CanvasComment) {
+    try {
+      await api(
+        `/chat/conversations/${conversationId}/canvas/comments/${comment.id}`,
+        { method: 'DELETE' },
+      );
+      setComments((current) =>
+        current.filter((item) => item.id !== comment.id),
+      );
+    } catch (err) {
+      setStatus(
+        err instanceof Error ? err.message : 'Could not delete comment',
+      );
+    }
+  }
+
   if (loading) return <p className="muted tab-empty">Loading canvas…</p>;
 
+  const openComments = comments.filter((c) => !c.resolvedAt);
+  const resolvedComments = comments.filter((c) => c.resolvedAt);
+
   return (
-    <section className="feature-panel canvas-panel">
+    <section className="feature-panel canvas-panel canvas-panel-with-comments">
+      <div className="canvas-main">
       <div className="feature-panel-head">
         <div>
           <h3>Canvas</h3>
           <p className="muted">
-            Shared work surface — markdown, @mentions, links, and files.
+            Shared work surface — markdown, @mentions, links, files, and section
+            comments.
           </p>
         </div>
         <div className="canvas-head-actions">
@@ -750,6 +848,117 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
           )}
         </div>
       )}
+      </div>
+
+      <aside className="canvas-comments" aria-label="Canvas comments">
+        <div className="canvas-comments-head">
+          <h4>Comments</h4>
+          <p className="muted">Anchor notes to a selected line or section.</p>
+        </div>
+        <div className="canvas-comment-composer">
+          <input
+            type="text"
+            value={commentAnchor}
+            onChange={(event) => setCommentAnchor(event.target.value)}
+            placeholder="Anchor text (optional)"
+            maxLength={240}
+          />
+          <textarea
+            value={commentDraft}
+            onChange={(event) => setCommentDraft(event.target.value)}
+            placeholder="Add a comment…"
+            rows={3}
+            maxLength={2000}
+          />
+          <div className="canvas-comment-actions">
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => captureAnchorFromSelection()}
+            >
+              Use selection
+            </button>
+            <button
+              type="button"
+              className="primary"
+              disabled={commentsBusy || !commentDraft.trim()}
+              onClick={() => void submitComment()}
+            >
+              Comment
+            </button>
+          </div>
+        </div>
+        {openComments.length === 0 && resolvedComments.length === 0 ? (
+          <p className="muted">No comments yet.</p>
+        ) : null}
+        <ul className="canvas-comment-list">
+          {openComments.map((comment) => {
+            const author = displayName(byUserId.get(comment.authorId));
+            return (
+              <li key={comment.id} className="canvas-comment-item">
+                {comment.anchorText ? (
+                  <blockquote className="canvas-comment-anchor">
+                    {comment.anchorText}
+                  </blockquote>
+                ) : null}
+                <p>{comment.body}</p>
+                <div className="canvas-comment-meta">
+                  <small className="muted">{author}</small>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => void toggleResolveComment(comment)}
+                  >
+                    Resolve
+                  </button>
+                  {comment.authorId === userId ? (
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void removeComment(comment)}
+                    >
+                      Delete
+                    </button>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+        {resolvedComments.length > 0 ? (
+          <details className="canvas-resolved-comments">
+            <summary>Resolved ({resolvedComments.length})</summary>
+            <ul className="canvas-comment-list">
+              {resolvedComments.map((comment) => {
+                const author = displayName(byUserId.get(comment.authorId));
+                return (
+                  <li
+                    key={comment.id}
+                    className="canvas-comment-item is-resolved"
+                  >
+                    {comment.anchorText ? (
+                      <blockquote className="canvas-comment-anchor">
+                        {comment.anchorText}
+                      </blockquote>
+                    ) : null}
+                    <p>{comment.body}</p>
+                    <div className="canvas-comment-meta">
+                      <small className="muted">{author}</small>
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => void toggleResolveComment(comment)}
+                      >
+                        Reopen
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          </details>
+        ) : null}
+      </aside>
     </section>
   );
 }

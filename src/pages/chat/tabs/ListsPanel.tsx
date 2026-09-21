@@ -17,6 +17,14 @@ import type {
   ChannelListItemStatus,
   Conversation,
 } from '../../../api/types';
+import {
+  ListsWeekView,
+  dueInputValue,
+  formatDueLabel,
+  isDueOverdue,
+  startOfWeek,
+  toDateKey,
+} from './ListsWeekView';
 
 const STATUSES: Array<{
   id: ChannelListItemStatus;
@@ -27,8 +35,16 @@ const STATUSES: Array<{
   { id: 'done', label: 'Done' },
 ];
 
+type ListViewMode = 'board' | 'week';
+
 function normalizeList(list: ChannelList): ChannelList {
-  return { ...list, items: list.items ?? [] };
+  return {
+    ...list,
+    items: (list.items ?? []).map((item) => ({
+      ...item,
+      dueAt: item.dueAt ?? null,
+    })),
+  };
 }
 
 function countByStatus(items: ChannelListItem[], status: ChannelListItemStatus) {
@@ -57,6 +73,9 @@ export function ListsPanel({
   const [newListName, setNewListName] = useState('');
   const [newItemTitle, setNewItemTitle] = useState('');
   const [newItemAssignee, setNewItemAssignee] = useState('');
+  const [newItemDue, setNewItemDue] = useState('');
+  const [viewMode, setViewMode] = useState<ListViewMode>('board');
+  const [weekAnchor, setWeekAnchor] = useState(() => startOfWeek(new Date()));
   const [renameValue, setRenameValue] = useState('');
   const [renaming, setRenaming] = useState(false);
   const [busy, setBusy] = useState(true);
@@ -66,6 +85,7 @@ export function ListsPanel({
   const [dropTarget, setDropTarget] = useState<ChannelListItemStatus | null>(
     null,
   );
+  const [dropDayKey, setDropDayKey] = useState<string | null>(null);
 
   const memberIds = useMemo(
     () =>
@@ -262,10 +282,11 @@ export function ListsPanel({
     setError('');
     setNotice('');
     const assigneeId = normalizeAssigneeId(newItemAssignee);
+    const dueAt = newItemDue.trim() ? newItemDue.trim() : null;
     try {
       const response = await api<ChannelListItem>(`${basePath(listId)}/items`, {
         method: 'POST',
-        body: JSON.stringify({ title, status: 'todo', assigneeId }),
+        body: JSON.stringify({ title, status: 'todo', assigneeId, dueAt }),
       });
       if (!response.data?.id) {
         throw new Error('Server did not return the new item');
@@ -278,11 +299,11 @@ export function ListsPanel({
         ),
       );
       setNewItemTitle('');
-      setNotice(
-        assigneeId
-          ? `Item added · assigned to ${assigneeLabel(assigneeId)}.`
-          : 'Item added.',
-      );
+      const bits = [
+        assigneeId ? `assigned to ${assigneeLabel(assigneeId)}` : null,
+        dueAt ? `due ${formatDueLabel(dueAt)}` : null,
+      ].filter(Boolean);
+      setNotice(bits.length ? `Item added · ${bits.join(' · ')}.` : 'Item added.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not add the item.');
     }
@@ -330,6 +351,35 @@ export function ListsPanel({
     }
   }
 
+  async function updateItemDue(item: ChannelListItem, dueAt: string | null) {
+    if (!selected) return;
+    const next = dueAt?.trim() ? dueAt.trim() : null;
+    const prevKey = item.dueAt ? toDateKey(item.dueAt) : '';
+    const nextKey = next ? toDateKey(next) : '';
+    if (prevKey === nextKey && Boolean(item.dueAt) === Boolean(next)) return;
+    const listId = selected.id;
+    const optimisticDue = next ? `${next}T12:00:00.000Z` : null;
+    patchItemLocal(listId, item.id, { dueAt: optimisticDue });
+    try {
+      const response = await api<ChannelListItem>(
+        `${basePath(listId)}/items/${item.id}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ dueAt: next }),
+        },
+      );
+      if (response.data) {
+        patchItemLocal(listId, item.id, { dueAt: response.data.dueAt ?? null });
+      }
+      setNotice(
+        next ? `Due date set to ${formatDueLabel(next)}.` : 'Due date cleared.',
+      );
+    } catch {
+      setError('Could not update due date.');
+      void loadLists(listId);
+    }
+  }
+
   async function deleteItem(itemId: string) {
     if (!selected) return;
     const listId = selected.id;
@@ -359,6 +409,7 @@ export function ListsPanel({
   function onCardDragEnd() {
     setDraggingId(null);
     setDropTarget(null);
+    setDropDayKey(null);
   }
 
   function onColumnDragOver(event: DragEvent, status: ChannelListItemStatus) {
@@ -379,10 +430,32 @@ export function ListsPanel({
     const itemId = event.dataTransfer.getData('text/plain') || draggingId;
     setDropTarget(null);
     setDraggingId(null);
+    setDropDayKey(null);
     if (!itemId) return;
     const item = items.find((row) => row.id === itemId);
     if (!item) return;
     await updateItemStatus(item, status);
+  }
+
+  function onDayDragOver(event: DragEvent, dayKey: string) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    if (dropDayKey !== dayKey) setDropDayKey(dayKey);
+  }
+
+  function onDayDragLeave(dayKey: string) {
+    setDropDayKey((current) => (current === dayKey ? null : current));
+  }
+
+  async function onDayDrop(event: DragEvent, dayKey: string | null) {
+    event.preventDefault();
+    const itemId = event.dataTransfer.getData('text/plain') || draggingId;
+    setDropDayKey(null);
+    setDraggingId(null);
+    if (!itemId) return;
+    const item = items.find((row) => row.id === itemId);
+    if (!item) return;
+    await updateItemDue(item, dayKey);
   }
 
   return (
@@ -391,8 +464,28 @@ export function ListsPanel({
         <div>
           <h3>Lists</h3>
           <p className="muted lists-panel-sub">
-            Drag cards across columns — assign tasks to channel members.
+            Board for status · Week for due dates — drag to reschedule.
           </p>
+        </div>
+        <div className="lists-view-toggle" role="tablist" aria-label="List view">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'board'}
+            className={viewMode === 'board' ? 'on' : ''}
+            onClick={() => setViewMode('board')}
+          >
+            Board
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={viewMode === 'week'}
+            className={viewMode === 'week' ? 'on' : ''}
+            onClick={() => setViewMode('week')}
+          >
+            Week
+          </button>
         </div>
         {error ? <p className="error tab-notice lists-inline-notice">{error}</p> : null}
         {!error && notice ? (
@@ -549,6 +642,14 @@ export function ListsPanel({
                     </button>
                   ) : null}
                 </div>
+                <input
+                  className="list-add-due"
+                  type="date"
+                  value={newItemDue}
+                  onChange={(event) => setNewItemDue(event.target.value)}
+                  aria-label="Due date"
+                  title="Due date"
+                />
                 <button
                   className="btn"
                   type="submit"
@@ -558,6 +659,20 @@ export function ListsPanel({
                 </button>
               </form>
 
+              {viewMode === 'week' ? (
+                <ListsWeekView
+                  items={items}
+                  weekAnchor={weekAnchor}
+                  onWeekAnchorChange={setWeekAnchor}
+                  draggingId={draggingId}
+                  dropDayKey={dropDayKey}
+                  onDragStart={onCardDragStart}
+                  onDragEnd={onCardDragEnd}
+                  onDayDragOver={onDayDragOver}
+                  onDayDragLeave={onDayDragLeave}
+                  onDayDrop={onDayDrop}
+                />
+              ) : (
               <div className="list-board" role="list">
                 {STATUSES.map((column) => {
                   const columnItems = items.filter(
@@ -685,6 +800,39 @@ export function ListsPanel({
                                 ) : null}
                               </div>
 
+                              <div className="list-card-due">
+                                <input
+                                  type="date"
+                                  className="list-card-due-input"
+                                  value={dueInputValue(item.dueAt)}
+                                  aria-label={`Due date for ${item.title}`}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onMouseDown={(event) => event.stopPropagation()}
+                                  onChange={(event) => {
+                                    event.stopPropagation();
+                                    void updateItemDue(
+                                      item,
+                                      event.target.value || null,
+                                    );
+                                  }}
+                                />
+                                {item.dueAt ? (
+                                  <span
+                                    className={`list-card-due-label${
+                                      isDueOverdue(item.dueAt, item.status)
+                                        ? ' is-overdue'
+                                        : ''
+                                    }`}
+                                  >
+                                    {formatDueLabel(item.dueAt)}
+                                  </span>
+                                ) : (
+                                  <span className="list-card-due-label muted">
+                                    No due date
+                                  </span>
+                                )}
+                              </div>
+
                               <div className="list-card-move">
                                 {STATUSES.filter((s) => s.id !== item.status).map(
                                   (target) => (
@@ -714,6 +862,7 @@ export function ListsPanel({
                   );
                 })}
               </div>
+              )}
             </>
           )}
         </div>

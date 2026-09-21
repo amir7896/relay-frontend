@@ -1,4 +1,4 @@
-/** Client-side “clear status after” — API has no expiry field. */
+/** Clear-after helpers for status tray (server stores statusClearsAt). */
 
 export type ClearAfterOption =
   | 'never'
@@ -6,13 +6,6 @@ export type ClearAfterOption =
   | '1h'
   | '4h'
   | 'today';
-
-export type StatusClearRecord = {
-  clearsAt: string;
-  option: ClearAfterOption;
-};
-
-const PREFIX = 'relay:status-clear:';
 
 export function clearAfterLabel(option: ClearAfterOption): string {
   switch (option) {
@@ -29,7 +22,10 @@ export function clearAfterLabel(option: ClearAfterOption): string {
   }
 }
 
-export function computeClearAt(option: ClearAfterOption, from = new Date()): Date | null {
+export function computeClearAt(
+  option: ClearAfterOption,
+  from = new Date(),
+): Date | null {
   if (option === 'never') return null;
   const at = new Date(from);
   if (option === '30m') {
@@ -52,35 +48,35 @@ export function computeClearAt(option: ClearAfterOption, from = new Date()): Dat
   return at;
 }
 
-export function readStatusClear(userId: string): StatusClearRecord | null {
-  try {
-    const raw = localStorage.getItem(`${PREFIX}${userId}`);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as StatusClearRecord;
-    if (!parsed?.clearsAt || !parsed?.option) return null;
-    return parsed;
-  } catch {
-    return null;
-  }
+export function formatUntilPhrase(clearsAt: Date): string {
+  return clearsAt.toLocaleString(undefined, {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
 }
 
-export function writeStatusClear(
-  userId: string,
-  option: ClearAfterOption,
-): StatusClearRecord | null {
-  const clearsAt = computeClearAt(option);
-  if (!clearsAt) {
-    clearStatusClear(userId);
-    return null;
-  }
-  const record: StatusClearRecord = {
-    clearsAt: clearsAt.toISOString(),
-    option,
-  };
-  localStorage.setItem(`${PREFIX}${userId}`, JSON.stringify(record));
-  return record;
+/** Append “until 3:00 PM” when scheduling a clear, without duplicating. */
+export function withUntilSuffix(
+  text: string,
+  clearsAt: Date | null,
+): string {
+  const trimmed = text.trim();
+  if (!clearsAt || !trimmed) return trimmed;
+  if (/\buntil\b/i.test(trimmed)) return trimmed;
+  return `${trimmed} until ${formatUntilPhrase(clearsAt)}`.slice(0, 100);
 }
 
-export function clearStatusClear(userId: string) {
-  localStorage.removeItem(`${PREFIX}${userId}`);
+export function inferClearOption(
+  clearsAtIso: string | null | undefined,
+): ClearAfterOption {
+  if (!clearsAtIso) return 'never';
+  const clearsAt = new Date(clearsAtIso).getTime();
+  if (Number.isNaN(clearsAt)) return 'never';
+  const delta = clearsAt - Date.now();
+  if (delta <= 0) return 'never';
+  const minutes = delta / 60_000;
+  if (minutes <= 35) return '30m';
+  if (minutes <= 70) return '1h';
+  if (minutes <= 260) return '4h';
+  return 'today';
 }

@@ -30,6 +30,60 @@ function resolveMediaUrl(url: string): string {
   return `/${url}`;
 }
 
+const WAVE_BARS = 32;
+
+function fallbackPeaks(count: number): number[] {
+  return Array.from({ length: count }, (_, index) => {
+    return 0.28 + ((index * 17) % 40) / 100;
+  });
+}
+
+/** Decode audio into normalized peak levels for waveform scrubbing. */
+async function extractWavePeaks(
+  url: string,
+  barCount = WAVE_BARS,
+): Promise<number[]> {
+  if (!url || typeof window === 'undefined') {
+    return fallbackPeaks(barCount);
+  }
+  const AudioCtx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext })
+      .webkitAudioContext;
+  if (!AudioCtx) {
+    return fallbackPeaks(barCount);
+  }
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return fallbackPeaks(barCount);
+    const buffer = await response.arrayBuffer();
+    const ctx = new AudioCtx();
+    try {
+      const decoded = await ctx.decodeAudioData(buffer.slice(0));
+      const channel = decoded.getChannelData(0);
+      if (!channel.length) return fallbackPeaks(barCount);
+      const block = Math.max(1, Math.floor(channel.length / barCount));
+      const peaks: number[] = [];
+      for (let i = 0; i < barCount; i += 1) {
+        const start = i * block;
+        const end = Math.min(channel.length, start + block);
+        let peak = 0;
+        for (let j = start; j < end; j += 1) {
+          const value = Math.abs(channel[j] ?? 0);
+          if (value > peak) peak = value;
+        }
+        peaks.push(peak);
+      }
+      const max = Math.max(...peaks, 0.01);
+      return peaks.map((peak) => Math.max(0.12, peak / max));
+    } finally {
+      void ctx.close().catch(() => undefined);
+    }
+  } catch {
+    return fallbackPeaks(barCount);
+  }
+}
+
 /** Prefer finite duration; fall back to seekable range (common for WebM). */
 function readMediaDuration(audio: HTMLAudioElement): number {
   if (Number.isFinite(audio.duration) && audio.duration > 0) {
@@ -60,11 +114,28 @@ export function VoiceNotePlayer({
   const [current, setCurrent] = useState(0);
   const [duration, setDuration] = useState(0);
   const [error, setError] = useState('');
+  const [peaks, setPeaks] = useState<number[]>(() => fallbackPeaks(WAVE_BARS));
   const mediaSrc = useMemo(() => resolveMediaUrl(src), [src]);
   const isPending = sendStatus === 'uploading' || sendStatus === 'sending';
   const isFailed = sendStatus === 'failed';
   const progressPct = Math.max(0, Math.min(100, uploadProgress));
   const canSeek = duration > 0 && !isPending && !isFailed && !error;
+
+  useEffect(() => {
+    let cancelled = false;
+    setPeaks(fallbackPeaks(WAVE_BARS));
+    if (!mediaSrc || isPending) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    void extractWavePeaks(mediaSrc, WAVE_BARS).then((next) => {
+      if (!cancelled) setPeaks(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [mediaSrc, isPending]);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -343,19 +414,19 @@ export function VoiceNotePlayer({
           }}
         >
           <div className="voice-note-wave" aria-hidden="true">
-            {Array.from({ length: 28 }, (_, index) => (
+            {peaks.map((peak, index) => (
               <span
                 key={index}
                 className={
                   isPending
-                    ? progressPct >= ((index + 1) / 28) * 100
+                    ? progressPct >= ((index + 1) / peaks.length) * 100
                       ? 'is-played'
                       : undefined
-                    : progress >= ((index + 1) / 28) * 100
+                    : progress >= ((index + 1) / peaks.length) * 100
                       ? 'is-played'
                       : undefined
                 }
-                style={{ height: `${28 + ((index * 17) % 40)}%` }}
+                style={{ height: `${Math.round(18 + peak * 70)}%` }}
               />
             ))}
           </div>

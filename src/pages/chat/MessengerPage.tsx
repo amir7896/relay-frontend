@@ -23,6 +23,7 @@ import { useDirectory } from '../../people/useDirectory';
 import { UserAvatar } from '../../components/UserAvatar';
 import { useOrganization } from '../../organizations/OrganizationContext';
 import type {
+  BookmarkCollection,
   ChatMessage,
   Conversation,
   GlobalSearchHit,
@@ -249,11 +250,23 @@ export function MessengerPage() {
   const [laterTab, setLaterTab] = useState<'later' | 'saved'>('later');
   const [laterItems, setLaterItems] = useState<MessageReminder[]>([]);
   const [savedItems, setSavedItems] = useState<MessageBookmark[]>([]);
+  const [savedTotalCount, setSavedTotalCount] = useState(0);
+  const [bookmarkCollections, setBookmarkCollections] = useState<
+    BookmarkCollection[]
+  >([]);
+  const [savedFolderId, setSavedFolderId] = useState<string | 'all' | 'none'>(
+    'all',
+  );
+  const [newFolderName, setNewFolderName] = useState('');
   const [laterBusy, setLaterBusy] = useState(false);
   const [savedBusy, setSavedBusy] = useState(false);
   const [unreadsBusy, setUnreadsBusy] = useState(false);
   const [sidebarSections, setSidebarSections] = useState<SidebarSection[]>([]);
   const [sidebarBusy, setSidebarBusy] = useState(false);
+  const [draggingSectionId, setDraggingSectionId] = useState<string | null>(
+    null,
+  );
+  const [starredCollapsed, setStarredCollapsed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notifyBanner, setNotifyBanner] = useState(false);
   const { showBanner: showInstallBanner, install, dismissBanner: dismissInstall } =
@@ -511,14 +524,109 @@ export function MessengerPage() {
 
   const refreshSaved = useCallback(async () => {
     try {
-      const response = await api<Paginated<MessageBookmark>>(
-        '/chat/bookmarks?page=1&limit=100',
+      const folderQuery =
+        savedFolderId === 'all'
+          ? ''
+          : savedFolderId === 'none'
+            ? '&collectionId=none'
+            : `&collectionId=${encodeURIComponent(savedFolderId)}`;
+      const [bookmarksRes, collectionsRes, allRes] = await Promise.all([
+        api<Paginated<MessageBookmark>>(
+          `/chat/bookmarks?page=1&limit=100${folderQuery}`,
+        ),
+        api<BookmarkCollection[]>('/chat/bookmark-collections'),
+        savedFolderId === 'all'
+          ? Promise.resolve(null)
+          : api<Paginated<MessageBookmark>>('/chat/bookmarks?page=1&limit=100'),
+      ]);
+      setSavedItems(bookmarksRes.data.items ?? []);
+      if (savedFolderId === 'all') {
+        setSavedTotalCount(bookmarksRes.data.items?.length ?? 0);
+      } else {
+        setSavedTotalCount(allRes?.data.items?.length ?? 0);
+      }
+      setBookmarkCollections(
+        Array.isArray(collectionsRes.data) ? collectionsRes.data : [],
       );
-      setSavedItems(response.data.items ?? []);
     } catch {
       // ignore
     }
-  }, []);
+  }, [savedFolderId]);
+
+  useEffect(() => {
+    if (laterTab !== 'saved') return;
+    void refreshSaved();
+  }, [savedFolderId, laterTab, refreshSaved]);
+
+  async function createSavedFolder() {
+    const name = newFolderName.trim();
+    if (!name) return;
+    try {
+      const response = await api<BookmarkCollection>(
+        '/chat/bookmark-collections',
+        {
+          method: 'POST',
+          body: JSON.stringify({ name }),
+        },
+      );
+      setBookmarkCollections((current) => [response.data, ...current]);
+      setNewFolderName('');
+      setSavedFolderId(response.data.id);
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not create folder',
+      );
+    }
+  }
+
+  async function deleteSavedFolder(collectionId: string) {
+    try {
+      await api(`/chat/bookmark-collections/${collectionId}`, {
+        method: 'DELETE',
+      });
+      setBookmarkCollections((current) =>
+        current.filter((item) => item.id !== collectionId),
+      );
+      if (savedFolderId === collectionId) setSavedFolderId('all');
+      await refreshSaved();
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not delete folder',
+      );
+    }
+  }
+
+  async function moveSavedToFolder(
+    messageId: string,
+    collectionId: string | null,
+  ) {
+    try {
+      const response = await api<MessageBookmark>(
+        `/chat/bookmarks/${messageId}/collection`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ collectionId }),
+        },
+      );
+      setSavedItems((current) => {
+        const next = current.map((item) =>
+          item.messageId === messageId
+            ? { ...item, collectionId: response.data.collectionId ?? null }
+            : item,
+        );
+        if (savedFolderId === 'all') return next;
+        if (savedFolderId === 'none') {
+          return next.filter((item) => !item.collectionId);
+        }
+        return next.filter((item) => item.collectionId === savedFolderId);
+      });
+      await refreshSaved();
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not move saved message',
+      );
+    }
+  }
 
   useEffect(() => {
     if (activeConversationId) {
@@ -657,7 +765,7 @@ export function MessengerPage() {
           '/chat/bookmarks?page=1&limit=100',
         );
         if (cancelled) return;
-        setSavedItems(response.data.items ?? []);
+        setSavedTotalCount((response.data.items ?? []).length);
       } catch {
         // ignore
       }
@@ -867,15 +975,25 @@ export function MessengerPage() {
   const channels = useMemo(
     () =>
       filtered.filter(
-        (item) => item.type === 'group' && !sectionedIds.has(item.id),
+        (item) =>
+          item.type === 'group' &&
+          !sectionedIds.has(item.id) &&
+          !item.pinned,
       ),
     [filtered, sectionedIds],
   );
   const directs = useMemo(
     () =>
       filtered.filter(
-        (item) => item.type === 'private' && !sectionedIds.has(item.id),
+        (item) =>
+          item.type === 'private' &&
+          !sectionedIds.has(item.id) &&
+          !item.pinned,
       ),
+    [filtered, sectionedIds],
+  );
+  const starredItems = useMemo(
+    () => filtered.filter((item) => item.pinned && !sectionedIds.has(item.id)),
     [filtered, sectionedIds],
   );
 
@@ -1251,6 +1369,43 @@ export function MessengerPage() {
     }
   }
 
+  async function reorderSidebarSections(fromId: string, toId: string) {
+    if (fromId === toId) return;
+    const ordered = [...sidebarSections].sort(
+      (a, b) => a.sortOrder - b.sortOrder,
+    );
+    const fromIndex = ordered.findIndex((row) => row.id === fromId);
+    const toIndex = ordered.findIndex((row) => row.id === toId);
+    if (fromIndex < 0 || toIndex < 0) return;
+    const [moved] = ordered.splice(fromIndex, 1);
+    ordered.splice(toIndex, 0, moved);
+    const withOrder = ordered.map((row, index) => ({
+      ...row,
+      sortOrder: index,
+    }));
+    setSidebarSections(withOrder);
+    try {
+      await Promise.all(
+        withOrder.map((row) =>
+          api<SidebarSection>(`/chat/sidebar/sections/${row.id}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ sortOrder: row.sortOrder }),
+          }),
+        ),
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not reorder sections');
+      await loadSidebarSections();
+    }
+  }
+
+  function sectionUnreadCount(sectionItems: Conversation[]) {
+    return sectionItems.reduce((sum, item) => {
+      if (item.id === activeConversationId) return sum;
+      return sum + (item.unreadCount > 0 ? item.unreadCount : 0);
+    }, 0);
+  }
+
   function renderConversationRow(item: Conversation) {
     const title = conversationTitle(item, me, byUserId);
     const peer = otherMember(item, me);
@@ -1406,8 +1561,8 @@ export function MessengerPage() {
               <button
                 className={`pin-toggle${item.pinned ? ' is-pinned' : ''}`}
                 type="button"
-                title={item.pinned ? 'Unpin' : 'Pin'}
-                aria-label={item.pinned ? 'Unpin' : 'Pin'}
+                title={item.pinned ? 'Remove from Starred' : 'Add to Starred'}
+                aria-label={item.pinned ? 'Unstar' : 'Star'}
                 onClick={(event) => void togglePin(event, item)}
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1584,11 +1739,31 @@ export function MessengerPage() {
       await ensureProfiles(profileIds);
     } catch (err) {
       setModalError(
-        err instanceof Error ? err.message : 'Could not load threads',
+        err instanceof Error ? err.message : 'Could not load following',
       );
       setThreadItems([]);
     } finally {
       setThreadsBusy(false);
+    }
+  }
+
+  async function unfollowThreadHome(
+    conversationId: string,
+    threadRootId: string,
+  ) {
+    try {
+      await api(
+        `/chat/conversations/${conversationId}/threads/${threadRootId}/follow`,
+        { method: 'DELETE' },
+      );
+      setThreadItems((current) =>
+        current.filter((item) => item.root.id !== threadRootId),
+      );
+      setThreadsUnreadTotal((count) => Math.max(0, count - 1));
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not unfollow thread',
+      );
     }
   }
 
@@ -1871,6 +2046,7 @@ export function MessengerPage() {
       setSavedItems((current) =>
         current.filter((item) => item.messageId !== messageId),
       );
+      setSavedTotalCount((count) => Math.max(0, count - 1));
     } catch (err) {
       setModalError(
         err instanceof Error ? err.message : 'Could not unsave message',
@@ -2079,7 +2255,7 @@ export function MessengerPage() {
                   />
                 </svg>
               </span>
-              <span className="inbox-nav-label">Threads</span>
+              <span className="inbox-nav-label">Following</span>
               {threadsUnreadTotal > 0 ? (
                 <span className="inbox-nav-badge">{threadsUnreadTotal}</span>
               ) : null}
@@ -2102,8 +2278,8 @@ export function MessengerPage() {
               <span className="inbox-nav-label">Later</span>
               {laterPendingCount > 0 ? (
                 <span className="inbox-nav-badge">{laterPendingCount}</span>
-              ) : savedItems.length > 0 ? (
-                <span className="inbox-nav-meta">{savedItems.length}</span>
+              ) : savedTotalCount > 0 ? (
+                <span className="inbox-nav-meta">{savedTotalCount}</span>
               ) : null}
             </button>
           </nav>
@@ -2145,12 +2321,61 @@ export function MessengerPage() {
               ) : null}
             </div>
           </div>
+          {starredItems.length > 0 ? (
+            <div className="inbox-custom-section inbox-starred-section">
+              <div className="inbox-section-head">
+                <button
+                  type="button"
+                  className="inbox-section-label inbox-section-toggle"
+                  aria-expanded={!starredCollapsed}
+                  onClick={() => setStarredCollapsed((v) => !v)}
+                >
+                  <span aria-hidden="true">{starredCollapsed ? '▸' : '▾'}</span>
+                  Starred
+                  {(() => {
+                    const unread = sectionUnreadCount(starredItems);
+                    return unread > 0 ? (
+                      <span className="inbox-unread-pill">{unread}</span>
+                    ) : null;
+                  })()}
+                </button>
+              </div>
+              {!starredCollapsed
+                ? starredItems.map((item) => renderConversationRow(item))
+                : null}
+            </div>
+          ) : null}
           {sidebarSections.map((section) => {
             const sectionItems = (section.conversationIds ?? [])
               .map((id) => conversationsById.get(id))
               .filter((row): row is Conversation => Boolean(row));
+            const unread = sectionUnreadCount(sectionItems);
             return (
-              <div key={section.id} className="inbox-custom-section">
+              <div
+                key={section.id}
+                className={`inbox-custom-section${
+                  draggingSectionId === section.id ? ' is-dragging' : ''
+                }`}
+                draggable={!sidebarBusy}
+                onDragStart={(event) => {
+                  setDraggingSectionId(section.id);
+                  event.dataTransfer.setData('text/section-id', section.id);
+                  event.dataTransfer.effectAllowed = 'move';
+                }}
+                onDragEnd={() => setDraggingSectionId(null)}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = 'move';
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  const fromId =
+                    event.dataTransfer.getData('text/section-id') ||
+                    draggingSectionId;
+                  if (fromId) void reorderSidebarSections(fromId, section.id);
+                  setDraggingSectionId(null);
+                }}
+              >
                 <div className="inbox-section-head">
                   <button
                     type="button"
@@ -2161,15 +2386,17 @@ export function MessengerPage() {
                       event.preventDefault();
                       void renameSidebarSection(section);
                     }}
-                    title="Click to collapse · right-click to rename"
+                    title="Click to collapse · drag section to reorder · right-click to rename"
                   >
                     <span aria-hidden="true">{section.collapsed ? '▸' : '▾'}</span>
                     {section.name}
-                    {sectionItems.length > 0 ? (
+                    {unread > 0 ? (
+                      <span className="inbox-unread-pill">{unread}</span>
+                    ) : sectionItems.length > 0 ? (
                       <span className="inbox-unread-pill muted-pill">
                         {sectionItems.length}
-                </span>
-                ) : null}
+                      </span>
+                    ) : null}
                   </button>
                   <div className="inbox-section-actions">
                     <button
@@ -2343,7 +2570,7 @@ export function MessengerPage() {
                   : homeView === 'drafts'
                     ? 'Drafts'
                     : homeView === 'threads'
-                      ? 'Threads'
+                      ? 'Following'
                       : 'Later'}
             </h2>
           </header>
@@ -2559,7 +2786,7 @@ export function MessengerPage() {
               void loadThreadsHome();
             }}
           >
-            Threads
+            Following
             {threadsUnreadTotal > 0 ? (
               <span className="inbox-unread-pill">{threadsUnreadTotal}</span>
             ) : null}
@@ -2632,7 +2859,8 @@ export function MessengerPage() {
             {assignmentsBusy ? <p className="muted">Loading assignments…</p> : null}
             {!assignmentsBusy && assignmentItems.length === 0 ? (
               <p className="muted">
-                When someone assigns you a list task, it shows up here.
+                Assignments and due-date reminders for your list tasks show up
+                here.
               </p>
             ) : null}
             <ul className="threads-home-list activity-mentions-list">
@@ -2662,9 +2890,13 @@ export function MessengerPage() {
                           name={actor}
                           size="sm"
                         />
-                        <strong>{actor}</strong>
+                        <strong>
+                          {item.type === 'list_due' ? 'Due' : actor}
+                        </strong>
                         <span className="muted">
-                          assigned you a task in {listName}
+                          {item.type === 'list_due'
+                            ? `task due in ${listName}`
+                            : `assigned you a task in ${listName}`}
                         </span>
                         <RelativeTime value={item.createdAt} />
                       </div>
@@ -2680,7 +2912,8 @@ export function MessengerPage() {
             {threadsBusy ? <p className="muted">Loading threads…</p> : null}
             {!threadsBusy && threadItems.length === 0 ? (
               <p className="muted">
-                Open or reply in a thread and it will show up here.
+                Threads you open or reply in show up here. Unfollow any time to
+                stop getting updates.
               </p>
             ) : null}
             <ul className="threads-home-list">
@@ -2692,7 +2925,7 @@ export function MessengerPage() {
                 const latest = item.latestReply ?? item.root;
                 const unread = (item.unreadCount ?? 0) > 0;
                 return (
-                  <li key={item.root.id}>
+                  <li key={item.root.id} className="following-thread-row">
                     <InboxListRow
                       className={unread ? 'unread' : ''}
                       onClick={() => {
@@ -2720,6 +2953,19 @@ export function MessengerPage() {
                         {messageSnippet(latest, me)}
                       </span>
                     </InboxListRow>
+                    <button
+                      type="button"
+                      className="ghost following-unfollow-btn"
+                      title="Unfollow thread"
+                      onClick={() =>
+                        void unfollowThreadHome(
+                          item.conversationId,
+                          item.root.id,
+                        )
+                      }
+                    >
+                      Unfollow
+                    </button>
                   </li>
                 );
               })}
@@ -2797,7 +3043,7 @@ export function MessengerPage() {
             const latest = item.latestReply ?? item.root;
             const unread = (item.unreadCount ?? 0) > 0;
             return (
-              <li key={item.root.id}>
+              <li key={item.root.id} className="following-thread-row">
                 <InboxListRow
                   className={unread ? 'unread' : ''}
                   onClick={() => {
@@ -2830,6 +3076,16 @@ export function MessengerPage() {
                     {messageSnippet(latest, me)}
                   </span>
                 </InboxListRow>
+                <button
+                  type="button"
+                  className="ghost following-unfollow-btn"
+                  title="Unfollow thread"
+                  onClick={() =>
+                    void unfollowThreadHome(item.conversationId, item.root.id)
+                  }
+                >
+                  Unfollow
+                </button>
               </li>
             );
           })}
@@ -2864,8 +3120,8 @@ export function MessengerPage() {
               }}
             >
               Saved
-              {savedItems.length > 0 ? (
-                <span className="later-tab-count">{savedItems.length}</span>
+              {savedTotalCount > 0 ? (
+                <span className="later-tab-count">{savedTotalCount}</span>
               ) : null}
             </button>
           </div>
@@ -2998,11 +3254,71 @@ export function MessengerPage() {
             </>
           ) : (
             <>
+              <div className="saved-folder-bar">
+                <div className="saved-folder-chips" role="tablist" aria-label="Saved folders">
+                  <button
+                    type="button"
+                    className={savedFolderId === 'all' ? 'on' : ''}
+                    onClick={() => {
+                      setSavedFolderId('all');
+                    }}
+                  >
+                    All
+                  </button>
+                  <button
+                    type="button"
+                    className={savedFolderId === 'none' ? 'on' : ''}
+                    onClick={() => setSavedFolderId('none')}
+                  >
+                    Unfiled
+                  </button>
+                  {bookmarkCollections.map((folder) => (
+                    <button
+                      key={folder.id}
+                      type="button"
+                      className={savedFolderId === folder.id ? 'on' : ''}
+                      onClick={() => setSavedFolderId(folder.id)}
+                      title={`${folder.bookmarkCount} saved`}
+                    >
+                      {folder.name}
+                    </button>
+                  ))}
+                </div>
+                <form
+                  className="saved-folder-create"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void createSavedFolder();
+                  }}
+                >
+                  <input
+                    type="text"
+                    value={newFolderName}
+                    onChange={(event) => setNewFolderName(event.target.value)}
+                    placeholder="New folder"
+                    maxLength={120}
+                  />
+                  <button type="submit" className="ghost" disabled={!newFolderName.trim()}>
+                    Add
+                  </button>
+                </form>
+                {savedFolderId !== 'all' &&
+                savedFolderId !== 'none' &&
+                bookmarkCollections.some((f) => f.id === savedFolderId) ? (
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => void deleteSavedFolder(savedFolderId)}
+                  >
+                    Delete folder
+                  </button>
+                ) : null}
+              </div>
               {savedBusy ? <p className="muted">Loading saved messages…</p> : null}
               {!savedBusy && savedItems.length === 0 ? (
                 <p className="muted">
-                  Save any message from the ⋮ menu. They show up here across
-                  chats.
+                  Save any message from the ⋮ menu. Organize them into folders
+                  here.
                 </p>
               ) : null}
               <ul className="saved-messages-list later-saved-list">
@@ -3032,6 +3348,26 @@ export function MessengerPage() {
                         <span>{snippet}</span>
                         <small>{formatScheduleWhen(item.createdAt)}</small>
                       </button>
+                      <label className="saved-folder-move">
+                        <span className="sr-only">Move to folder</span>
+                        <select
+                          value={item.collectionId ?? ''}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            void moveSavedToFolder(
+                              item.messageId,
+                              value ? value : null,
+                            );
+                          }}
+                        >
+                          <option value="">Unfiled</option>
+                          {bookmarkCollections.map((folder) => (
+                            <option key={folder.id} value={folder.id}>
+                              {folder.name}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
                       <button
                         type="button"
                         className="ghost"

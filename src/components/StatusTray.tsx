@@ -14,9 +14,10 @@ import { useChatSocket } from '../chat/ChatSocketContext';
 import { initials } from '../lib/format';
 import {
   clearAfterLabel,
-  clearStatusClear,
-  readStatusClear,
-  writeStatusClear,
+  computeClearAt,
+  formatUntilPhrase,
+  inferClearOption,
+  withUntilSuffix,
   type ClearAfterOption,
 } from '../lib/statusClear';
 
@@ -116,7 +117,6 @@ export function StatusTray({
   const titleId = useId();
   const { subscribe } = useChatSocket();
   const panelRef = useRef<HTMLDivElement | null>(null);
-  const clearTimerRef = useRef<number | null>(null);
 
   const [status, setStatus] = useState<Availability>('online');
   const [emoji, setEmoji] = useState('');
@@ -135,6 +135,13 @@ export function StatusTray({
       const split = splitCustomStatus(presence.customStatus);
       setEmoji(split.emoji);
       setText(split.text);
+      const option = inferClearOption(presence.statusClearsAt);
+      setClearAfter(option);
+      setClearsAtLabel(
+        presence.statusClearsAt
+          ? formatUntilPhrase(new Date(presence.statusClearsAt))
+          : null,
+      );
       onPresenceChange?.(presence);
     },
     [onPresenceChange],
@@ -149,31 +156,28 @@ export function StatusTray({
       setBusy(true);
       setError('');
       try {
-        const body: { status?: Availability; customStatus?: string | null } =
-          {};
+        const clearOption = next.clearOption ?? clearAfter;
+        const clearsAt =
+          next.clearOption !== undefined || next.customStatus !== undefined
+            ? computeClearAt(clearOption)
+            : undefined;
+        const body: {
+          status?: Availability;
+          customStatus?: string | null;
+          statusClearsAt?: string | null;
+        } = {};
         if (next.status !== undefined) body.status = next.status;
         if (next.customStatus !== undefined) {
           body.customStatus = next.customStatus;
+        }
+        if (clearsAt !== undefined) {
+          body.statusClearsAt = clearsAt ? clearsAt.toISOString() : null;
         }
         const response = await api<Presence>('/chat/presence', {
           method: 'PATCH',
           body: JSON.stringify(body),
         });
         applyPresence(response.data);
-
-        if (next.clearOption !== undefined) {
-          const record = writeStatusClear(userId, next.clearOption);
-          setClearAfter(next.clearOption);
-          setClearsAtLabel(
-            record
-              ? new Date(record.clearsAt).toLocaleString(undefined, {
-                  hour: 'numeric',
-                  minute: '2-digit',
-                })
-              : null,
-          );
-        }
-
         return response.data;
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Could not update status');
@@ -182,47 +186,16 @@ export function StatusTray({
         setBusy(false);
       }
     },
-    [applyPresence, userId],
+    [applyPresence, clearAfter],
   );
 
   const clearStatusNow = useCallback(async () => {
-    clearStatusClear(userId);
-    setClearAfter('never');
-    setClearsAtLabel(null);
     await patchPresence({
       status: 'online',
       customStatus: null,
       clearOption: 'never',
     });
-  }, [patchPresence, userId]);
-
-  const scheduleClearTimer = useCallback(() => {
-    if (clearTimerRef.current !== null) {
-      window.clearTimeout(clearTimerRef.current);
-      clearTimerRef.current = null;
-    }
-    const record = readStatusClear(userId);
-    if (!record) {
-      setClearAfter('never');
-      setClearsAtLabel(null);
-      return;
-    }
-    setClearAfter(record.option);
-    setClearsAtLabel(
-      new Date(record.clearsAt).toLocaleString(undefined, {
-        hour: 'numeric',
-        minute: '2-digit',
-      }),
-    );
-    const delay = new Date(record.clearsAt).getTime() - Date.now();
-    if (delay <= 0) {
-      void clearStatusNow();
-      return;
-    }
-    clearTimerRef.current = window.setTimeout(() => {
-      void clearStatusNow();
-    }, Math.min(delay, 2_147_000_000));
-  }, [clearStatusNow, userId]);
+  }, [patchPresence]);
 
   useEffect(() => {
     let cancelled = false;
@@ -233,14 +206,10 @@ export function StatusTray({
       .catch(() => {
         /* ignore — tray still usable */
       });
-    scheduleClearTimer();
     return () => {
       cancelled = true;
-      if (clearTimerRef.current !== null) {
-        window.clearTimeout(clearTimerRef.current);
-      }
     };
-  }, [userId, applyPresence, scheduleClearTimer]);
+  }, [userId, applyPresence]);
 
   useEffect(() => {
     return subscribe('chat:presence', (payload) => {
@@ -305,9 +274,11 @@ export function StatusTray({
       return;
     }
     setError('');
+    const clearsAt = computeClearAt(clearAfter);
+    const withUntil = withUntilSuffix(trimmed, clearsAt);
     try {
       await patchPresence({
-        customStatus: composeCustomStatus(emoji, trimmed),
+        customStatus: composeCustomStatus(emoji, withUntil),
         clearOption: clearAfter,
       });
       onClose();
@@ -318,13 +289,16 @@ export function StatusTray({
 
   async function pickPreset(preset: { emoji: string; text: string }) {
     setEmoji(preset.emoji);
-    setText(preset.text);
+    const clearsAt = computeClearAt(clearAfter);
+    const withUntil = withUntilSuffix(preset.text, clearsAt);
+    setText(withUntil);
     setError('');
     try {
       await patchPresence({
-        customStatus: composeCustomStatus(preset.emoji, preset.text),
-        clearOption: clearAfter,
+        customStatus: composeCustomStatus(preset.emoji, withUntil),
+        clearOption: clearAfter === 'never' ? '1h' : clearAfter,
       });
+      if (clearAfter === 'never') setClearAfter('1h');
       onClose();
     } catch {
       /* error already set in patchPresence */
@@ -488,16 +462,8 @@ export function StatusTray({
               onChange={(event) => {
                 const option = event.target.value as ClearAfterOption;
                 setClearAfter(option);
-                const record = writeStatusClear(userId, option);
-                setClearsAtLabel(
-                  record
-                    ? new Date(record.clearsAt).toLocaleString(undefined, {
-                        hour: 'numeric',
-                        minute: '2-digit',
-                      })
-                    : null,
-                );
-                scheduleClearTimer();
+                const at = computeClearAt(option);
+                setClearsAtLabel(at ? formatUntilPhrase(at) : null);
               }}
             >
               {CLEAR_OPTIONS.map((option) => (

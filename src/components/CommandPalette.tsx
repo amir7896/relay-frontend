@@ -234,6 +234,58 @@ export function CommandPalette() {
         run: () => navigate('/profile'),
       },
       {
+        id: 'action-slash-remind',
+        group: 'Actions',
+        title: '/remind',
+        subtitle: 'Remind yourself in this chat',
+        run: () => {
+          window.dispatchEvent(
+            new CustomEvent('relay:composer-slash', {
+              detail: { command: 'remind' },
+            }),
+          );
+        },
+      },
+      {
+        id: 'action-slash-poll',
+        group: 'Actions',
+        title: '/poll',
+        subtitle: 'Start a poll in the open chat',
+        run: () => {
+          window.dispatchEvent(
+            new CustomEvent('relay:composer-slash', {
+              detail: { command: 'poll' },
+            }),
+          );
+        },
+      },
+      {
+        id: 'action-slash-assign',
+        group: 'Actions',
+        title: '/assign',
+        subtitle: 'Assign a list task',
+        run: () => {
+          window.dispatchEvent(
+            new CustomEvent('relay:composer-slash', {
+              detail: { command: 'assign' },
+            }),
+          );
+        },
+      },
+      {
+        id: 'action-slash-status',
+        group: 'Actions',
+        title: '/status',
+        subtitle: 'Set your custom status',
+        run: () => {
+          window.dispatchEvent(
+            new CustomEvent('relay:composer-slash', {
+              detail: { command: 'status' },
+            }),
+          );
+        },
+      },
+      {
         id: 'action-people',
         group: 'Actions',
         title: 'Browse people',
