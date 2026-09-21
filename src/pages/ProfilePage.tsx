@@ -1593,7 +1593,7 @@ export function ProfilePage() {
                 <option value="ephemeral">Ephemeral (only you see it)</option>
               </select>
             </label>
-            <label className="profile-plain-field" style={{ gridColumn: '1 / -1' }}>
+            <label className="profile-plain-field profile-field-span">
               Response template
               <input
                 value={slashDraft.responseTemplate}
@@ -1607,7 +1607,7 @@ export function ProfilePage() {
                 maxLength={2000}
               />
             </label>
-            <label className="profile-plain-field" style={{ gridColumn: '1 / -1' }}>
+            <label className="profile-plain-field profile-field-span">
               Interactive request URL (optional)
               <input
                 value={slashDraft.requestUrl}
@@ -1621,47 +1621,51 @@ export function ProfilePage() {
                 maxLength={500}
               />
             </label>
-            <p className="muted" style={{ gridColumn: '1 / -1', margin: 0 }}>
+            <p className="muted profile-field-span profile-form-note">
               If set, Relay POSTs <code>{'{'} command, text, user_id, channel_id {'}'}</code> and
               expects <code>{'{'} text, response_type? {'}'}</code>. Template is the fallback.
             </p>
-            <div className="profile-sheet-actions" style={{ gridColumn: '1 / -1' }}>
+            <div className="profile-sheet-actions profile-field-span">
               <button className="btn" type="submit" disabled={slashBusy}>
                 {slashBusy ? 'Creating…' : 'Add command'}
               </button>
             </div>
           </form>
-          <ul className="member-list" style={{ marginTop: 12 }}>
-            {slashCommands.map((command) => (
-              <li key={command.id}>
-                <div className="member-identity">
-                  <span>
-                    /{command.name}
-                    {command.builtin ? ' · built-in' : ''}
-                    {!command.builtin
-                      ? ` · ${command.responseMode === 'ephemeral' ? 'ephemeral' : 'in channel'}`
-                      : ''}
-                    {command.requestUrl ? ' · interactive' : ''}
-                  </span>
-                  <small>{command.description}</small>
-                </div>
-                <div className="member-actions">
-                  {!command.builtin ? (
-                    <button
-                      type="button"
-                      className="ghost danger-text"
-                      onClick={() => void revokeSlashCommand(command)}
-                    >
-                      Revoke
-                    </button>
-                  ) : null}
-                </div>
-              </li>
-            ))}
-          </ul>
-          {slashSaved ? (
-            <p className="ok profile-inline-ok">{slashSaved}</p>
-          ) : null}
+          <div className="profile-sheet-body">
+            <ul className="member-list">
+              {slashCommands.map((command) => (
+                <li key={command.id}>
+                  <div className="member-identity">
+                    <span>
+                      /{command.name}
+                      {command.builtin ? ' · built-in' : ''}
+                      {!command.builtin
+                        ? ` · ${command.responseMode === 'ephemeral' ? 'ephemeral' : 'in channel'}`
+                        : ''}
+                      {command.requestUrl ? ' · interactive' : ''}
+                    </span>
+                    <small>{command.description}</small>
+                  </div>
+                  <div className="member-actions">
+                    {!command.builtin ? (
+                      <button
+                        type="button"
+                        className="ghost danger-text"
+                        onClick={() => void revokeSlashCommand(command)}
+                      >
+                        Revoke
+                      </button>
+                    ) : null}
+                  </div>
+                </li>
+              ))}
+            </ul>
+            {slashSaved ? (
+              <p className="ok profile-inline-ok" style={{ paddingLeft: 0 }}>
+                {slashSaved}
+              </p>
+            ) : null}
+          </div>
         </section>
       ) : null}
 
@@ -1710,10 +1714,7 @@ export function ProfilePage() {
                 required
               />
             </label>
-            <label
-              className="profile-plain-field"
-              style={{ gridColumn: '1 / -1' }}
-            >
+            <label className="profile-plain-field profile-field-span">
               Description
               <input
                 value={userGroupDraft.description}
@@ -1727,8 +1728,8 @@ export function ProfilePage() {
                 maxLength={240}
               />
             </label>
-            <div style={{ gridColumn: '1 / -1' }}>
-              <p className="muted" style={{ marginBottom: 8 }}>
+            <div className="profile-field-span profile-picker-block">
+              <p className="muted profile-picker-hint">
                 {userGroupDraft.memberIds.length === 0
                   ? 'Select at least one member'
                   : `${userGroupDraft.memberIds.length} member${
@@ -1742,10 +1743,7 @@ export function ProfilePage() {
                 onToggle={toggleUserGroupMember}
               />
             </div>
-            <div
-              className="profile-sheet-actions"
-              style={{ gridColumn: '1 / -1' }}
-            >
+            <div className="profile-sheet-actions profile-field-span">
               <button
                 className="btn"
                 type="submit"
@@ -1773,57 +1771,61 @@ export function ProfilePage() {
               ) : null}
             </div>
           </form>
-          <ul className="member-list" style={{ marginTop: 12 }}>
-            {userGroups.map((group) => (
-              <li key={group.id}>
-                <div className="member-identity">
-                  <span>@{group.handle}</span>
-                  <small>
-                    {group.name}
-                    {group.description ? ` — ${group.description}` : ''} ·{' '}
-                    {group.memberIds.length} member
-                    {group.memberIds.length === 1 ? '' : 's'}
-                    {group.memberIds.length > 0
-                      ? `: ${group.memberIds
-                          .slice(0, 4)
-                          .map((id) =>
-                            displayName(
-                              people.find((person) => person.userId === id),
-                            ),
-                          )
-                          .join(', ')}${
-                          group.memberIds.length > 4 ? '…' : ''
-                        }`
-                      : ''}
-                  </small>
-                </div>
-                <div className="member-actions">
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => startEditUserGroup(group)}
-                  >
-                    Edit
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost danger-text"
-                    onClick={() => void deleteUserGroup(group)}
-                  >
-                    Delete
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
-          {userGroups.length === 0 ? (
-            <p className="muted" style={{ marginTop: 8 }}>
-              No user groups yet.
-            </p>
-          ) : null}
-          {userGroupSaved ? (
-            <p className="ok profile-inline-ok">{userGroupSaved}</p>
-          ) : null}
+          <div className="profile-sheet-body">
+            <ul className="member-list">
+              {userGroups.map((group) => (
+                <li key={group.id}>
+                  <div className="member-identity">
+                    <span>@{group.handle}</span>
+                    <small>
+                      {group.name}
+                      {group.description ? ` — ${group.description}` : ''} ·{' '}
+                      {group.memberIds.length} member
+                      {group.memberIds.length === 1 ? '' : 's'}
+                      {group.memberIds.length > 0
+                        ? `: ${group.memberIds
+                            .slice(0, 4)
+                            .map((id) =>
+                              displayName(
+                                people.find((person) => person.userId === id),
+                              ),
+                            )
+                            .join(', ')}${
+                            group.memberIds.length > 4 ? '…' : ''
+                          }`
+                        : ''}
+                    </small>
+                  </div>
+                  <div className="member-actions">
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => startEditUserGroup(group)}
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost danger-text"
+                      onClick={() => void deleteUserGroup(group)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            {userGroups.length === 0 ? (
+              <p className="muted invite-empty" style={{ paddingLeft: 0, paddingRight: 0 }}>
+                No user groups yet.
+              </p>
+            ) : null}
+            {userGroupSaved ? (
+              <p className="ok profile-inline-ok" style={{ paddingLeft: 0 }}>
+                {userGroupSaved}
+              </p>
+            ) : null}
+          </div>
         </section>
       ) : null}
 
@@ -1837,36 +1839,39 @@ export function ProfilePage() {
               transfer ownership; admins can promote/demote members.
             </p>
           </header>
-          {membersBusy ? <p className="muted">Loading members…</p> : null}
-          {!membersBusy && members.length === 0 ? (
-            <p className="muted">No members found.</p>
+          {membersBusy ? (
+            <p className="muted profile-sheet-status">Loading members…</p>
           ) : null}
-          <ul className="member-list">
-            {members.map((member) => {
-              const label = member.label || member.userId.slice(0, 8);
-              const isSelf = member.userId === session?.user.id;
-              const isOwnerRow = member.role === 'owner';
-              return (
-                <li key={member.userId}>
-                  <div className="member-identity">
-                    <span>{label}</span>
-                    <small>
-                      {member.role}
-                      {isSelf ? ' · you' : ''}
-                    </small>
-                  </div>
-                  <div className="member-actions">
-                    {!isOwnerRow && isWorkspaceOwner ? (
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={() =>
-                          void transferOwnershipTo(member.userId, label)
-                        }
-                      >
-                        Make owner
-                      </button>
-                    ) : null}
+          {!membersBusy && members.length === 0 ? (
+            <p className="muted profile-sheet-status">No members found.</p>
+          ) : null}
+          <div className="profile-sheet-body">
+            <ul className="member-list">
+              {members.map((member) => {
+                const label = member.label || member.userId.slice(0, 8);
+                const isSelf = member.userId === session?.user.id;
+                const isOwnerRow = member.role === 'owner';
+                return (
+                  <li key={member.userId}>
+                    <div className="member-identity">
+                      <span>{label}</span>
+                      <small>
+                        {member.role}
+                        {isSelf ? ' · you' : ''}
+                      </small>
+                    </div>
+                    <div className="member-actions">
+                      {!isOwnerRow && isWorkspaceOwner ? (
+                        <button
+                          type="button"
+                          className="ghost"
+                          onClick={() =>
+                            void transferOwnershipTo(member.userId, label)
+                          }
+                        >
+                          Make owner
+                        </button>
+                      ) : null}
                     {!isOwnerRow && isWorkspaceOwner && !isSelf ? (
                       member.role === 'admin' ? (
                         <button
@@ -1925,6 +1930,7 @@ export function ProfilePage() {
               );
             })}
           </ul>
+          </div>
         </section>
       ) : null}
 
@@ -2193,7 +2199,8 @@ export function ProfilePage() {
         <header className="profile-sheet-head">
           <h2>Status</h2>
           <p className="muted">
-            Away, Busy, or Do not disturb — shown to teammates while you are connected.
+            Away, Busy, or Do not disturb — also available from your avatar in the
+            sidebar.
           </p>
         </header>
         <div className="profile-fields">

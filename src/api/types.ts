@@ -260,6 +260,23 @@ export type MentionActivity = {
   unread: boolean;
 };
 
+export type UserNotification = {
+  id: string;
+  organizationId: string;
+  userId: string;
+  actorId: string;
+  type: string;
+  title: string;
+  body: string;
+  conversationId: string | null;
+  listId: string | null;
+  listItemId: string | null;
+  meta: Record<string, unknown>;
+  readAt: string | null;
+  createdAt: string;
+  unread: boolean;
+};
+
 export type DraftInboxItem = {
   conversationId: string;
   conversationName: string | null;

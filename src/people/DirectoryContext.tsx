@@ -11,6 +11,7 @@ import {
 import { api } from '../api/client';
 import type { Paginated, UserProfile } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
+import { useOrganization } from '../organizations/OrganizationContext';
 
 type DirectoryContextValue = {
   people: UserProfile[];
@@ -27,6 +28,7 @@ const DirectoryContext = createContext<DirectoryContextValue | null>(null);
 
 export function DirectoryProvider({ children }: { children: ReactNode }) {
   const { session } = useAuth();
+  const { activeOrganizationId } = useOrganization();
   const me = session?.user.id;
   const [people, setPeople] = useState<UserProfile[]>([]);
   const [error, setError] = useState('');
@@ -38,16 +40,21 @@ export function DirectoryProvider({ children }: { children: ReactNode }) {
       const response = await api<Paginated<UserProfile>>(
         '/users/directory?page=1&limit=100&sortBy=firstName&order=ASC',
       );
-      setPeople(response.data.items);
+      setPeople(response.data.items ?? []);
       setError('');
     } catch (err: unknown) {
+      setPeople([]);
       setError(err instanceof Error ? err.message : 'Could not load people');
     }
   }, []);
 
   useEffect(() => {
+    if (!session?.user.id || !activeOrganizationId) {
+      setPeople([]);
+      return;
+    }
     void refreshDirectory();
-  }, [refreshDirectory]);
+  }, [session?.user.id, activeOrganizationId, refreshDirectory]);
 
   const byUserId = useMemo(() => {
     const map = new Map<string, UserProfile>();

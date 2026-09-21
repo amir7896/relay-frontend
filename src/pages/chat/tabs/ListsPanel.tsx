@@ -6,11 +6,16 @@ import {
   useState,
 } from 'react';
 import { api } from '../../../api/client';
+import { useAuth } from '../../../auth/AuthContext';
 import { useConfirm } from '../../../components/ConfirmProvider';
+import { UserAvatar } from '../../../components/UserAvatar';
+import { displayName } from '../../../lib/format';
+import { useDirectory } from '../../../people/useDirectory';
 import type {
   ChannelList,
   ChannelListItem,
   ChannelListItemStatus,
+  Conversation,
 } from '../../../api/types';
 
 const STATUSES: Array<{
@@ -30,12 +35,28 @@ function countByStatus(items: ChannelListItem[], status: ChannelListItemStatus) 
   return items.filter((item) => item.status === status).length;
 }
 
-export function ListsPanel({ conversationId }: { conversationId: string }) {
+function normalizeAssigneeId(value: string): string | null {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+export function ListsPanel({
+  conversationId,
+  conversation,
+}: {
+  conversationId: string;
+  conversation: Conversation;
+}) {
   const confirmDialog = useConfirm();
+  const { session } = useAuth();
+  const me = session?.user.id ?? '';
+  const { byUserId, ensureProfiles } = useDirectory();
+
   const [lists, setLists] = useState<ChannelList[]>([]);
   const [selectedId, setSelectedId] = useState('');
   const [newListName, setNewListName] = useState('');
   const [newItemTitle, setNewItemTitle] = useState('');
+  const [newItemAssignee, setNewItemAssignee] = useState('');
   const [renameValue, setRenameValue] = useState('');
   const [renaming, setRenaming] = useState(false);
   const [busy, setBusy] = useState(true);
@@ -44,6 +65,21 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<ChannelListItemStatus | null>(
     null,
+  );
+
+  const memberIds = useMemo(
+    () =>
+      conversation.members
+        .map((member) => member.userId)
+        .filter(Boolean)
+        .sort((a, b) => {
+          if (a === me) return -1;
+          if (b === me) return 1;
+          return displayName(byUserId.get(a)).localeCompare(
+            displayName(byUserId.get(b)),
+          );
+        }),
+    [conversation.members, me, byUserId],
   );
 
   const selected =
@@ -89,6 +125,7 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
   useEffect(() => {
     setSelectedId('');
     setRenaming(false);
+    setNewItemAssignee('');
     void loadLists();
   }, [conversationId]);
 
@@ -96,8 +133,44 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
     if (selected) setRenameValue(selected.name);
   }, [selected?.id, selected?.name]);
 
+  useEffect(() => {
+    if (!memberIds.length) return;
+    void ensureProfiles(memberIds);
+  }, [memberIds, ensureProfiles]);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => setNotice(''), 2800);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
   function basePath(listId: string) {
     return `/chat/conversations/${conversationId}/lists/${listId}`;
+  }
+
+  function assigneeLabel(userId: string | null | undefined) {
+    if (!userId) return 'Unassigned';
+    if (userId === me) return 'You';
+    return displayName(byUserId.get(userId));
+  }
+
+  function patchItemLocal(
+    listId: string,
+    itemId: string,
+    patch: Partial<ChannelListItem>,
+  ) {
+    setLists((current) =>
+      current.map((list) =>
+        list.id === listId
+          ? {
+              ...list,
+              items: (list.items ?? []).map((row) =>
+                row.id === itemId ? { ...row, ...patch } : row,
+              ),
+            }
+          : list,
+      ),
+    );
   }
 
   async function createList(event: FormEvent) {
@@ -116,6 +189,7 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
       const created = normalizeList(response.data);
       setLists((current) => [...current, created]);
       setSelectedId(created.id);
+      setRenaming(false);
       setNewListName('');
       setNotice('List created.');
     } catch (err) {
@@ -187,10 +261,11 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
     if (!listId || !title) return;
     setError('');
     setNotice('');
+    const assigneeId = normalizeAssigneeId(newItemAssignee);
     try {
       const response = await api<ChannelListItem>(`${basePath(listId)}/items`, {
         method: 'POST',
-        body: JSON.stringify({ title, status: 'todo' }),
+        body: JSON.stringify({ title, status: 'todo', assigneeId }),
       });
       if (!response.data?.id) {
         throw new Error('Server did not return the new item');
@@ -203,7 +278,11 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
         ),
       );
       setNewItemTitle('');
-      setNotice('Item added.');
+      setNotice(
+        assigneeId
+          ? `Item added · assigned to ${assigneeLabel(assigneeId)}.`
+          : 'Item added.',
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not add the item.');
     }
@@ -215,18 +294,7 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
   ) {
     if (!selected || item.status === status) return;
     const listId = selected.id;
-    setLists((current) =>
-      current.map((list) =>
-        list.id === listId
-          ? {
-              ...list,
-              items: (list.items ?? []).map((row) =>
-                row.id === item.id ? { ...row, status } : row,
-              ),
-            }
-          : list,
-      ),
-    );
+    patchItemLocal(listId, item.id, { status });
     try {
       await api(`${basePath(listId)}/items/${item.id}`, {
         method: 'PATCH',
@@ -234,6 +302,30 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
       });
     } catch {
       setError('Could not update the item.');
+      void loadLists(listId);
+    }
+  }
+
+  async function updateItemAssignee(
+    item: ChannelListItem,
+    assigneeId: string | null,
+  ) {
+    if (!selected) return;
+    if ((item.assigneeId ?? null) === assigneeId) return;
+    const listId = selected.id;
+    patchItemLocal(listId, item.id, { assigneeId });
+    try {
+      await api(`${basePath(listId)}/items/${item.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ assigneeId }),
+      });
+      setNotice(
+        assigneeId
+          ? `Assigned to ${assigneeLabel(assigneeId)}.`
+          : 'Assignee cleared.',
+      );
+    } catch {
+      setError('Could not update assignee.');
       void loadLists(listId);
     }
   }
@@ -295,21 +387,20 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
 
   return (
     <section className="feature-panel lists-panel">
-      <div className="feature-panel-head">
+      <div className="feature-panel-head lists-panel-head">
         <div>
           <h3>Lists</h3>
-          <p className="muted">
-            Drag cards across columns — To do → In progress → Done.
+          <p className="muted lists-panel-sub">
+            Drag cards across columns — assign tasks to channel members.
           </p>
         </div>
+        {error ? <p className="error tab-notice lists-inline-notice">{error}</p> : null}
+        {!error && notice ? (
+          <p className="muted tab-notice lists-inline-notice" role="status">
+            {notice}
+          </p>
+        ) : null}
       </div>
-
-      {error ? <p className="error tab-notice">{error}</p> : null}
-      {notice ? (
-        <p className="muted tab-notice" role="status">
-          {notice}
-        </p>
-      ) : null}
 
       <div className="lists-layout">
         <aside className="lists-sidebar">
@@ -329,7 +420,7 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
           {!busy && lists.length === 0 ? (
             <p className="muted lists-sidebar-empty">No lists yet.</p>
           ) : null}
-          <ul className="lists-nav">
+          <ul className="lists-nav" aria-label="Channel lists">
             {lists.map((list) => {
               const listItems = list.items ?? [];
               const done = countByStatus(listItems, 'done');
@@ -372,37 +463,41 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
                       autoFocus
                       maxLength={160}
                     />
-                    <button className="btn" type="submit">
-                      Save
-                    </button>
-                    <button
-                      className="ghost"
-                      type="button"
-                      onClick={() => {
-                        setRenaming(false);
-                        setRenameValue(selected.name);
-                      }}
-                    >
-                      Cancel
-                    </button>
+                    <div className="list-rename-actions">
+                      <button className="btn" type="submit">
+                        Save
+                      </button>
+                      <button
+                        className="ghost"
+                        type="button"
+                        onClick={() => {
+                          setRenaming(false);
+                          setRenameValue(selected.name);
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   </form>
                 ) : (
                   <div className="list-detail-title">
-                    <h4>{selected.name}</h4>
-                    <button
-                      className="ghost"
-                      type="button"
-                      onClick={() => setRenaming(true)}
-                    >
-                      Rename
-                    </button>
-                    <button
-                      className="ghost danger-link"
-                      type="button"
-                      onClick={() => void deleteList(selected.id)}
-                    >
-                      Delete
-                    </button>
+                    <h4 title={selected.name}>{selected.name}</h4>
+                    <div className="list-detail-actions">
+                      <button
+                        className="ghost"
+                        type="button"
+                        onClick={() => setRenaming(true)}
+                      >
+                        Rename
+                      </button>
+                      <button
+                        className="ghost danger-link"
+                        type="button"
+                        onClick={() => void deleteList(selected.id)}
+                      >
+                        Delete
+                      </button>
+                    </div>
                   </div>
                 )}
                 <div className="list-progress" aria-label="List progress">
@@ -424,6 +519,36 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
                   aria-label="New item title"
                   maxLength={500}
                 />
+                <div className="list-add-assignee">
+                  <select
+                    value={newItemAssignee}
+                    onChange={(event) => setNewItemAssignee(event.target.value)}
+                    aria-label="Assign to"
+                  >
+                    <option value="">Unassigned</option>
+                    {me ? (
+                      <option value={me}>Assign to me</option>
+                    ) : null}
+                    {memberIds
+                      .filter((userId) => userId !== me)
+                      .map((userId) => (
+                        <option key={userId} value={userId}>
+                          {displayName(byUserId.get(userId))}
+                        </option>
+                      ))}
+                  </select>
+                  {me ? (
+                    <button
+                      className="ghost list-assign-me"
+                      type="button"
+                      title="Assign to me"
+                      onClick={() => setNewItemAssignee(me)}
+                      disabled={newItemAssignee === me}
+                    >
+                      Me
+                    </button>
+                  ) : null}
+                </div>
                 <button
                   className="btn"
                   type="submit"
@@ -433,7 +558,7 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
                 </button>
               </form>
 
-              <div className="list-board">
+              <div className="list-board" role="list">
                 {STATUSES.map((column) => {
                   const columnItems = items.filter(
                     (item) => item.status === column.id,
@@ -457,12 +582,17 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
                         </span>
                       </header>
                       <ul className="list-column-items">
-                        {columnItems.map((item) => (
+                        {columnItems.map((item) => {
+                          const assigneeProfile = item.assigneeId
+                            ? byUserId.get(item.assigneeId)
+                            : null;
+                          const isMine = Boolean(me && item.assigneeId === me);
+                          return (
                             <li
                               key={item.id}
                               className={`list-card${
                                 draggingId === item.id ? ' dragging' : ''
-                              }`}
+                              }${isMine ? ' is-mine' : ''}`}
                               draggable
                               onDragStart={(event) =>
                                 onCardDragStart(event, item)
@@ -499,14 +629,85 @@ export function ListsPanel({ conversationId }: { conversationId: string }) {
                                   ×
                                 </button>
                               </div>
+
+                              <div className="list-card-assignee">
+                                {item.assigneeId ? (
+                                  <UserAvatar
+                                    profile={assigneeProfile}
+                                    name={assigneeLabel(item.assigneeId)}
+                                    size="sm"
+                                    className="list-card-avatar"
+                                  />
+                                ) : (
+                                  <span
+                                    className="list-card-avatar-empty"
+                                    aria-hidden="true"
+                                  />
+                                )}
+                                <select
+                                  className="list-card-assignee-select"
+                                  value={item.assigneeId ?? ''}
+                                  aria-label={`Assignee for ${item.title}`}
+                                  onClick={(event) => event.stopPropagation()}
+                                  onMouseDown={(event) => event.stopPropagation()}
+                                  onChange={(event) => {
+                                    event.stopPropagation();
+                                    void updateItemAssignee(
+                                      item,
+                                      normalizeAssigneeId(event.target.value),
+                                    );
+                                  }}
+                                >
+                                  <option value="">Unassigned</option>
+                                  {me ? (
+                                    <option value={me}>You</option>
+                                  ) : null}
+                                  {memberIds
+                                    .filter((userId) => userId !== me)
+                                    .map((userId) => (
+                                      <option key={userId} value={userId}>
+                                        {displayName(byUserId.get(userId))}
+                                      </option>
+                                    ))}
+                                </select>
+                                {me && item.assigneeId !== me ? (
+                                  <button
+                                    type="button"
+                                    className="ghost list-card-take"
+                                    title="Assign to me"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void updateItemAssignee(item, me);
+                                    }}
+                                  >
+                                    Take
+                                  </button>
+                                ) : null}
+                              </div>
+
+                              <div className="list-card-move">
+                                {STATUSES.filter((s) => s.id !== item.status).map(
+                                  (target) => (
+                                    <button
+                                      key={target.id}
+                                      type="button"
+                                      className="ghost list-card-move-btn"
+                                      onClick={() =>
+                                        void updateItemStatus(item, target.id)
+                                      }
+                                    >
+                                      {target.label}
+                                    </button>
+                                  ),
+                                )}
+                              </div>
                             </li>
-                        ))}
+                          );
+                        })}
                       </ul>
                       {columnItems.length === 0 ? (
                         <p className="muted list-column-empty">
-                          {draggingId
-                            ? 'Drop here'
-                            : 'No items'}
+                          {draggingId ? 'Drop here' : 'No items'}
                         </p>
                       ) : null}
                     </section>

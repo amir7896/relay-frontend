@@ -34,6 +34,7 @@ import type {
   MentionActivity,
   DraftInboxItem,
   ThreadSummary,
+  UserNotification,
   UserProfile,
 } from '../../api/types';
 
@@ -233,12 +234,15 @@ export function MessengerPage() {
   const [threadItems, setThreadItems] = useState<ThreadSummary[]>([]);
   const [threadsBusy, setThreadsBusy] = useState(false);
   const [threadsUnreadTotal, setThreadsUnreadTotal] = useState(0);
-  const [activityTab, setActivityTab] = useState<'mentions' | 'threads'>(
+  const [activityTab, setActivityTab] = useState<'mentions' | 'threads' | 'assigned'>(
     'mentions',
   );
   const [mentionItems, setMentionItems] = useState<MentionActivity[]>([]);
   const [mentionsBusy, setMentionsBusy] = useState(false);
   const [mentionsUnreadTotal, setMentionsUnreadTotal] = useState(0);
+  const [assignmentItems, setAssignmentItems] = useState<UserNotification[]>([]);
+  const [assignmentsBusy, setAssignmentsBusy] = useState(false);
+  const [assignmentsUnreadTotal, setAssignmentsUnreadTotal] = useState(0);
   const [draftItems, setDraftItems] = useState<DraftInboxItem[]>([]);
   const [draftsBusy, setDraftsBusy] = useState(false);
   const [draftsCount, setDraftsCount] = useState(0);
@@ -610,6 +614,17 @@ export function MessengerPage() {
         // ignore
       }
     }
+    async function refreshAssignmentsBadge() {
+      try {
+        const response = await api<{ count: number }>(
+          '/chat/notifications/unread-count',
+        );
+        if (cancelled) return;
+        setAssignmentsUnreadTotal(response.data.count ?? 0);
+      } catch {
+        // ignore
+      }
+    }
     async function refreshDraftsBadge() {
       try {
         const response = await api<Paginated<DraftInboxItem>>(
@@ -649,6 +664,7 @@ export function MessengerPage() {
     }
     void refreshThreadBadge();
     void refreshMentionsBadge();
+    void refreshAssignmentsBadge();
     void refreshDraftsBadge();
     void refreshLaterBadge();
     void refreshSavedBadge();
@@ -692,6 +708,23 @@ export function MessengerPage() {
       }),
       subscribe('chat:reminder', () => {
         void refreshLater();
+      }),
+      subscribe('chat:notification', (payload) => {
+        const notification = payload as UserNotification;
+        setAssignmentItems((current) => {
+          if (current.some((item) => item.id === notification.id)) {
+            return current;
+          }
+          return [notification, ...current];
+        });
+        if (notification.unread !== false) {
+          setAssignmentsUnreadTotal((count) => count + 1);
+        }
+        notify({
+          title: notification.title || 'Task assigned to you',
+          body: notification.body || 'A list task was assigned to you',
+          tag: `assignment-${notification.id}`,
+        });
       }),
       subscribe(
         'chat:presence',
@@ -868,27 +901,103 @@ export function MessengerPage() {
   }, [loadSidebarSections, activeOrganizationId]);
 
   useEffect(() => {
+    function navList() {
+      return items;
+    }
+
+    function stepChannel(delta: number) {
+      const list = navList();
+      if (list.length === 0) return;
+      const currentId = activeIdRef.current;
+      const index = currentId
+        ? list.findIndex((item) => item.id === currentId)
+        : -1;
+      const nextIndex =
+        index < 0
+          ? delta > 0
+            ? 0
+            : list.length - 1
+          : (index + delta + list.length) % list.length;
+      const next = list[nextIndex];
+      if (next) {
+        setHomeView(null);
+        navigate(`/chat/${next.id}`);
+      }
+    }
+
+    function stepUnread(delta: number) {
+      const list = navList().filter(
+        (item) => (item.unreadCount ?? 0) > 0 || Boolean(item.hasUnreadMention),
+      );
+      if (list.length === 0) {
+        setHomeView('unreads');
+        navigate('/chat');
+        return;
+      }
+      const currentId = activeIdRef.current;
+      const index = currentId
+        ? list.findIndex((item) => item.id === currentId)
+        : -1;
+      let nextIndex: number;
+      if (index < 0) {
+        nextIndex = delta > 0 ? 0 : list.length - 1;
+      } else {
+        nextIndex = (index + delta + list.length) % list.length;
+      }
+      const next = list[nextIndex];
+      if (next) {
+        setHomeView(null);
+        const focus = next.firstUnreadMentionMessageId;
+        if (focus) {
+          navigate(
+            `/chat/${next.id}?focus=${encodeURIComponent(focus)}`,
+          );
+        } else {
+          navigate(`/chat/${next.id}`);
+        }
+      }
+    }
+
     const onCommand = (event: Event) => {
       const detail = (event as CustomEvent<{ action?: string }>).detail;
-      if (detail?.action === 'new-channel') {
+      const action = detail?.action;
+      if (action === 'new-channel') {
         setModalError('');
         setGroupMembers([]);
         setGroupName('');
         setGroupVisibility('private');
         setGroupAnnounceOnly(false);
         setGroupOpen(true);
-      } else if (detail?.action === 'new-dm') {
+        void refreshDirectory();
+      } else if (action === 'new-dm') {
         setModalError('');
         setDmOpen(true);
-      } else if (detail?.action === 'unreads') {
+        void refreshDirectory();
+      } else if (action === 'unreads' || action === 'open-unreads') {
         setHomeView('unreads');
         setModalError('');
         navigate('/chat');
+      } else if (action === 'open-threads') {
+        void openThreadsHome();
+      } else if (action === 'open-later') {
+        void openLaterInbox('later');
+      } else if (action === 'open-activity') {
+        void openActivityHome('mentions');
+      } else if (action === 'open-drafts') {
+        void openDraftsHome();
+      } else if (action === 'prev-channel') {
+        stepChannel(-1);
+      } else if (action === 'next-channel') {
+        stepChannel(1);
+      } else if (action === 'prev-unread') {
+        stepUnread(-1);
+      } else if (action === 'next-unread') {
+        stepUnread(1);
       }
     };
     window.addEventListener('relay:command', onCommand);
     return () => window.removeEventListener('relay:command', onCommand);
-  }, [navigate]);
+  }, [navigate, items, refreshDirectory]);
 
   const peopleHits = useMemo(() => {
     const term = query.trim().toLowerCase();
@@ -961,6 +1070,7 @@ export function MessengerPage() {
     openNewChat: () => {
       setModalError('');
       setDmOpen(true);
+      void refreshDirectory();
     },
     openNewGroup: () => {
       setModalError('');
@@ -969,6 +1079,7 @@ export function MessengerPage() {
       setGroupVisibility('private');
       setGroupAnnounceOnly(false);
       setGroupOpen(true);
+      void refreshDirectory();
     },
     clearUnread,
     setUnread,
@@ -1508,13 +1619,72 @@ export function MessengerPage() {
     }
   }
 
-  async function openActivityHome(tab: 'mentions' | 'threads' = 'mentions') {
+  async function loadAssignedHome() {
+    setAssignmentsBusy(true);
+    try {
+      const response = await api<Paginated<UserNotification>>(
+        '/chat/notifications?page=1&limit=40',
+      );
+      const items = response.data.items ?? [];
+      setAssignmentItems(items);
+      setAssignmentsUnreadTotal(items.filter((item) => item.unread).length);
+      await ensureProfiles(items.map((item) => item.actorId));
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not load assignments',
+      );
+      setAssignmentItems([]);
+    } finally {
+      setAssignmentsBusy(false);
+    }
+  }
+
+  async function markAssignmentRead(notification: UserNotification) {
+    if (!notification.unread) return;
+    setAssignmentItems((current) =>
+      current.map((item) =>
+        item.id === notification.id
+          ? { ...item, unread: false, readAt: new Date().toISOString() }
+          : item,
+      ),
+    );
+    setAssignmentsUnreadTotal((count) => Math.max(0, count - 1));
+    try {
+      await api(`/chat/notifications/${notification.id}/read`, {
+        method: 'POST',
+      });
+    } catch {
+      // ignore — list will refresh later
+    }
+  }
+
+  async function markAllAssignmentsRead() {
+    setAssignmentItems((current) =>
+      current.map((item) => ({
+        ...item,
+        unread: false,
+        readAt: item.readAt ?? new Date().toISOString(),
+      })),
+    );
+    setAssignmentsUnreadTotal(0);
+    try {
+      await api('/chat/notifications/read-all', { method: 'POST' });
+    } catch {
+      // ignore
+    }
+  }
+
+  async function openActivityHome(
+    tab: 'mentions' | 'threads' | 'assigned' = 'mentions',
+  ) {
     setActivityTab(tab);
     setHomeView('activity');
     setModalError('');
     if (activeIdRef.current) navigate('/chat');
     if (tab === 'mentions') {
       await loadMentionsHome();
+    } else if (tab === 'assigned') {
+      await loadAssignedHome();
     } else {
       await loadThreadsHome();
     }
@@ -1790,8 +1960,8 @@ export function MessengerPage() {
           className="inbox-search"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search…"
-              aria-label="Search channels and messages"
+              placeholder="Filter channels…"
+              aria-label="Filter channels and messages"
               title="Operators: from:name · in:#channel · has:file|image|link|audio · after:7d · before:2024-01-01"
         />
           </div>
@@ -1852,7 +2022,11 @@ export function MessengerPage() {
               type="button"
               className={`inbox-nav-row${
                 homeView === 'activity' ? ' is-active' : ''
-              }${mentionsUnreadTotal > 0 ? ' has-unread' : ''}`}
+              }${
+                mentionsUnreadTotal > 0 || assignmentsUnreadTotal > 0
+                  ? ' has-unread'
+                  : ''
+              }`}
               onClick={() => void openActivityHome('mentions')}
             >
               <span className="inbox-nav-icon" aria-hidden="true">
@@ -1864,8 +2038,10 @@ export function MessengerPage() {
                 </svg>
               </span>
               <span className="inbox-nav-label">Activity</span>
-              {mentionsUnreadTotal > 0 ? (
-                <span className="inbox-nav-badge">{mentionsUnreadTotal}</span>
+              {mentionsUnreadTotal + assignmentsUnreadTotal > 0 ? (
+                <span className="inbox-nav-badge">
+                  {mentionsUnreadTotal + assignmentsUnreadTotal}
+                </span>
               ) : null}
             </button>
             <button
@@ -2361,6 +2537,21 @@ export function MessengerPage() {
           <button
             type="button"
             role="tab"
+            aria-selected={activityTab === 'assigned'}
+            className={activityTab === 'assigned' ? 'on' : ''}
+            onClick={() => {
+              setActivityTab('assigned');
+              void loadAssignedHome();
+            }}
+          >
+            Assigned
+            {assignmentsUnreadTotal > 0 ? (
+              <span className="inbox-unread-pill">{assignmentsUnreadTotal}</span>
+            ) : null}
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={activityTab === 'threads'}
             className={activityTab === 'threads' ? 'on' : ''}
             onClick={() => {
@@ -2419,6 +2610,65 @@ export function MessengerPage() {
                       <span className="threads-home-snippet">
                         {messageSnippet(item.message, me)}
                       </span>
+                    </InboxListRow>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        ) : activityTab === 'assigned' ? (
+          <>
+            <div className="activity-assigned-toolbar">
+              {assignmentsUnreadTotal > 0 ? (
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => void markAllAssignmentsRead()}
+                >
+                  Mark all read
+                </button>
+              ) : null}
+            </div>
+            {assignmentsBusy ? <p className="muted">Loading assignments…</p> : null}
+            {!assignmentsBusy && assignmentItems.length === 0 ? (
+              <p className="muted">
+                When someone assigns you a list task, it shows up here.
+              </p>
+            ) : null}
+            <ul className="threads-home-list activity-mentions-list">
+              {assignmentItems.map((item) => {
+                const actor = displayName(byUserId.get(item.actorId));
+                const listName =
+                  typeof item.meta?.listName === 'string'
+                    ? item.meta.listName
+                    : 'List';
+                return (
+                  <li key={item.id}>
+                    <InboxListRow
+                      className={item.unread ? 'unread' : ''}
+                      onClick={() => {
+                        void markAssignmentRead(item);
+                        setHomeView(null);
+                        if (item.conversationId) {
+                          navigate(
+                            `/chat/${item.conversationId}?tab=lists`,
+                          );
+                        }
+                      }}
+                    >
+                      <div className="threads-home-meta">
+                        <UserAvatar
+                          profile={byUserId.get(item.actorId)}
+                          name={actor}
+                          size="sm"
+                        />
+                        <strong>{actor}</strong>
+                        <span className="muted">
+                          assigned you a task in {listName}
+                        </span>
+                        <RelativeTime value={item.createdAt} />
+                      </div>
+                      <span className="threads-home-snippet">{item.body}</span>
                     </InboxListRow>
                   </li>
                 );

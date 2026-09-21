@@ -75,7 +75,10 @@ export function PeoplePicker({
         })}
         {visible.length === 0 ? (
           <p className="muted empty">
-            {emptyHint || 'No people match that search.'}
+            {emptyHint ||
+              (people.length === 0
+                ? 'No other people in this workspace yet. Invite teammates from Profile, or switch to a workspace that has members.'
+                : 'No people match that search.')}
           </p>
         ) : null}
       </div>

@@ -55,6 +55,11 @@ import {
   setMessageDraft,
 } from '../../lib/messageDrafts';
 import { downloadMedia, openMedia as openAttachmentMedia } from '../../lib/downloadMedia';
+import {
+  loadChannelNotificationMode,
+  saveChannelNotificationMode,
+  type ChannelNotifyMode,
+} from '../../lib/notifications';
 import { useDirectory } from '../../people/useDirectory';
 import type {
   ChatMessage,
@@ -73,6 +78,58 @@ import { ChannelTabs, type ChannelTab } from './ChannelTabs';
 
 const DELETE_FOR_EVERYONE_MS = Number.POSITIVE_INFINITY;
 const EDIT_WINDOW_MS = 15 * 60 * 1000;
+const GROUP_WINDOW_MS = 5 * 60 * 1000;
+
+/** Slack-style: same author within 5 minutes → continuation (no avatar/name). */
+function isMessageContinuation(
+  previous: ChatMessage | undefined,
+  current: ChatMessage,
+): boolean {
+  if (!previous) return false;
+  if (previous.type === 'call' || current.type === 'call') return false;
+  if (previous.deletedForEveryone || current.deletedForEveryone) return false;
+  if (current.replyTo) return false;
+  const prevBot = previous.botUsername?.trim() || null;
+  const currBot = current.botUsername?.trim() || null;
+  if (Boolean(prevBot) !== Boolean(currBot)) return false;
+  if (prevBot && currBot && prevBot !== currBot) return false;
+  if (!prevBot && previous.senderId !== current.senderId) return false;
+  const prevAt = new Date(previous.createdAt).getTime();
+  const currAt = new Date(current.createdAt).getTime();
+  if (!Number.isFinite(prevAt) || !Number.isFinite(currAt)) return false;
+  return currAt - prevAt < GROUP_WINDOW_MS;
+}
+
+function sameCalendarDay(a: string, b: string): boolean {
+  const left = new Date(a);
+  const right = new Date(b);
+  if (Number.isNaN(left.getTime()) || Number.isNaN(right.getTime())) return false;
+  return (
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate()
+  );
+}
+
+function dayDividerLabel(iso: string): string {
+  const then = new Date(iso);
+  if (Number.isNaN(then.getTime())) return '';
+  const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const startThen = new Date(then.getFullYear(), then.getMonth(), then.getDate());
+  const diffDays = Math.round(
+    (startToday.getTime() - startThen.getTime()) / (24 * 60 * 60 * 1000),
+  );
+  if (diffDays === 0) return 'Today';
+  if (diffDays === 1) return 'Yesterday';
+  return then.toLocaleDateString(undefined, {
+    weekday: 'long',
+    month: 'long',
+    day: 'numeric',
+    year: then.getFullYear() === now.getFullYear() ? undefined : 'numeric',
+  });
+}
+
 const QUICK_REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🙏'] as const;
 const MORE_REACTIONS = [
   '🎉',
@@ -500,6 +557,7 @@ export function ThreadView() {
   const [searchParams, setSearchParams] = useSearchParams();
   const focusMessageId = searchParams.get('focus');
   const threadParam = searchParams.get('thread');
+  const tabParam = searchParams.get('tab');
   const { session } = useAuth();
   const me = session?.user.id;
   const navigate = useNavigate();
@@ -550,6 +608,11 @@ export function ThreadView() {
   const [pinnedMessages, setPinnedMessages] = useState<ChatMessage[]>([]);
   const [pinnedBannerOpen, setPinnedBannerOpen] = useState(false);
   const [mentionJumpId, setMentionJumpId] = useState<string | null>(null);
+  const [unreadDividerId, setUnreadDividerId] = useState<string | null>(null);
+  const [channelNotifyMode, setChannelNotifyMode] =
+    useState<ChannelNotifyMode>('default');
+  const [notifyMenuOpen, setNotifyMenuOpen] = useState(false);
+  const [channelNotifyBusy, setChannelNotifyBusy] = useState(false);
   const [mentionBannerDismissed, setMentionBannerDismissed] = useState(false);
   const [mediaOpen, setMediaOpen] = useState(false);
   const [mediaKind, setMediaKind] = useState<MediaKindTab>('all');
@@ -561,6 +624,7 @@ export function ThreadView() {
   const [channelTab, setChannelTab] = useState<ChannelTab>('messages');
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
   const toolsMenuRef = useRef<HTMLDivElement | null>(null);
+  const notifyMenuRef = useRef<HTMLDivElement | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<ChatMessage[]>([]);
   const [searchBusy, setSearchBusy] = useState(false);
@@ -867,7 +931,7 @@ export function ThreadView() {
     setMessages((current) => (prepend ? [...batch, ...current] : batch));
     setHasOlder(history.data.meta.hasNextPage);
     setMessagePage(page);
-    return history;
+    return batch;
   }
 
   async function loadPinned() {
@@ -910,7 +974,10 @@ export function ThreadView() {
     setPinnedMessages([]);
     setPinnedBannerOpen(false);
     setMentionJumpId(null);
+    setUnreadDividerId(null);
     setMentionBannerDismissed(false);
+    setNotifyMenuOpen(false);
+    setChannelNotifyMode('default');
     setScheduledMessages([]);
     setScheduleOpen(false);
     setFormatToolbarOpen(false);
@@ -922,7 +989,7 @@ export function ThreadView() {
     setSavedOpen(false);
     setSavedItems([]);
     const conv = await api<Conversation>(`/chat/conversations/${id}`);
-    await loadHistory(1, false);
+    const historyBatch = await loadHistory(1, false);
     void loadPinned();
     void loadScheduled();
     setConversation({
@@ -943,6 +1010,38 @@ export function ThreadView() {
     setMentionJumpId(mentionJumpTarget);
     setMentionBannerDismissed(false);
     setLoading(false);
+
+    // Capture unread "New" divider before we mark the channel read.
+    const unreadCount = Math.max(
+      0,
+      inboxRow?.unreadCount ?? conv.data.unreadCount ?? 0,
+    );
+    const myMembership = conv.data.members.find((member) => member.userId === me);
+    const lastReadMs = myMembership?.lastReadAt
+      ? new Date(myMembership.lastReadAt).getTime()
+      : NaN;
+    const channelMessages = historyBatch.filter(
+      (item) => !item.threadRootId && item.type !== 'call',
+    );
+    let dividerId: string | null = null;
+    if (unreadCount > 0) {
+      if (Number.isFinite(lastReadMs)) {
+        const firstUnread = channelMessages.find(
+          (item) =>
+            item.senderId !== me &&
+            new Date(item.createdAt).getTime() > lastReadMs,
+        );
+        dividerId = firstUnread?.id ?? null;
+      }
+      if (!dividerId) {
+        const fromEnd = channelMessages.slice(-unreadCount);
+        dividerId = fromEnd.find((item) => item.senderId !== me)?.id ?? null;
+      }
+    }
+    setUnreadDividerId(dividerId);
+
+    void loadChannelNotificationMode(id).then(setChannelNotifyMode);
+
     if (!holdAutoSeenRef.current) {
       clearUnread(id);
     }
@@ -1422,6 +1521,31 @@ export function ThreadView() {
       window.removeEventListener('resize', onResize);
     };
   }, [toolsMenuOpen]);
+
+  useEffect(() => {
+    if (!notifyMenuOpen) {
+      return;
+    }
+    const onPointerDown = (event: Event) => {
+      const root = notifyMenuRef.current;
+      if (root && !root.contains(event.target as Node)) {
+        setNotifyMenuOpen(false);
+      }
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setNotifyMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('touchstart', onPointerDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('touchstart', onPointerDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [notifyMenuOpen]);
 
   useEffect(() => {
     if (!menuMessageId && !reactPickerId) {
@@ -1951,6 +2075,39 @@ export function ThreadView() {
     // Intentionally only when media query appears after load.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchParams, loading, conversation?.id]);
+
+  useEffect(() => {
+    if (!tabParam || loading || !conversation) {
+      return;
+    }
+    const allowed: ChannelTab[] = [
+      'messages',
+      'files',
+      'pins',
+      'canvas',
+      'lists',
+      'clips',
+      'workflows',
+      'apps',
+      'connect',
+    ];
+    if (!allowed.includes(tabParam as ChannelTab)) {
+      return;
+    }
+    if (tabParam === 'connect' && conversation.type !== 'group') {
+      return;
+    }
+    setChannelTab(tabParam as ChannelTab);
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        next.delete('tab');
+        return next;
+      },
+      { replace: true },
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabParam, loading, conversation?.id]);
 
   async function handleDownloadMedia(message: ChatMessage) {
     if (!message.attachment?.url) {
@@ -2519,21 +2676,47 @@ export function ThreadView() {
     emit('chat:typing', { conversationId: id, typing: isTyping });
   }
 
-  async function toggleMute() {
-    if (!conversation) {
-      return;
-    }
+  async function applyChannelNotifyMode(mode: ChannelNotifyMode) {
+    if (!conversation || !id) return;
+    setChannelNotifyBusy(true);
+    setActionError('');
     try {
-      const response = await api<Conversation>(`/chat/conversations/${id}/mute`, {
-        method: 'POST',
-        body: JSON.stringify({ muted: !conversation.muted }),
-      });
-      setConversation(response.data);
-      void refreshInbox();
+      const saved = await saveChannelNotificationMode(id, mode);
+      setChannelNotifyMode(saved);
+      // Keep mute flag aligned with "Nothing" for inbox quiet styling.
+      if (mode === 'none' && !conversation.muted) {
+        const response = await api<Conversation>(`/chat/conversations/${id}/mute`, {
+          method: 'POST',
+          body: JSON.stringify({ muted: true }),
+        });
+        setConversation(response.data);
+        void refreshInbox();
+      } else if (mode !== 'none' && conversation.muted) {
+        const response = await api<Conversation>(`/chat/conversations/${id}/mute`, {
+          method: 'POST',
+          body: JSON.stringify({ muted: false }),
+        });
+        setConversation(response.data);
+        void refreshInbox();
+      }
+      setNotifyMenuOpen(false);
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : 'Could not update mute');
+      setActionError(
+        err instanceof Error ? err.message : 'Could not update notifications',
+      );
+    } finally {
+      setChannelNotifyBusy(false);
     }
   }
+
+  const channelNotifyLabel =
+    conversation?.muted || channelNotifyMode === 'none'
+      ? 'Muted'
+      : channelNotifyMode === 'mentions'
+        ? 'Mentions'
+        : channelNotifyMode === 'all'
+          ? 'All msgs'
+          : null;
 
   async function togglePin() {
     if (!conversation) {
@@ -3091,6 +3274,32 @@ export function ThreadView() {
     }
   }
 
+  useEffect(() => {
+    const onCommand = (event: Event) => {
+      const detail = (event as CustomEvent<{ action?: string }>).detail;
+      const action = detail?.action;
+      if (action === 'focus-composer') {
+        composerInputRef.current?.focus();
+        return;
+      }
+      if (action === 'mark-unread') {
+        const list = messagesRef.current.filter(
+          (item) => !item.deletedForEveryone,
+        );
+        if (list.length === 0) return;
+        const lastOther = [...list]
+          .reverse()
+          .find((item) => !me || item.senderId !== me);
+        const target = lastOther ?? list[list.length - 1];
+        if (target) {
+          void markMessageUnread(target);
+        }
+      }
+    };
+    window.addEventListener('relay:command', onCommand);
+    return () => window.removeEventListener('relay:command', onCommand);
+  }, [me]);
+
   function positionMessageMenu(anchor: HTMLElement, alignEnd: boolean) {
     const rect = anchor.getBoundingClientRect();
     const menuWidth = 220;
@@ -3279,7 +3488,9 @@ export function ThreadView() {
                 </span>
               ) : null}
               {title}
-              {conversation.muted ? <span className="mute-pill">Muted</span> : null}
+              {channelNotifyLabel ? (
+                <span className="mute-pill">{channelNotifyLabel}</span>
+              ) : null}
               {conversation.announceOnly ? (
                 <span
                   className="announce-pill"
@@ -3442,32 +3653,74 @@ export function ThreadView() {
                 />
               </svg>
             </button>
-            <button
-              className={`ghost thread-tool-btn${conversation.muted ? ' active' : ''}`}
-              type="button"
-              aria-label={conversation.muted ? 'Unmute chat' : 'Mute chat'}
-              title={conversation.muted ? 'Unmute' : 'Mute'}
-              onClick={() => {
-                setToolsMenuOpen(false);
-                void toggleMute();
-              }}
-            >
-              {conversation.muted ? (
-                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-                  <path
-                    fill="currentColor"
-                    d="M4.3 3 3 4.3 7.7 9H4v6h3l5 5v-6.7l4.5 4.5c-.7.5-1.5.9-2.5 1.1v2.1a8.9 8.9 0 0 0 4.1-1.8L19.7 21 21 19.7 4.3 3zM12 4 9.9 6.1 12 8.2V4zm7.6 6.6-1.5 1.5A4.9 4.9 0 0 1 17 12c0 1.2-.4 2.3-1.2 3.1l1.4 1.4A6.9 6.9 0 0 0 19 12c0-.9-.2-1.7-.4-2.4z"
-                  />
-                </svg>
-              ) : (
-                <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-                  <path
-                    fill="currentColor"
-                    d="M12 3 7 8H4v8h3l5 5V3zm5.5 9c0 1.8-.8 3.4-2 4.5v2.2A6.9 6.9 0 0 0 19.5 12 6.9 6.9 0 0 0 15.5 5.3v2.2c1.2 1.1 2 2.7 2 4.5z"
-                  />
-                </svg>
-              )}
-            </button>
+            <div className="thread-notify-wrap" ref={notifyMenuRef}>
+              <button
+                className={`ghost thread-tool-btn${
+                  conversation.muted ||
+                  channelNotifyMode === 'mentions' ||
+                  channelNotifyMode === 'none'
+                    ? ' active'
+                    : ''
+                }${notifyMenuOpen ? ' open' : ''}`}
+                type="button"
+                aria-label="Notification preferences"
+                aria-expanded={notifyMenuOpen}
+                aria-haspopup="menu"
+                title="Notifications"
+                disabled={channelNotifyBusy}
+                onClick={() => {
+                  setToolsMenuOpen(false);
+                  setNotifyMenuOpen((open) => !open);
+                }}
+              >
+                {conversation.muted || channelNotifyMode === 'none' ? (
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M4.3 3 3 4.3 7.7 9H4v6h3l5 5v-6.7l4.5 4.5c-.7.5-1.5.9-2.5 1.1v2.1a8.9 8.9 0 0 0 4.1-1.8L19.7 21 21 19.7 4.3 3zM12 4 9.9 6.1 12 8.2V4zm7.6 6.6-1.5 1.5A4.9 4.9 0 0 1 17 12c0 1.2-.4 2.3-1.2 3.1l1.4 1.4A6.9 6.9 0 0 0 19 12c0-.9-.2-1.7-.4-2.4z"
+                    />
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                    <path
+                      fill="currentColor"
+                      d="M12 3 7 8H4v8h3l5 5V3zm5.5 9c0 1.8-.8 3.4-2 4.5v2.2A6.9 6.9 0 0 0 19.5 12 6.9 6.9 0 0 0 15.5 5.3v2.2c1.2 1.1 2 2.7 2 4.5z"
+                    />
+                  </svg>
+                )}
+              </button>
+              {notifyMenuOpen ? (
+                <div className="thread-notify-menu" role="menu">
+                  <p className="thread-notify-menu-label">Get notified for</p>
+                  {(
+                    [
+                      ['default', 'Workspace default'],
+                      ['all', 'All messages'],
+                      ['mentions', 'Mentions & keywords'],
+                      ['none', 'Nothing'],
+                    ] as const
+                  ).map(([value, label]) => {
+                    const selected =
+                      value === 'none'
+                        ? conversation.muted || channelNotifyMode === 'none'
+                        : !conversation.muted && channelNotifyMode === value;
+                    return (
+                      <button
+                        key={value}
+                        type="button"
+                        role="menuitemradio"
+                        aria-checked={selected}
+                        className={selected ? 'is-selected' : ''}
+                        disabled={channelNotifyBusy}
+                        onClick={() => void applyChannelNotifyMode(value)}
+                      >
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+            </div>
             <button
               className="ghost thread-tool-btn"
               type="button"
@@ -3475,6 +3728,7 @@ export function ThreadView() {
               title={conversation.type === 'group' ? 'Details' : 'Chat info'}
               onClick={() => {
                 setToolsMenuOpen(false);
+                setNotifyMenuOpen(false);
                 navigate(`/chat/${id}/details`);
               }}
             >
@@ -3496,7 +3750,10 @@ export function ThreadView() {
             aria-expanded={toolsMenuOpen}
             aria-haspopup="menu"
             title="More"
-            onClick={() => setToolsMenuOpen((open) => !open)}
+            onClick={() => {
+              setNotifyMenuOpen(false);
+              setToolsMenuOpen((open) => !open);
+            }}
           >
             <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
               <path
@@ -3552,10 +3809,10 @@ export function ThreadView() {
                 role="menuitem"
                 onClick={() => {
                   setToolsMenuOpen(false);
-                  void toggleMute();
+                  setNotifyMenuOpen(true);
                 }}
               >
-                {conversation.muted ? 'Unmute' : 'Mute'}
+                Notifications…
               </button>
               <button
                 type="button"
@@ -3934,7 +4191,27 @@ export function ThreadView() {
         ) : null}
         {messages
           .filter((message) => !message.threadRootId)
-          .map((message) => {
+          .map((message, index, channelList) => {
+          let previousNonCall: ChatMessage | undefined;
+          for (let i = index - 1; i >= 0; i -= 1) {
+            const candidate = channelList[i];
+            if (candidate && candidate.type !== 'call') {
+              previousNonCall = candidate;
+              break;
+            }
+          }
+          const showDayDivider =
+            !previousNonCall ||
+            !sameCalendarDay(previousNonCall.createdAt, message.createdAt);
+          const showUnreadDivider = unreadDividerId === message.id;
+          const immediatePrev = index > 0 ? channelList[index - 1] : undefined;
+          const continuation =
+            message.type !== 'call' &&
+            !showDayDivider &&
+            !showUnreadDivider &&
+            immediatePrev?.type !== 'call' &&
+            isMessageContinuation(previousNonCall, message);
+
           if (message.type === 'call' && !message.deletedForEveryone) {
             const history = parseCallHistoryBody(message.body);
             const label = history ? callHistoryLabel(history) : 'Call';
@@ -3944,8 +4221,18 @@ export function ThreadView() {
               canJoinOngoing &&
               ongoingLobby?.callId === history.callId;
             return (
+              <div key={message.id} className="wa-msg-block">
+                {showDayDivider ? (
+                  <div className="wa-day-divider" role="separator">
+                    <span>{dayDividerLabel(message.createdAt)}</span>
+                  </div>
+                ) : null}
+                {showUnreadDivider ? (
+                  <div className="wa-unread-divider" role="separator" aria-label="New messages">
+                    <span>New</span>
+                  </div>
+                ) : null}
               <div
-                key={message.id}
                 className="wa-call-history"
                 ref={(node) => {
                   if (node) {
@@ -3971,6 +4258,7 @@ export function ThreadView() {
                     </button>
                   ) : null}
                 </div>
+              </div>
               </div>
             );
           }
@@ -4013,11 +4301,21 @@ export function ThreadView() {
               ? message.body
               : null;
           return (
+            <div key={message.id} className="wa-msg-block">
+              {showDayDivider ? (
+                <div className="wa-day-divider" role="separator">
+                  <span>{dayDividerLabel(message.createdAt)}</span>
+                </div>
+              ) : null}
+              {showUnreadDivider ? (
+                <div className="wa-unread-divider" role="separator" aria-label="New messages">
+                  <span>New</span>
+                </div>
+              ) : null}
             <div
-              key={message.id}
               className={`${mine ? 'wa-row mine' : 'wa-row theirs'}${
                 isBot ? ' is-bot' : ''
-              }${
+              }${continuation ? ' is-continuation' : ''}${
                 highlightId === message.id ? ' highlight' : ''
               }${
                 !mine && me && (message.mentions ?? []).includes(me)
@@ -4092,6 +4390,9 @@ export function ThreadView() {
                 touchStartRef.current = null;
               }}
             >
+              {continuation ? (
+                <span className="wa-msg-avatar-spacer" aria-hidden="true" />
+              ) : (
               <UserHoverCard
                 userId={message.senderId}
                 profile={isBot ? null : byUserId.get(message.senderId)}
@@ -4108,6 +4409,7 @@ export function ThreadView() {
                   className="wa-msg-avatar"
                 />
               </UserHoverCard>
+              )}
               <div className={`wa-msg${mine ? ' mine' : ' theirs'}`}>
               <div
                 className={`${mine ? 'wa-bubble mine' : 'wa-bubble theirs'}${
@@ -4128,6 +4430,14 @@ export function ThreadView() {
                   setMenuMessageId(message.id);
                 }}
               >
+                {continuation ? (
+                  <time
+                    className="wa-author-time wa-author-time-hover"
+                    dateTime={message.createdAt}
+                  >
+                    {clock(message.createdAt)}
+                  </time>
+                ) : (
                 <span className={`wa-author${isBot ? ' wa-author-bot' : ''}`}>
                   {isBot ? (
                     <>
@@ -4151,6 +4461,7 @@ export function ThreadView() {
                     {clock(message.createdAt)}
                   </time>
                 </span>
+                )}
                 {message.forwarded && !message.deletedForEveryone ? (
                   <span className="wa-forwarded">Forwarded</span>
                 ) : null}
@@ -4550,6 +4861,7 @@ export function ThreadView() {
                 </button>
               ) : null}
               </div>
+            </div>
             </div>
           );
         })}

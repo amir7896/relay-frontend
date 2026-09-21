@@ -1,8 +1,14 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from 'react';
 import { createPortal } from 'react-dom';
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
-import type { UserProfile } from '../api/types';
+import type { Presence, PresenceStatus, UserProfile } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
 import { useOrganization } from '../organizations/OrganizationContext';
 import { initials } from '../lib/format';
@@ -14,6 +20,8 @@ import { DemoTour } from './DemoTour';
 import { ThemeToggle } from './ThemeToggle';
 import { VoiceCallOverlay } from './VoiceCallOverlay';
 import { CommandPalette } from './CommandPalette';
+import { KeyboardShortcuts } from './KeyboardShortcuts';
+import { StatusTray } from './StatusTray';
 import { useWorkspace } from '../theme/WorkspaceContext';
 
 type NavItem = {
@@ -111,6 +119,9 @@ export function AppShell() {
   const [debugVerifyUrl, setDebugVerifyUrl] = useState('');
   const [verifyBusy, setVerifyBusy] = useState(false);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  const [statusOpen, setStatusOpen] = useState(false);
+  const [myPresence, setMyPresence] = useState<PresenceStatus>('online');
+  const [myCustomStatus, setMyCustomStatus] = useState<string | null>(null);
   const [orgModalOpen, setOrgModalOpen] = useState(false);
   const [newOrgName, setNewOrgName] = useState('');
   const [orgError, setOrgError] = useState('');
@@ -128,6 +139,12 @@ export function AppShell() {
   useEffect(() => {
     setMenuOpen(false);
   }, [location.pathname]);
+
+  useEffect(() => {
+    const onOpenStatus = () => setStatusOpen(true);
+    window.addEventListener('relay:open-status', onOpenStatus);
+    return () => window.removeEventListener('relay:open-status', onOpenStatus);
+  }, []);
 
   useEffect(() => {
     document.body.classList.toggle('nav-open', menuOpen);
@@ -154,7 +171,13 @@ export function AppShell() {
     };
   }, [session?.user.id, activeOrganizationId, location.pathname]);
 
+  const onPresenceChange = useCallback((presence: Presence) => {
+    setMyPresence(presence.status === 'offline' ? 'online' : presence.status);
+    setMyCustomStatus(presence.customStatus?.trim() || null);
+  }, []);
+
   async function onLogout() {
+    setStatusOpen(false);
     await logout();
     navigate('/');
   }
@@ -261,16 +284,26 @@ export function AppShell() {
           <ThemeToggle />
           <button
             type="button"
-            className="ws-rail-avatar"
-            title={`${handle} · Sign out`}
-            aria-label="Sign out"
-            onClick={() => void onLogout()}
+            className={`ws-rail-avatar${statusOpen ? ' open' : ''}`}
+            title={
+              myCustomStatus
+                ? `${handle} · ${myCustomStatus}`
+                : `${handle} · Set status`
+            }
+            aria-label="Open status menu"
+            aria-haspopup="dialog"
+            aria-expanded={statusOpen}
+            onClick={() => setStatusOpen((open) => !open)}
           >
             {avatarUrl ? (
               <img src={avatarUrl} alt="" />
             ) : (
               <span>{initials(handle)}</span>
             )}
+            <span
+              className={`ws-rail-presence presence on presence-${myPresence}`}
+              aria-hidden="true"
+            />
           </button>
         </div>
       </aside>
@@ -326,6 +359,18 @@ export function AppShell() {
               <Outlet />
               <VoiceCallOverlay />
               <CommandPalette />
+              <KeyboardShortcuts />
+              {session?.user.id ? (
+                <StatusTray
+                  open={statusOpen}
+                  onClose={() => setStatusOpen(false)}
+                  userId={session.user.id}
+                  handle={handle}
+                  avatarUrl={avatarUrl}
+                  onLogout={() => void onLogout()}
+                  onPresenceChange={onPresenceChange}
+                />
+              ) : null}
               <DemoTour />
             </VoiceCallProvider>
           </ChatSocketProvider>

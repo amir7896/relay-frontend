@@ -548,19 +548,21 @@ export function AppsPanel({ conversationId }: { conversationId: string }) {
               const isInstalled = installedMap.has(app.key);
               return (
                 <article key={app.key} className="app-card app-card-bot">
-                  <span className="app-card-icon">
-                    {app.name.slice(0, 1).toUpperCase()}
-                  </span>
-                  <div>
-                    <h4>{app.name}</h4>
-                    <p className="muted">{app.description}</p>
-                    {isInstalled ? (
-                      <p className="app-card-meta">
-                        {formatBotSchedule(
-                          installedMap.get(app.key)?.config as BotConfig,
-                        ) || 'Installed'}
-                      </p>
-                    ) : null}
+                  <div className="app-card-main">
+                    <span className="app-card-icon">
+                      {app.name.slice(0, 1).toUpperCase()}
+                    </span>
+                    <div className="app-card-body">
+                      <h4>{app.name}</h4>
+                      <p className="muted">{app.description}</p>
+                      {isInstalled ? (
+                        <p className="app-card-meta">
+                          {formatBotSchedule(
+                            installedMap.get(app.key)?.config as BotConfig,
+                          ) || 'Installed'}
+                        </p>
+                      ) : null}
+                    </div>
                   </div>
                   <div className="app-card-actions">
                     <button
@@ -605,32 +607,34 @@ export function AppsPanel({ conversationId }: { conversationId: string }) {
               const connected = Boolean(app.connected || installedApp?.connected);
               return (
                 <article key={app.key} className="app-card">
-                  <span className="app-card-icon">
-                    {app.iconUrl ? (
-                      <img src={app.iconUrl} alt="" />
-                    ) : (
-                      app.name.slice(0, 1).toUpperCase()
-                    )}
-                  </span>
-                  <div>
-                    <h4>{app.name}</h4>
-                    <p className="muted">
-                      {app.description || 'Workspace integration'}
-                    </p>
-                    {connected ? (
-                      <p className="app-card-meta">
-                        Connected
-                        {app.providerAccountName ||
-                        installedApp?.providerAccountName
-                          ? ` · ${
-                              app.providerAccountName ||
-                              installedApp?.providerAccountName
-                            }`
-                          : ''}
+                  <div className="app-card-main">
+                    <span className="app-card-icon">
+                      {app.iconUrl ? (
+                        <img src={app.iconUrl} alt="" />
+                      ) : (
+                        app.name.slice(0, 1).toUpperCase()
+                      )}
+                    </span>
+                    <div className="app-card-body">
+                      <h4>{app.name}</h4>
+                      <p className="muted">
+                        {app.description || 'Workspace integration'}
                       </p>
-                    ) : (
-                      <p className="app-card-meta">OAuth required</p>
-                    )}
+                      {connected ? (
+                        <p className="app-card-meta">
+                          Connected
+                          {app.providerAccountName ||
+                          installedApp?.providerAccountName
+                            ? ` · ${
+                                app.providerAccountName ||
+                                installedApp?.providerAccountName
+                              }`
+                            : ''}
+                        </p>
+                      ) : (
+                        <p className="app-card-meta">OAuth required</p>
+                      )}
+                    </div>
                   </div>
                   <div className="app-card-actions">
                     {connected ? (

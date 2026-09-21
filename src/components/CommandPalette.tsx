@@ -160,6 +160,24 @@ export function CommandPalette() {
 
     const actions: PaletteItem[] = [
       {
+        id: 'action-shortcuts',
+        group: 'Actions',
+        title: 'Keyboard shortcuts',
+        subtitle: 'Jump channels, unreads, Threads, and more',
+        run: () => {
+          window.dispatchEvent(new CustomEvent('relay:open-shortcuts'));
+        },
+      },
+      {
+        id: 'action-status',
+        group: 'Actions',
+        title: 'Update your status',
+        subtitle: 'Emoji, Away / DND, clear after',
+        run: () => {
+          window.dispatchEvent(new CustomEvent('relay:open-status'));
+        },
+      },
+      {
         id: 'action-home',
         group: 'Actions',
         title: 'Go to Home',

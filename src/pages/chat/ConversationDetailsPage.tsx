@@ -623,15 +623,21 @@ export function ConversationDetailsPage() {
   }
 
   async function toggleMute() {
-    if (!conversation) {
+    if (!conversation || !id) {
       return;
     }
     try {
+      const nextMuted = !conversation.muted;
       const response = await api<Conversation>(`/chat/conversations/${id}/mute`, {
         method: 'POST',
-        body: JSON.stringify({ muted: !conversation.muted }),
+        body: JSON.stringify({ muted: nextMuted }),
       });
       setConversation(response.data);
+      const synced = await saveChannelNotificationMode(
+        id,
+        nextMuted ? 'none' : 'default',
+      );
+      setChannelNotifyMode(synced);
       void refreshInbox();
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not update mute');
@@ -639,12 +645,27 @@ export function ConversationDetailsPage() {
   }
 
   async function updateChannelNotifyMode(mode: ChannelNotifyMode) {
-    if (!id) return;
+    if (!id || !conversation) return;
     setChannelNotifyBusy(true);
     setActionError('');
     try {
       const saved = await saveChannelNotificationMode(id, mode);
       setChannelNotifyMode(saved);
+      if (mode === 'none' && !conversation.muted) {
+        const response = await api<Conversation>(`/chat/conversations/${id}/mute`, {
+          method: 'POST',
+          body: JSON.stringify({ muted: true }),
+        });
+        setConversation(response.data);
+        void refreshInbox();
+      } else if (mode !== 'none' && conversation.muted) {
+        const response = await api<Conversation>(`/chat/conversations/${id}/mute`, {
+          method: 'POST',
+          body: JSON.stringify({ muted: false }),
+        });
+        setConversation(response.data);
+        void refreshInbox();
+      }
       flashSaved('Notification preference updated');
     } catch (err) {
       setActionError(
@@ -918,7 +939,7 @@ export function ConversationDetailsPage() {
                     <option value="default">Default (workspace setting)</option>
                     <option value="all">All messages</option>
                     <option value="mentions">Mentions &amp; keywords</option>
-                    <option value="none">Nothing (keywords still alert)</option>
+                    <option value="none">Nothing (mute channel)</option>
                   </select>
                 </label>
                 <label className="disappearing-field">
@@ -1108,7 +1129,7 @@ export function ConversationDetailsPage() {
                     <option value="default">Default (workspace setting)</option>
                     <option value="all">All messages</option>
                     <option value="mentions">Mentions &amp; keywords</option>
-                    <option value="none">Nothing (keywords still alert)</option>
+                    <option value="none">Nothing (mute channel)</option>
                   </select>
                 </label>
                 {canManage ? (

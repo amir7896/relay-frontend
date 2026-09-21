@@ -139,7 +139,13 @@ self.addEventListener('notificationclick', (event) => {
   const data = event.notification.data || {};
   const conversationId = data.conversationId;
   const path = conversationId
-    ? `/chat/${encodeURIComponent(conversationId)}${data.type === 'call' ? '?incomingCall=1' : ''}`
+    ? `/chat/${encodeURIComponent(conversationId)}${
+        data.type === 'call'
+          ? '?incomingCall=1'
+          : data.type === 'list_assignment'
+            ? '?tab=lists'
+            : ''
+      }`
     : '/chat';
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clients) => {

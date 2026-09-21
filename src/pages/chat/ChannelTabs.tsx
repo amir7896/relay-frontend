@@ -84,11 +84,16 @@ export function ChannelTabs({
         <div
           className={`channel-tab-panel${
             activeTab === 'lists' ? ' is-lists' : ''
-          }`}
+          }${activeTab === 'apps' ? ' is-apps' : ''}`}
           role="tabpanel"
         >
           {activeTab === 'canvas' ? <CanvasPanel conversationId={conversationId} /> : null}
-          {activeTab === 'lists' ? <ListsPanel conversationId={conversationId} /> : null}
+          {activeTab === 'lists' ? (
+            <ListsPanel
+              conversationId={conversationId}
+              conversation={conversation}
+            />
+          ) : null}
           {activeTab === 'clips' ? <ClipsPanel conversationId={conversationId} /> : null}
           {activeTab === 'workflows' ? (
             <WorkflowsPanel conversationId={conversationId} />
