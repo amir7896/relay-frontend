@@ -958,7 +958,7 @@ export function ConversationDetailsPage() {
                   </select>
                 </label>
                 <Link className="ghost full details-link-btn" to={`/chat/${id}?media=all`}>
-                  Media (photos, files, voice)
+                  Files (photos, documents, voice)
                 </Link>
                 <button
                   className="ghost full"
@@ -1150,7 +1150,7 @@ export function ConversationDetailsPage() {
                   </label>
                 ) : null}
                 <Link className="ghost full details-link-btn" to={`/chat/${id}?media=all`}>
-                  Media (photos, files, voice)
+                  Files (photos, documents, voice)
                 </Link>
                 <button
                   className="ghost full"

@@ -166,7 +166,9 @@ export function StatusTray({
           customStatus?: string | null;
           statusClearsAt?: string | null;
         } = {};
-        if (next.status !== undefined) body.status = next.status;
+        // Always send current availability so clear-after-only patches
+        // do not reset Away/Busy/DND to Online on the gateway.
+        body.status = next.status ?? status;
         if (next.customStatus !== undefined) {
           body.customStatus = next.customStatus;
         }
@@ -186,7 +188,7 @@ export function StatusTray({
         setBusy(false);
       }
     },
-    [applyPresence, clearAfter],
+    [applyPresence, clearAfter, status],
   );
 
   const clearStatusNow = useCallback(async () => {
@@ -352,7 +354,10 @@ export function StatusTray({
                 }`}
                 disabled={busy}
                 onClick={() => {
-                  void patchPresence({ status: item.value });
+                  void patchPresence({
+                    status: item.value,
+                    clearOption: clearAfter,
+                  });
                 }}
               >
                 <span
@@ -464,6 +469,7 @@ export function StatusTray({
                 setClearAfter(option);
                 const at = computeClearAt(option);
                 setClearsAtLabel(at ? formatUntilPhrase(at) : null);
+                void patchPresence({ clearOption: option });
               }}
             >
               {CLEAR_OPTIONS.map((option) => (

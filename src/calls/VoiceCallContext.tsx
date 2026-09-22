@@ -31,7 +31,7 @@ import {
   audioConstraintsForMode,
   type VoiceClarityMode,
 } from './callVoiceClarity';
-import { openCallPip, supportsDocumentPip, type CallPipHandle } from './callPip';
+import { copyStylesToPip, openCallPip, supportsDocumentPip, type CallPipHandle } from './callPip';
 import type {
   CallAcceptedEvent,
   CallDeclinedEvent,
@@ -76,6 +76,8 @@ type VoiceCallContextValue = {
   screenSharerId: string | null;
   minimized: boolean;
   pipActive: boolean;
+  /** Document PiP window when active (for portaling the mini bubble). */
+  pipWindow: Window | null;
   supportsPip: boolean;
   remoteSpeaking: boolean;
   speakingPeerIds: string[];
@@ -155,6 +157,7 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
   const [screenSharerId, setScreenSharerId] = useState<string | null>(null);
   const [minimized, setMinimized] = useState(false);
   const [pipActive, setPipActive] = useState(false);
+  const [pipWindow, setPipWindow] = useState<Window | null>(null);
   const [remoteSpeaking, setRemoteSpeaking] = useState(false);
   const [speakingPeerIds, setSpeakingPeerIds] = useState<string[]>([]);
   const [connectionState, setConnectionState] =
@@ -415,6 +418,29 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     setRemoteSpeaking(speakingPeerIds.length > 0);
   }, [speakingPeerIds]);
+
+  // Local speaking indicator (you).
+  useEffect(() => {
+    if (!me || !localStream) {
+      if (me) stopSpeakingMonitor(me);
+      return;
+    }
+    const hasAudio = localStream.getAudioTracks().some((track) => track.enabled);
+    if (!hasAudio || muted || forceMuted) {
+      stopSpeakingMonitor(me);
+      setSpeakingPeerIds((current) => current.filter((id) => id !== me));
+      return;
+    }
+    startSpeakingMonitor(me, localStream);
+    return () => stopSpeakingMonitor(me);
+  }, [
+    me,
+    localStream,
+    muted,
+    forceMuted,
+    startSpeakingMonitor,
+    stopSpeakingMonitor,
+  ]);
 
   const attachRemoteAudio = useCallback((peerId: string, stream: MediaStream) => {
     let audio = remoteAudioElements.current.get(peerId);
@@ -1518,6 +1544,7 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
   const exitPip = useCallback(() => {
     pipRef.current?.close();
     pipRef.current = null;
+    setPipWindow(null);
     setPipActive(false);
   }, []);
 
@@ -1526,16 +1553,26 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
       setMinimized(true);
       return;
     }
-    const handle = await openCallPip({ width: 300, height: 168 });
+    const handle = await openCallPip({ width: 340, height: 120 });
     if (!handle) {
       setMinimized(true);
       return;
     }
     pipRef.current = handle;
+    try {
+      copyStylesToPip(handle.window);
+      handle.window.document.body.classList.add('voice-call-pip-body');
+      handle.window.document.body.style.margin = '0';
+      handle.window.document.body.style.background = 'transparent';
+    } catch {
+      // styles best-effort
+    }
+    setPipWindow(handle.window);
     setPipActive(true);
     setMinimized(true);
     handle.window.addEventListener('pagehide', () => {
       pipRef.current = null;
+      setPipWindow(null);
       setPipActive(false);
     });
   }, []);
@@ -2027,6 +2064,7 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
       screenSharerId,
       minimized,
       pipActive,
+      pipWindow,
       supportsPip: supportsDocumentPip(),
       remoteSpeaking,
       speakingPeerIds,
@@ -2074,6 +2112,7 @@ export function VoiceCallProvider({ children }: { children: ReactNode }) {
       screenSharerId,
       minimized,
       pipActive,
+      pipWindow,
       remoteSpeaking,
       speakingPeerIds,
       connectionState,

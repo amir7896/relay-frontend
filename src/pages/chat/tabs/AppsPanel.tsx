@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { api } from '../../../api/client';
 import type { AppCatalogItem, Conversation, InstalledApp } from '../../../api/types';
 import { MrkdwnEditor } from '../../../components/MrkdwnEditor';
+import { SlashMarketplacePanel } from './SlashMarketplacePanel';
 
 const BOT_KEYS = new Set(['standup', 'dsu', 'daily-meeting']);
 
@@ -59,7 +60,14 @@ function emptyConfig(appKey: string, channelId: string): BotConfig {
   };
 }
 
-export function AppsPanel({ conversationId }: { conversationId: string }) {
+export function AppsPanel({
+  conversationId,
+  onTrySlashCommand,
+}: {
+  conversationId: string;
+  onTrySlashCommand?: (commandName: string) => void;
+}) {
+  const [appsSection, setAppsSection] = useState<'apps' | 'slash'>('apps');
   const [apps, setApps] = useState<AppCatalogItem[]>([]);
   const [installed, setInstalled] = useState<InstalledApp[]>([]);
   const [channels, setChannels] = useState<Conversation[]>([]);
@@ -298,13 +306,39 @@ export function AppsPanel({ conversationId }: { conversationId: string }) {
     <section className="feature-panel apps-panel">
       <div className="feature-panel-head">
         <div>
-          <h3>Apps</h3>
+          <h3>Apps & commands</h3>
           <p className="muted">
-            Schedule bots to post on selected weekdays at the set time, or use{' '}
-            <strong>Post now</strong> to send a prompt immediately.
+            Install bots and integrations, or browse the slash-command
+            marketplace for this workspace.
           </p>
         </div>
       </div>
+
+      <div className="apps-subnav" role="tablist" aria-label="Apps sections">
+        <button
+          type="button"
+          role="tab"
+          className={appsSection === 'apps' ? 'on' : ''}
+          aria-selected={appsSection === 'apps'}
+          onClick={() => setAppsSection('apps')}
+        >
+          Apps
+        </button>
+        <button
+          type="button"
+          role="tab"
+          className={appsSection === 'slash' ? 'on' : ''}
+          aria-selected={appsSection === 'slash'}
+          onClick={() => setAppsSection('slash')}
+        >
+          Slash commands
+        </button>
+      </div>
+
+      {appsSection === 'slash' ? (
+        <SlashMarketplacePanel onTryCommand={onTrySlashCommand} />
+      ) : (
+        <>
       {error ? <p className="error tab-notice">{error}</p> : null}
       {notice ? (
         <p className="muted tab-notice" role="status">
@@ -685,6 +719,8 @@ export function AppsPanel({ conversationId }: { conversationId: string }) {
           ) : null}
         </div>
       </div>
+        </>
+      )}
     </section>
   );
 }

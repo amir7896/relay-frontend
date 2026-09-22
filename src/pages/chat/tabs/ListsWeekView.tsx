@@ -59,6 +59,8 @@ type ListsWeekViewProps = {
   onWeekAnchorChange: (next: Date) => void;
   draggingId: string | null;
   dropDayKey: string | null;
+  selectedIssueId?: string | null;
+  onSelectIssue?: (itemId: string) => void;
   onDragStart: (event: DragEvent, item: ChannelListItem) => void;
   onDragEnd: () => void;
   onDayDragOver: (event: DragEvent, dayKey: string) => void;
@@ -73,6 +75,8 @@ export function ListsWeekView({
   onWeekAnchorChange,
   draggingId,
   dropDayKey,
+  selectedIssueId = null,
+  onSelectIssue,
   onDragStart,
   onDragEnd,
   onDayDragOver,
@@ -172,9 +176,10 @@ export function ListsWeekView({
                     key={item.id}
                     className={`list-week-chip status-${item.status}${
                       draggingId === item.id ? ' dragging' : ''
-                    }`}
+                    }${selectedIssueId === item.id ? ' is-selected' : ''}`}
                     draggable
                     title={item.title}
+                    onClick={() => onSelectIssue?.(item.id)}
                     onDragStart={(event) => onDragStart(event, item)}
                     onDragEnd={onDragEnd}
                   >
@@ -211,9 +216,10 @@ export function ListsWeekView({
               key={item.id}
               className={`list-week-chip status-${item.status}${
                 draggingId === item.id ? ' dragging' : ''
-              }`}
+              }${selectedIssueId === item.id ? ' is-selected' : ''}`}
               draggable
               title={item.title}
+              onClick={() => onSelectIssue?.(item.id)}
               onDragStart={(event) => onDragStart(event, item)}
               onDragEnd={onDragEnd}
             >

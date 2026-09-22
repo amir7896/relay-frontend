@@ -19,6 +19,10 @@ import { notify, subscribeWebPush, shouldShowNotificationBanner, dismissNotifica
 import { usePwaInstall } from '../../hooks/usePwaInstall';
 import { CommandPaletteHintButton } from '../../components/CommandPalette';
 import { clearMessageDraft } from '../../lib/messageDrafts';
+import {
+  extractSlackMentionIds,
+  resolveSlackMentions,
+} from '../../lib/chatComposer';
 import { useDirectory } from '../../people/useDirectory';
 import { UserAvatar } from '../../components/UserAvatar';
 import { useOrganization } from '../../organizations/OrganizationContext';
@@ -34,6 +38,7 @@ import type {
   SidebarSection,
   MentionActivity,
   DraftInboxItem,
+  ScheduledMessage,
   ThreadSummary,
   UserNotification,
   UserProfile,
@@ -68,8 +73,12 @@ function hitConversationTitle(
   return displayName(peerId ? byUserId.get(peerId) : undefined);
 }
 
-function messageSnippet(message: ChatMessage, me?: string) {
-  return singleLinePreview(previewText(message, me) ?? 'Message');
+function messageSnippet(
+  message: ChatMessage,
+  me?: string,
+  labelForUserId?: (userId: string) => string,
+) {
+  return singleLinePreview(previewText(message, me, labelForUserId) ?? 'Message');
 }
 
 function singleLinePreview(text: string, max = 140) {
@@ -105,7 +114,11 @@ function InboxListRow({
   );
 }
 
-function previewText(message: ChatMessage | null | undefined, me?: string) {
+function previewText(
+  message: ChatMessage | null | undefined,
+  me?: string,
+  labelForUserId?: (userId: string) => string,
+) {
   if (!message) {
     return null;
   }
@@ -163,7 +176,10 @@ function previewText(message: ChatMessage | null | undefined, me?: string) {
     return null;
   }
   const prefix = message.senderId === me ? 'You: ' : '';
-  const body = message.body.length > 64 ? `${message.body.slice(0, 64)}…` : message.body;
+  const resolved = labelForUserId
+    ? resolveSlackMentions(message.body, labelForUserId)
+    : message.body;
+  const body = resolved.length > 64 ? `${resolved.slice(0, 64)}…` : resolved;
   return `${prefix}${body}`;
 }
 
@@ -172,6 +188,7 @@ function normalizeConversation(item: Conversation): Conversation {
     ...item,
     muted: Boolean(item.muted),
     pinned: Boolean(item.pinned),
+    pinnedAt: item.pinnedAt ?? null,
     blockedByMe: Boolean(item.blockedByMe),
     blockedMe: Boolean(item.blockedMe),
     hasUnreadMention: Boolean(item.hasUnreadMention),
@@ -214,6 +231,10 @@ export function MessengerPage() {
   const isGuest = activeOrg?.role === 'guest';
   const { people, byUserId, error: directoryError, ensureProfiles, refreshDirectory } =
     useDirectory();
+  const mentionLabel = useCallback(
+    (userId: string) => displayName(byUserId.get(userId)),
+    [byUserId],
+  );
   const [items, setItems] = useState<Conversation[]>([]);
   const [query, setQuery] = useState('');
   const [messageHits, setMessageHits] = useState<GlobalSearchHit[]>([]);
@@ -247,8 +268,16 @@ export function MessengerPage() {
   const [draftItems, setDraftItems] = useState<DraftInboxItem[]>([]);
   const [draftsBusy, setDraftsBusy] = useState(false);
   const [draftsCount, setDraftsCount] = useState(0);
+  const [draftsTab, setDraftsTab] = useState<'drafts' | 'scheduled'>('drafts');
+  const [scheduledInboxItems, setScheduledInboxItems] = useState<
+    ScheduledMessage[]
+  >([]);
+  const [scheduledBusy, setScheduledBusy] = useState(false);
+  const [scheduledCount, setScheduledCount] = useState(0);
   const [laterTab, setLaterTab] = useState<'later' | 'saved'>('later');
+  const [laterQuery, setLaterQuery] = useState('');
   const [laterItems, setLaterItems] = useState<MessageReminder[]>([]);
+  const [snoozingId, setSnoozingId] = useState<string | null>(null);
   const [savedItems, setSavedItems] = useState<MessageBookmark[]>([]);
   const [savedTotalCount, setSavedTotalCount] = useState(0);
   const [bookmarkCollections, setBookmarkCollections] = useState<
@@ -266,6 +295,14 @@ export function MessengerPage() {
   const [draggingSectionId, setDraggingSectionId] = useState<string | null>(
     null,
   );
+  const [draggingConversationId, setDraggingConversationId] = useState<
+    string | null
+  >(null);
+  const dragConversationRef = useRef<{
+    id: string;
+    scope: string;
+  } | null>(null);
+  const suppressChatNavClickRef = useRef(false);
   const [starredCollapsed, setStarredCollapsed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notifyBanner, setNotifyBanner] = useState(false);
@@ -492,7 +529,10 @@ export function MessengerPage() {
     const preview =
       message.attachment && message.type === 'image'
         ? 'Sent a photo'
-        : message.body || 'New message';
+        : resolveSlackMentions(
+            message.body || 'New message',
+            (userId) => displayName(byUserIdRef.current.get(userId)),
+          );
     const body = mentionsMe
       ? preview.startsWith('@')
         ? preview
@@ -517,6 +557,21 @@ export function MessengerPage() {
         '/chat/reminders?page=1&limit=100&scope=all',
       );
       setLaterItems(response.data.items ?? []);
+    } catch {
+      // ignore badge errors
+    }
+  }, []);
+
+  const refreshThreadsUnread = useCallback(async () => {
+    try {
+      const response = await api<Paginated<ThreadSummary>>(
+        '/chat/threads?page=1&limit=40',
+      );
+      const unread = (response.data.items ?? []).reduce(
+        (sum, item) => sum + (item.unreadCount ?? 0),
+        0,
+      );
+      setThreadsUnreadTotal(unread);
     } catch {
       // ignore badge errors
     }
@@ -592,6 +647,29 @@ export function MessengerPage() {
     } catch (err) {
       setModalError(
         err instanceof Error ? err.message : 'Could not delete folder',
+      );
+    }
+  }
+
+  async function renameSavedFolder(collectionId: string, currentName: string) {
+    const next = window.prompt('Rename folder', currentName)?.trim();
+    if (!next || next === currentName) return;
+    try {
+      const response = await api<BookmarkCollection>(
+        `/chat/bookmark-collections/${collectionId}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ name: next }),
+        },
+      );
+      setBookmarkCollections((current) =>
+        current.map((item) =>
+          item.id === collectionId ? { ...item, ...response.data } : item,
+        ),
+      );
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not rename folder',
       );
     }
   }
@@ -680,7 +758,12 @@ export function MessengerPage() {
     const overdue: MessageReminder[] = [];
     const upcoming: MessageReminder[] = [];
     const completed: MessageReminder[] = [];
+    const q = laterQuery.trim().toLowerCase();
     for (const item of laterItems) {
+      if (q) {
+        const hay = `${item.bodySnippet ?? ''} ${item.conversationName ?? ''}`.toLowerCase();
+        if (!hay.includes(q)) continue;
+      }
       if (item.status === 'completed' || item.status === 'sent') {
         completed.push(item);
         continue;
@@ -690,24 +773,31 @@ export function MessengerPage() {
       else upcoming.push(item);
     }
     return { overdue, upcoming, completed };
-  }, [laterItems]);
+  }, [laterItems, laterQuery]);
+
+  const filteredSavedItems = useMemo(() => {
+    const q = laterQuery.trim().toLowerCase();
+    if (!q) return savedItems;
+    return savedItems.filter((item) => {
+      const title =
+        item.conversationName?.trim() ||
+        (item.conversationType === 'group' ? 'channel' : 'direct message');
+      const snippet =
+        item.message?.body?.trim() ||
+        item.message?.attachment?.name ||
+        '';
+      const folder =
+        bookmarkCollections.find((row) => row.id === item.collectionId)?.name ??
+        '';
+      return `${title} ${snippet} ${folder}`.toLowerCase().includes(q);
+    });
+  }, [savedItems, laterQuery, bookmarkCollections]);
 
   useEffect(() => {
     let cancelled = false;
     async function refreshThreadBadge() {
-      try {
-        const response = await api<Paginated<ThreadSummary>>(
-          '/chat/threads?page=1&limit=40',
-        );
-        if (cancelled) return;
-        const unread = (response.data.items ?? []).reduce(
-          (sum, item) => sum + (item.unreadCount ?? 0),
-          0,
-        );
-        setThreadsUnreadTotal(unread);
-      } catch {
-        // ignore badge errors
-      }
+      if (cancelled) return;
+      await refreshThreadsUnread();
     }
     async function refreshMentionsBadge() {
       try {
@@ -735,15 +825,21 @@ export function MessengerPage() {
     }
     async function refreshDraftsBadge() {
       try {
-        const response = await api<Paginated<DraftInboxItem>>(
-          '/chat/drafts?page=1&limit=40',
-        );
+        const [draftsRes, scheduledRes] = await Promise.all([
+          api<Paginated<DraftInboxItem>>('/chat/drafts?page=1&limit=40'),
+          api<Paginated<ScheduledMessage>>(
+            '/chat/scheduled-messages?page=1&limit=40',
+          ),
+        ]);
         if (cancelled) return;
-        const items = (response.data.items ?? []).filter((item) =>
+        const drafts = (draftsRes.data.items ?? []).filter((item) =>
           item.body.trim(),
         );
-        setDraftItems(items);
-        setDraftsCount(items.length);
+        setDraftItems(drafts);
+        setDraftsCount(drafts.length);
+        const scheduled = scheduledRes.data.items ?? [];
+        setScheduledInboxItems(scheduled);
+        setScheduledCount(scheduled.length);
       } catch {
         // ignore
       }
@@ -779,12 +875,47 @@ export function MessengerPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [refreshThreadsUnread]);
 
   useEffect(() => {
     setNotifyBanner(shouldShowNotificationBanner());
     void loadNotificationPrefs();
   }, []);
+
+  useEffect(() => {
+    let pendingCommand: string | null = null;
+    let timer: number | undefined;
+    function onComposerSlash(event: Event) {
+      const detail = (event as CustomEvent<{ command?: string }>).detail;
+      const command = detail?.command?.trim();
+      if (!command) return;
+      if (activeIdRef.current) {
+        pendingCommand = null;
+        return;
+      }
+      if (pendingCommand === command) return;
+      const target =
+        itemsRef.current.find((item) => item.type === 'group')?.id ??
+        itemsRef.current[0]?.id;
+      if (!target) return;
+      pendingCommand = command;
+      navigate(`/chat/${target}`);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        pendingCommand = null;
+        window.dispatchEvent(
+          new CustomEvent('relay:composer-slash', {
+            detail: { command },
+          }),
+        );
+      }, 160);
+    }
+    window.addEventListener('relay:composer-slash', onComposerSlash);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('relay:composer-slash', onComposerSlash);
+    };
+  }, [navigate]);
 
   useEffect(() => {
     if (
@@ -802,7 +933,11 @@ export function MessengerPage() {
   useEffect(() => {
     const unsubs = [
       subscribe('chat:message', (payload) => {
-        applyInboxMessage(payload as ChatMessage);
+        const message = payload as ChatMessage;
+        applyInboxMessage(message);
+        if (message.threadRootId) {
+          void refreshThreadsUnread();
+        }
       }),
       subscribe('chat:message_deleted', (payload) => {
         const message = payload as ChatMessage;
@@ -939,7 +1074,7 @@ export function MessengerPage() {
     return () => {
       unsubs.forEach((unsub) => unsub());
     };
-  }, [applyInboxMessage, leaveConversation, navigate, refreshLater, subscribe]);
+  }, [applyInboxMessage, leaveConversation, navigate, refreshLater, refreshThreadsUnread, subscribe]);
 
   useEffect(() => {
     void refreshDirectory();
@@ -992,10 +1127,18 @@ export function MessengerPage() {
       ),
     [filtered, sectionedIds],
   );
-  const starredItems = useMemo(
-    () => filtered.filter((item) => item.pinned && !sectionedIds.has(item.id)),
-    [filtered, sectionedIds],
-  );
+  const starredItems = useMemo(() => {
+    return filtered
+      .filter((item) => item.pinned && !sectionedIds.has(item.id))
+      .sort((a, b) => {
+        const aTime = a.pinnedAt ? Date.parse(a.pinnedAt) : 0;
+        const bTime = b.pinnedAt ? Date.parse(b.pinnedAt) : 0;
+        if (aTime !== bTime) return bTime - aTime;
+        const aMsg = a.lastMessageAt ? Date.parse(a.lastMessageAt) : 0;
+        const bMsg = b.lastMessageAt ? Date.parse(b.lastMessageAt) : 0;
+        return bMsg - aMsg;
+      });
+  }, [filtered, sectionedIds]);
 
   const conversationsById = useMemo(() => {
     const map = new Map<string, Conversation>();
@@ -1399,14 +1542,90 @@ export function MessengerPage() {
     }
   }
 
+  async function reorderStarredConversations(fromId: string, toId: string) {
+    if (fromId === toId) return;
+    const ordered = starredItems.map((item) => item.id);
+    const fromIndex = ordered.indexOf(fromId);
+    const toIndex = ordered.indexOf(toId);
+    if (fromIndex < 0 || toIndex < 0) return;
+    const next = [...ordered];
+    const [moved] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, moved);
+    const base = Date.now();
+    setItems((current) =>
+      current.map((row) => {
+        const index = next.indexOf(row.id);
+        if (index < 0) return row;
+        return {
+          ...row,
+          pinned: true,
+          pinnedAt: new Date(base - index * 1000).toISOString(),
+        };
+      }),
+    );
+    try {
+      await api('/chat/sidebar/starred-order', {
+        method: 'PUT',
+        body: JSON.stringify({ conversationIds: next }),
+      });
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Could not reorder starred',
+      );
+    }
+  }
+
+  async function reorderSectionConversations(
+    sectionId: string,
+    fromId: string,
+    toId: string,
+  ) {
+    if (fromId === toId) return;
+    const section = sidebarSections.find((row) => row.id === sectionId);
+    if (!section) return;
+    const ordered = [...(section.conversationIds ?? [])];
+    const fromIndex = ordered.indexOf(fromId);
+    const toIndex = ordered.indexOf(toId);
+    if (fromIndex < 0 || toIndex < 0) return;
+    const [moved] = ordered.splice(fromIndex, 1);
+    ordered.splice(toIndex, 0, moved);
+    setSidebarSections((current) =>
+      current.map((row) =>
+        row.id === sectionId ? { ...row, conversationIds: ordered } : row,
+      ),
+    );
+    try {
+      const response = await api<SidebarSection>(
+        `/chat/sidebar/sections/${sectionId}`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ conversationIds: ordered }),
+        },
+      );
+      setSidebarSections((current) =>
+        current.map((row) => (row.id === sectionId ? response.data : row)),
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Could not reorder section chats',
+      );
+      await loadSidebarSections();
+    }
+  }
+
   function sectionUnreadCount(sectionItems: Conversation[]) {
     return sectionItems.reduce((sum, item) => {
       if (item.id === activeConversationId) return sum;
-      return sum + (item.unreadCount > 0 ? item.unreadCount : 0);
+      if (item.unreadCount > 0) return sum + item.unreadCount;
+      if (item.hasUnreadMention) return sum + 1;
+      return sum;
     }, 0);
   }
 
-  function renderConversationRow(item: Conversation) {
+  function renderConversationRow(
+    item: Conversation,
+    dragScope?: 'starred' | `section:${string}` | 'pool' | null,
+  ) {
     const title = conversationTitle(item, me, byUserId);
     const peer = otherMember(item, me);
     const peerProfile = peer ? byUserId.get(peer.userId) : undefined;
@@ -1423,7 +1642,7 @@ export function MessengerPage() {
         ? `presence on presence-${peer.status}`
         : 'presence';
     const preview =
-      previewText(item.lastMessage, me) ??
+      previewText(item.lastMessage, me, mentionLabel) ??
       (item.type === 'group' ? 'Channel' : 'Direct message');
     const unread =
       item.id !== activeConversationId && item.unreadCount > 0
@@ -1442,17 +1661,116 @@ export function MessengerPage() {
       Boolean(liveLobby?.active) &&
       liveLobby?.mode !== 'huddle' &&
       (liveLobby?.joinedIds.length ?? 0) > 0;
+    const canDrag = Boolean(dragScope) && !sidebarBusy;
+    const canReorder =
+      dragScope === 'starred' || Boolean(dragScope?.startsWith('section:'));
+
+    const applyConversationDrop = (targetId: string) => {
+      const payload = dragConversationRef.current;
+      const fromId = payload?.id;
+      const fromScope = payload?.scope ?? '';
+      dragConversationRef.current = null;
+      setDraggingConversationId(null);
+      if (!fromId || fromId === targetId || !dragScope) return;
+      if (dragScope === 'starred' && fromScope === 'starred') {
+        void reorderStarredConversations(fromId, targetId);
+        return;
+      }
+      if (dragScope.startsWith('section:') && fromScope === dragScope) {
+        const sectionId = dragScope.slice('section:'.length);
+        void reorderSectionConversations(sectionId, fromId, targetId);
+      }
+    };
 
     return (
-      <NavLink
+      <div
         key={item.id}
-        className={`chat-row${isChannel ? ' channel-row' : ''}${
-          item.muted ? ' muted-chat' : ''
-        }${item.pinned ? ' pinned-chat' : ''}${
-          unread || mentionUnread ? ' has-unread' : ''
-        }${mentionUnread ? ' has-mention' : ''}`}
-        to={`/chat/${item.id}`}
+        className={`chat-row-shell${
+          draggingConversationId === item.id ? ' is-dragging-row' : ''
+        }${canReorder ? ' is-reorderable' : ''}`}
+        onDragOver={(event) => {
+          if (!canReorder || !dragConversationRef.current) return;
+          if (dragConversationRef.current.scope !== dragScope) return;
+          event.preventDefault();
+          event.stopPropagation();
+          event.dataTransfer.dropEffect = 'move';
+        }}
+        onDrop={(event) => {
+          if (!canReorder) return;
+          event.preventDefault();
+          event.stopPropagation();
+          applyConversationDrop(item.id);
+        }}
       >
+        {canDrag ? (
+          <span
+            className="chat-row-grip"
+            role="button"
+            tabIndex={0}
+            title={
+              canReorder
+                ? 'Drag to reorder'
+                : 'Drag onto a section to move'
+            }
+            aria-label={
+              canReorder ? 'Drag to reorder chat' : 'Drag chat to a section'
+            }
+            draggable
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+            }}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+              }
+            }}
+            onMouseDown={(event) => {
+              event.stopPropagation();
+            }}
+            onDragStart={(event) => {
+              event.stopPropagation();
+              suppressChatNavClickRef.current = true;
+              dragConversationRef.current = {
+                id: item.id,
+                scope: dragScope ?? 'pool',
+              };
+              setDraggingConversationId(item.id);
+              event.dataTransfer.setData(
+                'text/plain',
+                JSON.stringify({ id: item.id, scope: dragScope }),
+              );
+              event.dataTransfer.effectAllowed = 'move';
+            }}
+            onDragEnd={() => {
+              setDraggingConversationId(null);
+              // drop fires before dragend in spec, but keep payload briefly
+              // so late drop handlers can still read it.
+              window.setTimeout(() => {
+                if (dragConversationRef.current?.id === item.id) {
+                  dragConversationRef.current = null;
+                }
+                suppressChatNavClickRef.current = false;
+              }, 40);
+            }}
+          >
+            <span aria-hidden="true">⋮⋮</span>
+          </span>
+        ) : null}
+        <NavLink
+          className={`chat-row${isChannel ? ' channel-row' : ''}${
+            item.muted ? ' muted-chat' : ''
+          }${item.pinned ? ' pinned-chat' : ''}${
+            unread || mentionUnread ? ' has-unread' : ''
+          }${mentionUnread ? ' has-mention' : ''}`}
+          to={`/chat/${item.id}`}
+          onClick={(event) => {
+            if (suppressChatNavClickRef.current) {
+              event.preventDefault();
+              suppressChatNavClickRef.current = false;
+            }
+          }}
+        >
         <span className="chat-avatar-wrap">
           {isChannel ? (
             <span className="channel-hash" aria-hidden="true">
@@ -1514,7 +1832,7 @@ export function MessengerPage() {
                   disabled={sidebarBusy}
                   value={sectionIdForConversation(item.id) ?? ''}
                   onClick={(event) => {
-    event.preventDefault();
+                    event.preventDefault();
                     event.stopPropagation();
                   }}
                   onMouseDown={(event) => {
@@ -1589,7 +1907,8 @@ export function MessengerPage() {
             </span>
           </span>
         </span>
-      </NavLink>
+        </NavLink>
+      </div>
     );
   }
 
@@ -1604,12 +1923,21 @@ export function MessengerPage() {
       setItems((current) => {
         const updated = current.map((row) =>
           row.id === item.id
-            ? { ...row, pinned: Boolean(response.data.pinned) }
+            ? {
+                ...row,
+                pinned: Boolean(response.data.pinned),
+                pinnedAt: response.data.pinnedAt ?? (response.data.pinned ? new Date().toISOString() : null),
+              }
             : row,
         );
         return [...updated].sort((a, b) => {
           if (a.pinned !== b.pinned) {
             return Number(b.pinned) - Number(a.pinned);
+          }
+          if (a.pinned && b.pinned) {
+            const aPin = a.pinnedAt ? Date.parse(a.pinnedAt) : 0;
+            const bPin = b.pinnedAt ? Date.parse(b.pinnedAt) : 0;
+            if (aPin !== bPin) return bPin - aPin;
           }
           const aTime = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0;
           const bTime = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0;
@@ -1752,6 +2080,8 @@ export function MessengerPage() {
     threadRootId: string,
   ) {
     try {
+      const existing = threadItems.find((item) => item.root.id === threadRootId);
+      const unreadDelta = existing?.unreadCount ?? (existing?.hasUnread ? 1 : 0);
       await api(
         `/chat/conversations/${conversationId}/threads/${threadRootId}/follow`,
         { method: 'DELETE' },
@@ -1759,7 +2089,7 @@ export function MessengerPage() {
       setThreadItems((current) =>
         current.filter((item) => item.root.id !== threadRootId),
       );
-      setThreadsUnreadTotal((count) => Math.max(0, count - 1));
+      setThreadsUnreadTotal((count) => Math.max(0, count - unreadDelta));
     } catch (err) {
       setModalError(
         err instanceof Error ? err.message : 'Could not unfollow thread',
@@ -1783,7 +2113,17 @@ export function MessengerPage() {
       const items = response.data.items ?? [];
       setMentionItems(items);
       setMentionsUnreadTotal(items.filter((item) => item.unread).length);
-      await ensureProfiles(items.map((item) => item.message.senderId));
+      const profileIds = new Set<string>();
+      for (const item of items) {
+        profileIds.add(item.message.senderId);
+        for (const mentionId of item.message.mentions ?? []) {
+          profileIds.add(mentionId);
+        }
+        for (const mentionId of extractSlackMentionIds(item.message.body ?? '')) {
+          profileIds.add(mentionId);
+        }
+      }
+      await ensureProfiles([...profileIds]);
     } catch (err) {
       setModalError(
         err instanceof Error ? err.message : 'Could not load mentions',
@@ -1865,27 +2205,55 @@ export function MessengerPage() {
     }
   }
 
-  async function openDraftsHome() {
+  async function openDraftsHome(tab: 'drafts' | 'scheduled' = 'drafts') {
+    setDraftsTab(tab);
     setHomeView('drafts');
     setModalError('');
     if (activeIdRef.current) navigate('/chat');
     setDraftsBusy(true);
+    setScheduledBusy(true);
     try {
-      const response = await api<Paginated<DraftInboxItem>>(
-        '/chat/drafts?page=1&limit=40',
-      );
-      const items = (response.data.items ?? []).filter((item) =>
+      const [draftsRes, scheduledRes] = await Promise.all([
+        api<Paginated<DraftInboxItem>>('/chat/drafts?page=1&limit=40'),
+        api<Paginated<ScheduledMessage>>(
+          '/chat/scheduled-messages?page=1&limit=40',
+        ),
+      ]);
+      const drafts = (draftsRes.data.items ?? []).filter((item) =>
         item.body.trim(),
       );
-      setDraftItems(items);
-      setDraftsCount(items.length);
+      const scheduled = scheduledRes.data.items ?? [];
+      setDraftItems(drafts);
+      setDraftsCount(drafts.length);
+      setScheduledInboxItems(scheduled);
+      setScheduledCount(scheduled.length);
     } catch (err) {
       setModalError(
         err instanceof Error ? err.message : 'Could not load drafts',
       );
       setDraftItems([]);
+      setScheduledInboxItems([]);
     } finally {
       setDraftsBusy(false);
+      setScheduledBusy(false);
+    }
+  }
+
+  async function cancelScheduledInboxItem(item: ScheduledMessage) {
+    try {
+      await api(
+        `/chat/conversations/${item.conversationId}/scheduled-messages/${item.id}`,
+        { method: 'DELETE' },
+      );
+      setScheduledInboxItems((current) => {
+        const next = current.filter((row) => row.id !== item.id);
+        setScheduledCount(next.length);
+        return next;
+      });
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not cancel scheduled message',
+      );
     }
   }
 
@@ -1977,6 +2345,7 @@ export function MessengerPage() {
 
   async function openLaterInbox(tab: 'later' | 'saved' = 'later') {
     setLaterTab(tab);
+    setLaterQuery('');
     setHomeView('later');
     setModalError('');
     if (activeIdRef.current) navigate('/chat');
@@ -1991,6 +2360,38 @@ export function MessengerPage() {
     } finally {
       setLaterBusy(false);
       setSavedBusy(false);
+    }
+  }
+
+  function remindAtInOneHour() {
+    return new Date(Date.now() + 60 * 60 * 1000);
+  }
+
+  function remindAtTomorrowMorning() {
+    const when = new Date();
+    when.setDate(when.getDate() + 1);
+    when.setHours(9, 0, 0, 0);
+    return when;
+  }
+
+  async function snoozeLaterReminder(item: MessageReminder, when: Date) {
+    setSnoozingId(item.id);
+    setModalError('');
+    try {
+      await api<MessageReminder>(
+        `/chat/conversations/${item.conversationId}/messages/${item.messageId}/remind`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ remindAt: when.toISOString() }),
+        },
+      );
+      await refreshLater();
+    } catch (err) {
+      setModalError(
+        err instanceof Error ? err.message : 'Could not snooze reminder',
+      );
+    } finally {
+      setSnoozingId(null);
     }
   }
 
@@ -2222,9 +2623,26 @@ export function MessengerPage() {
             </button>
             <button
               type="button"
+              className="inbox-nav-row"
+              onClick={() => {
+                window.dispatchEvent(new CustomEvent('relay:open-daily-digest'));
+              }}
+            >
+              <span className="inbox-nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="18" height="18">
+                  <path
+                    fill="currentColor"
+                    d="M4 3.5A1.5 1.5 0 0 1 5.5 2h9A1.5 1.5 0 0 1 16 3.5V5h1.25a.75.75 0 0 1 0 1.5H16v2h1.25a.75.75 0 0 1 0 1.5H16v2h1.25a.75.75 0 0 1 0 1.5H16v2.5A1.5 1.5 0 0 1 14.5 18h-9A1.5 1.5 0 0 1 4 16.5v-13ZM6.25 5.5v1.25h7.5V5.5h-7.5Zm0 3.5v1.25h7.5V9H6.25Zm0 3.5v1.25h5V12.5h-5Z"
+                  />
+                </svg>
+              </span>
+              <span className="inbox-nav-label">Daily digest</span>
+            </button>
+            <button
+              type="button"
               className={`inbox-nav-row${
                 homeView === 'drafts' ? ' is-active' : ''
-              }${draftsCount > 0 ? ' has-unread' : ''}`}
+              }${draftsCount + scheduledCount > 0 ? ' has-unread' : ''}`}
               onClick={() => void openDraftsHome()}
             >
               <span className="inbox-nav-icon" aria-hidden="true">
@@ -2236,8 +2654,10 @@ export function MessengerPage() {
                 </svg>
               </span>
               <span className="inbox-nav-label">Drafts & sent</span>
-              {draftsCount > 0 ? (
-                <span className="inbox-nav-badge">{draftsCount}</span>
+              {draftsCount + scheduledCount > 0 ? (
+                <span className="inbox-nav-badge">
+                  {draftsCount + scheduledCount}
+                </span>
               ) : null}
             </button>
             <button
@@ -2329,6 +2749,7 @@ export function MessengerPage() {
                   className="inbox-section-label inbox-section-toggle"
                   aria-expanded={!starredCollapsed}
                   onClick={() => setStarredCollapsed((v) => !v)}
+                  title="Starred · drag chats to reorder"
                 >
                   <span aria-hidden="true">{starredCollapsed ? '▸' : '▾'}</span>
                   Starred
@@ -2341,7 +2762,9 @@ export function MessengerPage() {
                 </button>
               </div>
               {!starredCollapsed
-                ? starredItems.map((item) => renderConversationRow(item))
+                ? starredItems.map((item) =>
+                    renderConversationRow(item, 'starred'),
+                  )
                 : null}
             </div>
           ) : null}
@@ -2350,33 +2773,89 @@ export function MessengerPage() {
               .map((id) => conversationsById.get(id))
               .filter((row): row is Conversation => Boolean(row));
             const unread = sectionUnreadCount(sectionItems);
+            const sectionScope = `section:${section.id}` as const;
             return (
               <div
                 key={section.id}
                 className={`inbox-custom-section${
                   draggingSectionId === section.id ? ' is-dragging' : ''
+                }${
+                  draggingConversationId ? ' is-drop-target' : ''
                 }`}
-                draggable={!sidebarBusy}
-                onDragStart={(event) => {
-                  setDraggingSectionId(section.id);
-                  event.dataTransfer.setData('text/section-id', section.id);
-                  event.dataTransfer.effectAllowed = 'move';
-                }}
-                onDragEnd={() => setDraggingSectionId(null)}
                 onDragOver={(event) => {
+                  if (!dragConversationRef.current) return;
                   event.preventDefault();
                   event.dataTransfer.dropEffect = 'move';
                 }}
                 onDrop={(event) => {
                   event.preventDefault();
-                  const fromId =
-                    event.dataTransfer.getData('text/section-id') ||
-                    draggingSectionId;
-                  if (fromId) void reorderSidebarSections(fromId, section.id);
-                  setDraggingSectionId(null);
+                  const payload = dragConversationRef.current;
+                  let fromId = payload?.id ?? null;
+                  let fromScope = payload?.scope ?? '';
+                  if (!fromId) {
+                    try {
+                      const raw = event.dataTransfer.getData('text/plain');
+                      const parsed = JSON.parse(raw) as {
+                        id?: string;
+                        scope?: string;
+                      };
+                      fromId = parsed.id ?? null;
+                      fromScope = parsed.scope ?? '';
+                    } catch {
+                      fromId = null;
+                    }
+                  }
+                  dragConversationRef.current = null;
+                  setDraggingConversationId(null);
+                  if (!fromId) return;
+                  // Row-level drops handle same-section reorder.
+                  if (fromScope === sectionScope) return;
+                  void moveConversationToSection(fromId, section.id);
                 }}
               >
-                <div className="inbox-section-head">
+                <div
+                  className="inbox-section-head"
+                  draggable={!sidebarBusy}
+                  onDragStart={(event) => {
+                    // Don't start section drag when beginning from a chat grip.
+                    if (dragConversationRef.current) {
+                      event.preventDefault();
+                      return;
+                    }
+                    setDraggingSectionId(section.id);
+                    event.dataTransfer.setData('text/plain', `section:${section.id}`);
+                    event.dataTransfer.effectAllowed = 'move';
+                  }}
+                  onDragEnd={() => setDraggingSectionId(null)}
+                  onDragOver={(event) => {
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = 'move';
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const convPayload = dragConversationRef.current;
+                    if (convPayload?.id) {
+                      dragConversationRef.current = null;
+                      setDraggingConversationId(null);
+                      if (convPayload.scope !== sectionScope) {
+                        void moveConversationToSection(
+                          convPayload.id,
+                          section.id,
+                        );
+                      }
+                      return;
+                    }
+                    const raw = event.dataTransfer.getData('text/plain');
+                    if (raw.startsWith('section:')) {
+                      const sectionFrom = raw.slice('section:'.length);
+                      if (sectionFrom) {
+                        void reorderSidebarSections(sectionFrom, section.id);
+                      }
+                    }
+                    setDraggingSectionId(null);
+                  }}
+                >
                   <button
                     type="button"
                     className="inbox-section-label inbox-section-toggle"
@@ -2386,7 +2865,7 @@ export function MessengerPage() {
                       event.preventDefault();
                       void renameSidebarSection(section);
                     }}
-                    title="Click to collapse · drag section to reorder · right-click to rename"
+                    title="Click to collapse · drag header to reorder section · drop chats here · right-click to rename"
                   >
                     <span aria-hidden="true">{section.collapsed ? '▸' : '▾'}</span>
                     {section.name}
@@ -2411,17 +2890,19 @@ export function MessengerPage() {
                   </div>
                 </div>
                 {!section.collapsed
-                  ? sectionItems.map((item) => renderConversationRow(item))
+                  ? sectionItems.map((item) =>
+                      renderConversationRow(item, sectionScope),
+                    )
                   : null}
                 {!section.collapsed && sectionItems.length === 0 ? (
                   <p className="muted pad inbox-section-hint">
-                    Use the section menu on a chat to move it here.
+                    Drag a chat here, or use the section menu on a row.
                   </p>
                 ) : null}
               </div>
             );
           })}
-          {channels.map((item) => renderConversationRow(item))}
+          {channels.map((item) => renderConversationRow(item, 'pool'))}
           {channels.length === 0 && !query.trim() && sidebarSections.length === 0 ? (
             isGuest ? (
               <p className="muted inbox-empty-link">
@@ -2452,7 +2933,7 @@ export function MessengerPage() {
             </button>
           ) : null}
         </div>
-          {directs.map((item) => renderConversationRow(item))}
+          {directs.map((item) => renderConversationRow(item, 'pool'))}
           {directs.length === 0 && !query.trim() ? (
             isGuest ? (
               <p className="muted inbox-empty-link">No direct messages yet</p>
@@ -2495,7 +2976,7 @@ export function MessengerPage() {
               </p>
               {messageHits.map((hit) => {
                 const title = hitConversationTitle(hit, me, byUserId);
-                const snippet = messageSnippet(hit.message, me);
+                const snippet = messageSnippet(hit.message, me, mentionLabel);
                 const hitPeer =
                   hit.conversation.type === 'private'
                     ? hit.conversation.members.find((member) => member.userId !== me)
@@ -2617,7 +3098,7 @@ export function MessengerPage() {
                       byUserId,
                     );
                     const snippet = conversation.lastMessage
-                      ? messageSnippet(conversation.lastMessage, me)
+                      ? messageSnippet(conversation.lastMessage, me, mentionLabel)
                       : 'New activity';
                     return (
                       <li key={conversation.id}>
@@ -2683,7 +3164,7 @@ export function MessengerPage() {
                     );
                     const peer = otherMember(conversation, me);
                     const snippet = conversation.lastMessage
-                      ? messageSnippet(conversation.lastMessage, me)
+                      ? messageSnippet(conversation.lastMessage, me, mentionLabel)
                       : 'New activity';
                     return (
                       <li key={conversation.id}>
@@ -2835,7 +3316,7 @@ export function MessengerPage() {
                         <RelativeTime value={item.message.createdAt} />
                       </div>
                       <span className="threads-home-snippet">
-                        {messageSnippet(item.message, me)}
+                        {messageSnippet(item.message, me, mentionLabel)}
                       </span>
                     </InboxListRow>
                   </li>
@@ -2900,7 +3381,9 @@ export function MessengerPage() {
                         </span>
                         <RelativeTime value={item.createdAt} />
                       </div>
-                      <span className="threads-home-snippet">{item.body}</span>
+                      <span className="threads-home-snippet">
+                        {resolveSlackMentions(item.body, mentionLabel)}
+                      </span>
                     </InboxListRow>
                   </li>
                 );
@@ -2946,11 +3429,11 @@ export function MessengerPage() {
                       </div>
                       <span className="threads-home-snippet">
                         {displayName(byUserId.get(item.root.senderId))}:{' '}
-                        {messageSnippet(item.root, me)}
+                        {messageSnippet(item.root, me, mentionLabel)}
                       </span>
                       <span className="threads-home-snippet muted">
                         Latest · {displayName(byUserId.get(latest.senderId))}:{' '}
-                        {messageSnippet(latest, me)}
+                        {messageSnippet(latest, me, mentionLabel)}
                       </span>
                     </InboxListRow>
                     <button
@@ -2977,52 +3460,157 @@ export function MessengerPage() {
             ) : null}
             {homeView === 'drafts' ? (
               <>
-{draftsBusy ? <p className="muted">Loading drafts…</p> : null}
-        {!draftsBusy && draftItems.length === 0 ? (
-          <p className="muted">
-            Start typing in a channel and your unsent message will show up here
-            — same idea as Slack Drafts.
-          </p>
-        ) : null}
-        <ul className="threads-home-list drafts-home-list">
-          {draftItems.map((item) => {
-            const conversation = items.find(
-              (row) => row.id === item.conversationId,
-            );
-            const channelLabel = conversation
-              ? conversationTitle(conversation, me, byUserId)
-              : item.conversationType === 'group'
-                ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
-                : item.conversationName || 'Direct message';
-            return (
-              <li key={item.conversationId}>
-                <div className="drafts-home-row">
-                  <InboxListRow
-                    className="draft-open"
-                    onClick={() => {
-                      setHomeView(null);
-                      navigate(`/chat/${item.conversationId}`);
-                    }}
-                  >
-                    <div className="threads-home-meta">
-                      <strong>{channelLabel}</strong>
-                      <RelativeTime value={item.updatedAt} />
-                    </div>
-                    <span className="threads-home-snippet">{singleLinePreview(item.body)}</span>
-                  </InboxListRow>
-                  <button
-                    type="button"
-                    className="ghost drafts-discard"
-                    onClick={() => void discardDraft(item.conversationId)}
-                  >
-                    Discard
-                  </button>
+                <div className="later-panel drafts-scheduled-panel">
+                  <div className="later-tabs" role="tablist" aria-label="Drafts views">
+                    <button
+                      type="button"
+                      role="tab"
+                      className={draftsTab === 'drafts' ? 'on' : ''}
+                      aria-selected={draftsTab === 'drafts'}
+                      onClick={() => setDraftsTab('drafts')}
+                    >
+                      Drafts
+                      {draftsCount > 0 ? (
+                        <span className="later-tab-count">{draftsCount}</span>
+                      ) : null}
+                    </button>
+                    <button
+                      type="button"
+                      role="tab"
+                      className={draftsTab === 'scheduled' ? 'on' : ''}
+                      aria-selected={draftsTab === 'scheduled'}
+                      onClick={() => {
+                        setDraftsTab('scheduled');
+                        void openDraftsHome('scheduled');
+                      }}
+                    >
+                      Scheduled
+                      {scheduledCount > 0 ? (
+                        <span className="later-tab-count">{scheduledCount}</span>
+                      ) : null}
+                    </button>
+                  </div>
+
+                  {draftsTab === 'drafts' ? (
+                    <>
+                      {draftsBusy ? <p className="muted">Loading drafts…</p> : null}
+                      {!draftsBusy && draftItems.length === 0 ? (
+                        <div className="later-empty">
+                          <p className="muted">No drafts yet.</p>
+                          <p className="muted later-empty-hint">
+                            Start typing in a channel and your unsent message
+                            shows up here — same idea as Slack Drafts.
+                          </p>
+                        </div>
+                      ) : null}
+                      <ul className="threads-home-list drafts-home-list">
+                        {draftItems.map((item) => {
+                          const conversation = items.find(
+                            (row) => row.id === item.conversationId,
+                          );
+                          const channelLabel = conversation
+                            ? conversationTitle(conversation, me, byUserId)
+                            : item.conversationType === 'group'
+                              ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
+                              : item.conversationName || 'Direct message';
+                          return (
+                            <li key={item.conversationId}>
+                              <div className="drafts-home-row">
+                                <InboxListRow
+                                  className="draft-open"
+                                  onClick={() => {
+                                    setHomeView(null);
+                                    navigate(`/chat/${item.conversationId}`);
+                                  }}
+                                >
+                                  <div className="threads-home-meta">
+                                    <strong>{channelLabel}</strong>
+                                    <RelativeTime value={item.updatedAt} />
+                                  </div>
+                                  <span className="threads-home-snippet">
+                                    {singleLinePreview(item.body)}
+                                  </span>
+                                </InboxListRow>
+                                <button
+                                  type="button"
+                                  className="ghost drafts-discard"
+                                  onClick={() =>
+                                    void discardDraft(item.conversationId)
+                                  }
+                                >
+                                  Discard
+                                </button>
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </>
+                  ) : (
+                    <>
+                      {scheduledBusy ? (
+                        <p className="muted">Loading scheduled messages…</p>
+                      ) : null}
+                      {!scheduledBusy && scheduledInboxItems.length === 0 ? (
+                        <div className="later-empty">
+                          <p className="muted">Nothing scheduled.</p>
+                          <p className="muted later-empty-hint">
+                            Use the schedule control next to Send in any chat to
+                            queue a message for later.
+                          </p>
+                        </div>
+                      ) : null}
+                      <ul className="threads-home-list drafts-home-list">
+                        {scheduledInboxItems.map((item) => {
+                          const channelLabel =
+                            item.conversationType === 'group'
+                              ? `#${(item.conversationName ?? 'channel').replace(/^#/, '')}`
+                              : item.conversationName?.trim() || 'Direct message';
+                          const snippet = resolveSlackMentions(
+                            item.body?.trim() ||
+                              item.attachment?.name ||
+                              'Scheduled message',
+                            mentionLabel,
+                          );
+                          return (
+                            <li key={item.id}>
+                              <div className="drafts-home-row later-inbox-row">
+                                <InboxListRow
+                                  onClick={() => {
+                                    setHomeView(null);
+                                    navigate(`/chat/${item.conversationId}`);
+                                  }}
+                                >
+                                  <div className="threads-home-meta">
+                                    <strong>{channelLabel}</strong>
+                                    <span className="muted threads-home-meta-side">
+                                      Sends {formatScheduleWhen(item.scheduledFor)}
+                                    </span>
+                                  </div>
+                                  <span className="threads-home-snippet">
+                                    {singleLinePreview(snippet)}
+                                  </span>
+                                </InboxListRow>
+                                <div className="later-row-actions">
+                                  <button
+                                    type="button"
+                                    className="ghost later-cancel-btn"
+                                    onClick={() =>
+                                      void cancelScheduledInboxItem(item)
+                                    }
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </>
+                  )}
+                  {modalError ? <p className="error">{modalError}</p> : null}
                 </div>
-              </li>
-            );
-          })}
-        </ul>
-        {modalError ? <p className="error">{modalError}</p> : null}
               </>
             ) : null}
             {homeView === 'threads' ? (
@@ -3069,11 +3657,11 @@ export function MessengerPage() {
                   </div>
                   <span className="threads-home-snippet">
                     {displayName(byUserId.get(item.root.senderId))}:{' '}
-                    {messageSnippet(item.root, me)}
+                    {messageSnippet(item.root, me, mentionLabel)}
                   </span>
                   <span className="threads-home-snippet muted">
                     Latest · {displayName(byUserId.get(latest.senderId))}:{' '}
-                    {messageSnippet(latest, me)}
+                    {messageSnippet(latest, me, mentionLabel)}
                   </span>
                 </InboxListRow>
                 <button
@@ -3096,13 +3684,25 @@ export function MessengerPage() {
             {homeView === 'later' ? (
               <>
 <div className="later-panel">
+          <header className="later-panel-head">
+            <div>
+              <h3>Later</h3>
+              <p className="muted">
+                Reminders and saved messages — pick them up when you are ready.
+              </p>
+            </div>
+          </header>
+
           <div className="later-tabs" role="tablist" aria-label="Later views">
             <button
               type="button"
               role="tab"
               className={laterTab === 'later' ? 'on' : ''}
               aria-selected={laterTab === 'later'}
-              onClick={() => setLaterTab('later')}
+              onClick={() => {
+                setLaterTab('later');
+                setLaterQuery('');
+              }}
             >
               Reminders
               {laterPendingCount > 0 ? (
@@ -3116,6 +3716,7 @@ export function MessengerPage() {
               aria-selected={laterTab === 'saved'}
               onClick={() => {
                 setLaterTab('saved');
+                setLaterQuery('');
                 void refreshSaved();
               }}
             >
@@ -3126,6 +3727,32 @@ export function MessengerPage() {
             </button>
           </div>
 
+          <div className="later-toolbar">
+            <input
+              value={laterQuery}
+              onChange={(event) => setLaterQuery(event.target.value)}
+              placeholder={
+                laterTab === 'later'
+                  ? 'Search reminders…'
+                  : 'Search saved messages…'
+              }
+              aria-label={
+                laterTab === 'later'
+                  ? 'Search reminders'
+                  : 'Search saved messages'
+              }
+            />
+            {laterQuery.trim() ? (
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => setLaterQuery('')}
+              >
+                Clear
+              </button>
+            ) : null}
+          </div>
+
           {laterTab === 'later' ? (
             <>
               {laterBusy ? <p className="muted">Loading reminders…</p> : null}
@@ -3133,10 +3760,19 @@ export function MessengerPage() {
               laterSections.overdue.length === 0 &&
               laterSections.upcoming.length === 0 &&
               laterSections.completed.length === 0 ? (
-                <p className="muted">
-                  Use <strong>Remind me</strong> on any message. Items land here
-                  with due dates until you complete or cancel them.
-                </p>
+                <div className="later-empty">
+                  <p className="muted">
+                    {laterQuery.trim()
+                      ? `No reminders match “${laterQuery.trim()}”.`
+                      : 'Nothing waiting for you yet.'}
+                  </p>
+                  {!laterQuery.trim() ? (
+                    <p className="muted later-empty-hint">
+                      Open any message menu → <strong>Remind me</strong>. Due
+                      items land here until you complete, snooze, or cancel them.
+                    </p>
+                  ) : null}
+                </div>
               ) : null}
 
               {(
@@ -3148,7 +3784,7 @@ export function MessengerPage() {
                   },
                   {
                     key: 'upcoming',
-                    label: 'In progress',
+                    label: 'Upcoming',
                     items: laterSections.upcoming,
                   },
                   {
@@ -3189,6 +3825,10 @@ export function MessengerPage() {
                             : item.status === 'sent'
                               ? `Notified · ${formatScheduleWhen(item.remindAt)}`
                               : formatScheduleWhen(item.remindAt);
+                        const snippet = resolveSlackMentions(
+                          item.bodySnippet?.trim() || 'Message reminder',
+                          mentionLabel,
+                        );
                         return (
                           <li key={item.id}>
                             <div className="later-inbox-row">
@@ -3213,9 +3853,7 @@ export function MessengerPage() {
                                   </span>
                                 </div>
                                 <span className="threads-home-snippet">
-                                  {singleLinePreview(
-                                    item.bodySnippet?.trim() || 'Saved message',
-                                  )}
+                                  {singleLinePreview(snippet)}
                                 </span>
                               </InboxListRow>
                               <div className="later-row-actions">
@@ -3228,19 +3866,49 @@ export function MessengerPage() {
                                       void completeLaterReminder(item.id)
                                     }
                                   >
-                                    Complete
+                                    Done
                                   </button>
                                 ) : null}
                                 {item.status === 'pending' ? (
-                                  <button
-                                    type="button"
-                                    className="ghost later-cancel-btn"
-                                    onClick={() =>
-                                      void cancelLaterReminder(item.id)
-                                    }
-                                  >
-                                    Cancel
-                                  </button>
+                                  <>
+                                    <button
+                                      type="button"
+                                      className="ghost"
+                                      disabled={snoozingId === item.id}
+                                      title="Snooze 1 hour"
+                                      onClick={() =>
+                                        void snoozeLaterReminder(
+                                          item,
+                                          remindAtInOneHour(),
+                                        )
+                                      }
+                                    >
+                                      +1h
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="ghost"
+                                      disabled={snoozingId === item.id}
+                                      title="Snooze until tomorrow 9:00"
+                                      onClick={() =>
+                                        void snoozeLaterReminder(
+                                          item,
+                                          remindAtTomorrowMorning(),
+                                        )
+                                      }
+                                    >
+                                      +1d
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="ghost later-cancel-btn"
+                                      onClick={() =>
+                                        void cancelLaterReminder(item.id)
+                                      }
+                                    >
+                                      Cancel
+                                    </button>
+                                  </>
                                 ) : null}
                               </div>
                             </div>
@@ -3278,7 +3946,11 @@ export function MessengerPage() {
                       type="button"
                       className={savedFolderId === folder.id ? 'on' : ''}
                       onClick={() => setSavedFolderId(folder.id)}
-                      title={`${folder.bookmarkCount} saved`}
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        void renameSavedFolder(folder.id, folder.name);
+                      }}
+                      title={`${folder.bookmarkCount} saved · right-click to rename`}
                     >
                       {folder.name}
                     </button>
@@ -3305,33 +3977,61 @@ export function MessengerPage() {
                 {savedFolderId !== 'all' &&
                 savedFolderId !== 'none' &&
                 bookmarkCollections.some((f) => f.id === savedFolderId) ? (
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => void deleteSavedFolder(savedFolderId)}
-                  >
-                    Delete folder
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => {
+                        const folder = bookmarkCollections.find(
+                          (item) => item.id === savedFolderId,
+                        );
+                        if (folder) {
+                          void renameSavedFolder(folder.id, folder.name);
+                        }
+                      }}
+                    >
+                      Rename folder
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void deleteSavedFolder(savedFolderId)}
+                    >
+                      Delete folder
+                    </button>
+                  </>
                 ) : null}
               </div>
               {savedBusy ? <p className="muted">Loading saved messages…</p> : null}
-              {!savedBusy && savedItems.length === 0 ? (
-                <p className="muted">
-                  Save any message from the ⋮ menu. Organize them into folders
-                  here.
-                </p>
+              {!savedBusy && filteredSavedItems.length === 0 ? (
+                <div className="later-empty">
+                  <p className="muted">
+                    {laterQuery.trim()
+                      ? `No saved messages match “${laterQuery.trim()}”.`
+                      : savedItems.length === 0
+                        ? 'No saved messages yet.'
+                        : 'Nothing in this folder.'}
+                  </p>
+                  {!laterQuery.trim() && savedItems.length === 0 ? (
+                    <p className="muted later-empty-hint">
+                      Save any message from the ⋮ menu, then organize into
+                      folders here.
+                    </p>
+                  ) : null}
+                </div>
               ) : null}
               <ul className="saved-messages-list later-saved-list">
-                {savedItems.map((item) => {
+                {filteredSavedItems.map((item) => {
                   const title =
                     item.conversationName?.trim() ||
                     (item.conversationType === 'group'
                       ? 'Channel'
                       : 'Direct message');
-                  const snippet =
+                  const rawSnippet =
                     item.message?.body?.trim() ||
                     item.message?.attachment?.name ||
                     'Saved message';
+                  const snippet = resolveSlackMentions(rawSnippet, mentionLabel);
                   return (
                     <li key={item.id}>
                       <button

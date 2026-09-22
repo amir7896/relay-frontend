@@ -9,10 +9,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "lib0": "^0.2.117",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^7.8.2",
-    "socket.io-client": "^4.8.3"
+    "socket.io-client": "^4.8.3",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.32"
   },
   "devDependencies": {
     "@types/react": "^18.3.31",

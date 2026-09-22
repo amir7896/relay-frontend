@@ -1,9 +1,11 @@
-import type { Conversation } from '../../api/types';
+import type { ChatMessage, Conversation } from '../../api/types';
 import { AppsPanel } from './tabs/AppsPanel';
 import { CanvasPanel } from './tabs/CanvasPanel';
 import { ClipsPanel } from './tabs/ClipsPanel';
 import { ConnectPanel } from './tabs/ConnectPanel';
+import { FilesPanel, type MediaKindTab } from './tabs/FilesPanel';
 import { ListsPanel } from './tabs/ListsPanel';
+import { PinsPanel } from './tabs/PinsPanel';
 import { WorkflowsPanel } from './tabs/WorkflowsPanel';
 
 export type ChannelTab =
@@ -22,8 +24,9 @@ type Props = {
   conversation: Conversation;
   activeTab: ChannelTab;
   onTabChange: (tab: ChannelTab) => void;
-  onOpenFiles: () => void;
-  onOpenPins: () => void;
+  filesInitialKind?: MediaKindTab;
+  onJumpToMessage?: (messageId: string) => void;
+  onPinsChanged?: (items: ChatMessage[]) => void;
 };
 
 const TABS: Array<{ id: ChannelTab; label: string; groupsOnly?: boolean }> = [
@@ -43,21 +46,10 @@ export function ChannelTabs({
   conversation,
   activeTab,
   onTabChange,
-  onOpenFiles,
-  onOpenPins,
+  filesInitialKind = 'all',
+  onJumpToMessage,
+  onPinsChanged,
 }: Props) {
-  function selectTab(tab: ChannelTab) {
-    if (tab === 'files') {
-      onOpenFiles();
-      return;
-    }
-    if (tab === 'pins') {
-      onOpenPins();
-      return;
-    }
-    onTabChange(tab);
-  }
-
   const visibleTabs = TABS.filter(
     (tab) => !tab.groupsOnly || conversation.type === 'group',
   );
@@ -72,34 +64,64 @@ export function ChannelTabs({
             role="tab"
             aria-selected={activeTab === tab.id}
             className={`channel-tab${activeTab === tab.id ? ' active' : ''}`}
-            onClick={() => selectTab(tab.id)}
+            onClick={() => onTabChange(tab.id)}
           >
             {tab.label}
           </button>
         ))}
       </nav>
-      {activeTab !== 'messages' &&
-      activeTab !== 'files' &&
-      activeTab !== 'pins' ? (
+      {activeTab !== 'messages' ? (
         <div
           className={`channel-tab-panel${
             activeTab === 'lists' ? ' is-lists' : ''
-          }${activeTab === 'apps' ? ' is-apps' : ''}`}
+          }${activeTab === 'apps' ? ' is-apps' : ''}${
+            activeTab === 'files' ? ' is-files' : ''
+          }${activeTab === 'pins' ? ' is-pins' : ''}`}
           role="tabpanel"
         >
-          {activeTab === 'canvas' ? <CanvasPanel conversationId={conversationId} /> : null}
+          {activeTab === 'files' ? (
+            <FilesPanel
+              conversationId={conversationId}
+              initialKind={filesInitialKind}
+              onJumpToMessage={onJumpToMessage}
+            />
+          ) : null}
+          {activeTab === 'pins' ? (
+            <PinsPanel
+              conversationId={conversationId}
+              onJumpToMessage={onJumpToMessage}
+              onPinsChanged={onPinsChanged}
+            />
+          ) : null}
+          {activeTab === 'canvas' ? (
+            <CanvasPanel conversationId={conversationId} />
+          ) : null}
           {activeTab === 'lists' ? (
             <ListsPanel
               conversationId={conversationId}
               conversation={conversation}
             />
           ) : null}
-          {activeTab === 'clips' ? <ClipsPanel conversationId={conversationId} /> : null}
+          {activeTab === 'clips' ? (
+            <ClipsPanel conversationId={conversationId} />
+          ) : null}
           {activeTab === 'workflows' ? (
             <WorkflowsPanel conversationId={conversationId} />
           ) : null}
           {activeTab === 'apps' ? (
-            <AppsPanel conversationId={conversationId} />
+            <AppsPanel
+              conversationId={conversationId}
+              onTrySlashCommand={(commandName) => {
+                onTabChange('messages');
+                window.setTimeout(() => {
+                  window.dispatchEvent(
+                    new CustomEvent('relay:composer-slash', {
+                      detail: { command: commandName },
+                    }),
+                  );
+                }, 80);
+              }}
+            />
           ) : null}
           {activeTab === 'connect' ? (
             <ConnectPanel conversationId={conversationId} />

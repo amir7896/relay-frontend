@@ -2,6 +2,10 @@ import type { LinkPreview } from '../api/types';
 
 const URL_PATTERN = /https?:\/\/[^\s<]+[^\s<.,;:!?)]/gi;
 
+/** Slack-style user mention token: <@uuid> (used by Lists bot assignments). */
+export const SLACK_USER_MENTION_RE =
+  /<@([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})>/g;
+
 export function firstUrl(text: string): string | null {
   const match = text.match(URL_PATTERN);
   return match?.[0] ?? null;
@@ -30,11 +34,36 @@ export function bodyHasHereMention(body: string): boolean {
   return /(^|[\s([{])@here\b/i.test(body);
 }
 
+/** Collect user ids from `<@uuid>` tokens in a message body. */
+export function extractSlackMentionIds(body: string): string[] {
+  const ids = new Set<string>();
+  const pattern = new RegExp(SLACK_USER_MENTION_RE.source, 'gi');
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(body)) !== null) {
+    ids.add(match[1]);
+  }
+  return [...ids];
+}
+
+/**
+ * Replace `<@uuid>` tokens with display labels for plain-text previews
+ * (Activity, sidebar snippets, notifications).
+ */
+export function resolveSlackMentions(
+  body: string,
+  labelForUserId: (userId: string) => string,
+): string {
+  return body.replace(
+    new RegExp(SLACK_USER_MENTION_RE.source, 'gi'),
+    (_full, userId: string) => labelForUserId(userId),
+  );
+}
+
 export function extractMentionIds(
   body: string,
   members: { userId: string; label: string }[],
 ): string[] {
-  const ids = new Set<string>();
+  const ids = new Set<string>(extractSlackMentionIds(body));
   const lower = body.toLowerCase();
   for (const member of members) {
     const handle = mentionHandle(member.label);
@@ -91,15 +120,13 @@ function formatPlainText(text: string): MessageBodyPart[] {
   return parts.length > 0 ? parts : [{ type: 'text', value: text }];
 }
 
-/**
- * Split message body for display. Mentions render WhatsApp-style (name, no @);
- * @channel / @here / @usergroup stay as special mention chips; remaining text gets mrkdwn-lite.
- */
-export function renderMessageBody(
+function renderHandleMentions(
   body: string,
   mentionLabels: Map<string, string>,
-  userGroupHandles: Set<string> = new Set(),
+  userGroupHandles: Set<string>,
 ): MessageBodyPart[] {
+  if (!body) return [];
+
   const byHandle = new Map<string, { userId: string; label: string }>();
   for (const [userId, label] of mentionLabels) {
     const handle = mentionHandle(label);
@@ -148,9 +175,52 @@ export function renderMessageBody(
   if (lastIndex < body.length) {
     mentionParts.push(...formatPlainText(body.slice(lastIndex)));
   }
-  return mentionParts.length > 0
-    ? mentionParts
-    : [{ type: 'text', value: body }];
+  return mentionParts;
+}
+
+/**
+ * Split message body for display. Mentions render WhatsApp-style (name, no @);
+ * supports `<@uuid>` (Lists bot / Slack) and `@Handle` tokens.
+ * @channel / @here / @usergroup stay as special mention chips; remaining text gets mrkdwn-lite.
+ */
+export function renderMessageBody(
+  body: string,
+  mentionLabels: Map<string, string>,
+  userGroupHandles: Set<string> = new Set(),
+): MessageBodyPart[] {
+  const parts: MessageBodyPart[] = [];
+  const pattern = new RegExp(SLACK_USER_MENTION_RE.source, 'gi');
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let sawSlackMention = false;
+
+  while ((match = pattern.exec(body)) !== null) {
+    sawSlackMention = true;
+    if (match.index > lastIndex) {
+      parts.push(
+        ...renderHandleMentions(
+          body.slice(lastIndex, match.index),
+          mentionLabels,
+          userGroupHandles,
+        ),
+      );
+    }
+    const userId = match[1];
+    const label = mentionLabels.get(userId);
+    parts.push({
+      type: 'mention',
+      value: label || 'Someone',
+      userId,
+    });
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < body.length || !sawSlackMention) {
+    const rest = sawSlackMention ? body.slice(lastIndex) : body;
+    parts.push(...renderHandleMentions(rest, mentionLabels, userGroupHandles));
+  }
+
+  return parts.length > 0 ? parts : [{ type: 'text', value: body }];
 }
 
 export function isPlaceholderBody(body: string): boolean {

@@ -25,12 +25,15 @@ import { useAuth } from '../../../auth/AuthContext';
 import { useChatSocket } from '../../../chat/ChatSocketContext';
 import { api } from '../../../api/client';
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
   type KeyboardEvent,
 } from 'react';
+import { useCanvasCollab } from './useCanvasCollab';
+import { CanvasRemoteCarets } from './CanvasRemoteCarets';
 
 const EMPTY_CANVAS: ConversationCanvas = {
   id: '',
@@ -38,6 +41,7 @@ const EMPTY_CANVAS: ConversationCanvas = {
   conversationId: '',
   title: '',
   body: '',
+  ydocState: null as string | null,
   updatedBy: '',
   createdAt: '',
   updatedAt: null,
@@ -56,6 +60,7 @@ function normalizeCanvas(
     conversationId: value.conversationId || conversationId,
     title: value.title ?? '',
     body: value.body ?? '',
+    ydocState: value.ydocState ?? null,
     updatedBy: value.updatedBy ?? '',
     createdAt: value.createdAt ?? '',
     updatedAt: value.updatedAt ?? null,
@@ -163,12 +168,41 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
   const [comments, setComments] = useState<CanvasComment[]>([]);
   const [commentDraft, setCommentDraft] = useState('');
   const [commentAnchor, setCommentAnchor] = useState('');
+  const [commentAnchorOffset, setCommentAnchorOffset] = useState(0);
   const [commentsBusy, setCommentsBusy] = useState(false);
+  const [collabEnabled, setCollabEnabled] = useState(true);
   const dirtyRef = useRef(false);
   const skipRemoteRef = useRef(false);
   const loadedRef = useRef(false);
   const bodyRef = useRef<HTMLTextAreaElement | null>(null);
+  const titleRef = useRef<HTMLInputElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
+
+  const onDocChange = useCallback(
+    (next: { title: string; body: string }) => {
+      setCanvas((current) => ({
+        ...current,
+        title: next.title,
+        body: next.body,
+      }));
+      setStatus('Live');
+    },
+    [],
+  );
+
+  const {
+    ready: collabReady,
+    syncError,
+    peers,
+    liveCount,
+    setTitle: setCollabTitle,
+    setBody: setCollabBody,
+    setLocalCursor,
+  } = useCanvasCollab({
+    conversationId,
+    enabled: collabEnabled && !loading,
+    onDocChange,
+  });
 
   const mentionLabels = useMemo(() => {
     const map = new Map<string, string>();
@@ -210,6 +244,7 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
     setComments([]);
     setCommentDraft('');
     setCommentAnchor('');
+    setCommentAnchorOffset(0);
     setCanvas(normalizeCanvas(null, conversationId));
     Promise.all([
       api<ConversationCanvas | null>(
@@ -264,6 +299,7 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
 
   useEffect(() => {
     return subscribe('chat:canvas', (payload) => {
+      if (collabReady) return;
       const next = normalizeCanvas(payload as ConversationCanvas, conversationId);
       if (next.conversationId !== conversationId) return;
       if (skipRemoteRef.current && next.updatedBy === userId) return;
@@ -280,10 +316,43 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
       setCanvas(next);
       setStatus('Updated live');
     });
-  }, [conversationId, subscribe, userId]);
+  }, [collabReady, conversationId, subscribe, userId]);
 
   useEffect(() => {
-    if (!loadedRef.current || loading || !dirtyRef.current) return;
+    return subscribe('chat:canvas_comment', (payload) => {
+      const event = payload as {
+        action?: 'created' | 'updated' | 'deleted';
+        comment?: CanvasComment;
+        commentId?: string;
+      };
+      if (event.action === 'deleted' && event.commentId) {
+        setComments((current) =>
+          current.filter((item) => item.id !== event.commentId),
+        );
+        return;
+      }
+      const comment = event.comment;
+      if (!comment || comment.conversationId !== conversationId) return;
+      if (event.action === 'created') {
+        setComments((current) => {
+          if (current.some((item) => item.id === comment.id)) return current;
+          return [comment, ...current];
+        });
+        void ensureProfiles([comment.authorId]);
+        return;
+      }
+      if (event.action === 'updated') {
+        setComments((current) =>
+          current.map((item) => (item.id === comment.id ? comment : item)),
+        );
+      }
+    });
+  }, [conversationId, ensureProfiles, subscribe]);
+
+  useEffect(() => {
+    if (collabReady || !loadedRef.current || loading || !dirtyRef.current) {
+      return;
+    }
     setStatus('Saving…');
     const timer = window.setTimeout(() => {
       skipRemoteRef.current = true;
@@ -310,7 +379,14 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
         });
     }, 700);
     return () => window.clearTimeout(timer);
-  }, [canvas.title, canvas.body, conversationId, loading]);
+  }, [canvas.title, canvas.body, collabReady, conversationId, loading]);
+
+  useEffect(() => {
+    if (syncError) {
+      setCollabEnabled(false);
+      setStatus('Live sync unavailable — editing offline to server save.');
+    }
+  }, [syncError]);
 
   useEffect(() => {
     if (mode !== 'preview' || !canvas.body.trim()) {
@@ -342,8 +418,14 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
   }, [mode, canvas.body]);
 
   function updateField(field: 'title' | 'body', value: string) {
-    dirtyRef.current = true;
     setCanvas((current) => ({ ...current, [field]: value }));
+    if (collabReady) {
+      if (field === 'title') setCollabTitle(value);
+      else setCollabBody(value);
+      setStatus('Live');
+      return;
+    }
+    dirtyRef.current = true;
   }
 
   function applyBodyEdit(
@@ -398,6 +480,7 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
       setMentionQuery(null);
       return;
     }
+    setLocalCursor('body', el.selectionStart, el.selectionEnd);
     const before = value.slice(0, el.selectionStart);
     setMentionQuery(parseMentionQuery(before));
   }
@@ -497,6 +580,7 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
     const selected = el.value.slice(start, end).trim();
     if (selected) {
       setCommentAnchor(selected.slice(0, 240));
+      setCommentAnchorOffset(start);
       return;
     }
     const lineStart = el.value.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
@@ -505,6 +589,38 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
       .slice(lineStart, lineEnd === -1 ? undefined : lineEnd)
       .trim();
     setCommentAnchor(line.slice(0, 240));
+    setCommentAnchorOffset(lineStart);
+  }
+
+  function jumpToCommentAnchor(comment: CanvasComment) {
+    const el = bodyRef.current;
+    if (!el) return;
+    setMode('edit');
+    const offset = Math.max(0, Number(comment.anchorOffset) || 0);
+    const anchor = (comment.anchorText || '').trim();
+    let start = offset;
+    let end = offset;
+    if (anchor) {
+      const fromOffset = el.value.indexOf(anchor, Math.max(0, offset - 2));
+      const index =
+        fromOffset >= 0 ? fromOffset : el.value.indexOf(anchor);
+      if (index >= 0) {
+        start = index;
+        end = index + anchor.length;
+      }
+    }
+    window.setTimeout(() => {
+      el.focus();
+      try {
+        el.setSelectionRange(start, Math.max(start, end));
+      } catch {
+        // ignore selection errors
+      }
+      const lineHeight = Number.parseFloat(getComputedStyle(el).lineHeight) || 20;
+      const before = el.value.slice(0, start);
+      const line = before.split('\n').length - 1;
+      el.scrollTop = Math.max(0, line * lineHeight - 40);
+    }, 30);
   }
 
   async function submitComment() {
@@ -519,12 +635,19 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
           body: JSON.stringify({
             body,
             anchorText: commentAnchor.trim(),
-            anchorOffset: 0,
+            anchorOffset: commentAnchorOffset,
           }),
         },
       );
-      setComments((current) => [response.data, ...current]);
+      setComments((current) => {
+        if (current.some((item) => item.id === response.data.id)) {
+          return current;
+        }
+        return [response.data, ...current];
+      });
       setCommentDraft('');
+      setCommentAnchor('');
+      setCommentAnchorOffset(0);
       void ensureProfiles([response.data.authorId]);
     } catch (err) {
       setStatus(err instanceof Error ? err.message : 'Could not add comment');
@@ -579,9 +702,26 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
         <div>
           <h3>Canvas</h3>
           <p className="muted">
-            Shared work surface — markdown, @mentions, links, files, and section
-            comments.
+            Real-time collaborative doc — CRDT sync, colored live carets,
+            markdown, @mentions, and comments.
           </p>
+          {collabReady ? (
+            <div className="canvas-live-bar" aria-live="polite">
+              <span className="canvas-live-pill">
+                Live · {liveCount} editing
+              </span>
+              {peers.slice(0, 5).map((peer) => (
+                <span
+                  key={peer.clientId}
+                  className="canvas-peer-chip"
+                  style={{ ['--peer-color' as string]: peer.color }}
+                  title={`${peer.name} editing ${peer.field}`}
+                >
+                  {peer.name}
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
         <div className="canvas-head-actions">
           <div className="canvas-mode-toggle" role="tablist" aria-label="Canvas mode">
@@ -610,13 +750,46 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
         </div>
       </div>
 
-      <input
-        className="canvas-title"
-        value={canvas.title}
-        onChange={(event) => updateField('title', event.target.value)}
-        placeholder="Untitled canvas"
-        aria-label="Canvas title"
-      />
+      <div className="canvas-title-wrap">
+        <input
+          ref={titleRef}
+          className="canvas-title"
+          value={canvas.title}
+          onChange={(event) => updateField('title', event.target.value)}
+          onSelect={(event) => {
+            const el = event.currentTarget;
+            setLocalCursor(
+              'title',
+              el.selectionStart ?? 0,
+              el.selectionEnd ?? 0,
+            );
+          }}
+          onKeyUp={(event) => {
+            const el = event.currentTarget;
+            setLocalCursor(
+              'title',
+              el.selectionStart ?? 0,
+              el.selectionEnd ?? 0,
+            );
+          }}
+          onClick={(event) => {
+            const el = event.currentTarget;
+            setLocalCursor(
+              'title',
+              el.selectionStart ?? 0,
+              el.selectionEnd ?? 0,
+            );
+          }}
+          placeholder="Untitled canvas"
+          aria-label="Canvas title"
+        />
+        <CanvasRemoteCarets
+          field="title"
+          fieldRef={titleRef}
+          peers={peers}
+          text={canvas.title}
+        />
+      </div>
 
       {mode === 'edit' ? (
         <>
@@ -698,18 +871,37 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
               className="canvas-body"
               value={canvas.body}
               onChange={(event) => onBodyChange(event.target.value)}
-              onKeyUp={(event) =>
-                onBodyChange((event.target as HTMLTextAreaElement).value)
-              }
-              onClick={(event) =>
-                onBodyChange((event.target as HTMLTextAreaElement).value)
-              }
+              onSelect={(event) => {
+                const el = event.currentTarget;
+                setLocalCursor('body', el.selectionStart, el.selectionEnd);
+              }}
+              onKeyUp={(event) => {
+                const el = event.target as HTMLTextAreaElement;
+                onBodyChange(el.value);
+                setLocalCursor('body', el.selectionStart, el.selectionEnd);
+              }}
+              onClick={(event) => {
+                const el = event.target as HTMLTextAreaElement;
+                onBodyChange(el.value);
+                setLocalCursor('body', el.selectionStart, el.selectionEnd);
+              }}
+              onScroll={() => {
+                const el = bodyRef.current;
+                if (!el) return;
+                setLocalCursor('body', el.selectionStart, el.selectionEnd);
+              }}
               onKeyDown={onBodyKeyDown}
               placeholder={
                 'Write notes with *bold*, _italic_, # headings, - bullets…\n' +
                 'Type @ to mention someone. Use Link / File to embed.'
               }
               aria-label="Canvas content"
+            />
+            <CanvasRemoteCarets
+              field="body"
+              fieldRef={bodyRef}
+              peers={peers}
+              text={canvas.body}
             />
             {mentionQuery && mentionSuggestions.length ? (
               <ul className="canvas-mention-picker mention-picker" role="listbox">
@@ -898,7 +1090,14 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
               <li key={comment.id} className="canvas-comment-item">
                 {comment.anchorText ? (
                   <blockquote className="canvas-comment-anchor">
-                    {comment.anchorText}
+                    <button
+                      type="button"
+                      className="ghost canvas-comment-anchor-btn"
+                      onClick={() => jumpToCommentAnchor(comment)}
+                      title="Jump to anchored text"
+                    >
+                      {comment.anchorText}
+                    </button>
                   </blockquote>
                 ) : null}
                 <p>{comment.body}</p>
@@ -938,7 +1137,14 @@ export function CanvasPanel({ conversationId }: { conversationId: string }) {
                   >
                     {comment.anchorText ? (
                       <blockquote className="canvas-comment-anchor">
-                        {comment.anchorText}
+                        <button
+                          type="button"
+                          className="ghost canvas-comment-anchor-btn"
+                          onClick={() => jumpToCommentAnchor(comment)}
+                          title="Jump to anchored text"
+                        >
+                          {comment.anchorText}
+                        </button>
                       </blockquote>
                     ) : null}
                     <p>{comment.body}</p>

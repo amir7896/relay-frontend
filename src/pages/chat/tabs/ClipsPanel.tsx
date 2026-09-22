@@ -123,12 +123,22 @@ export function ClipsPanel({ conversationId }: { conversationId: string }) {
             mediaUrl: upload.data.url,
             mediaType,
             durationSeconds,
+            attachmentMime: upload.data.mime || file.type,
+            attachmentName: upload.data.name || fileName,
+            attachmentSize: upload.data.size ?? file.size,
           }),
         },
       );
       setClips((current) => [response.data, ...current]);
       void ensureProfiles([response.data.createdBy]);
-      setNotice(`${mediaType === 'video' ? 'Video' : 'Audio'} clip shared.`);
+      setNotice(
+        `${mediaType === 'video' ? 'Video' : 'Audio'} clip shared to Messages.`,
+      );
+      window.dispatchEvent(
+        new CustomEvent('relay:clip-shared', {
+          detail: { conversationId, clipId: response.data.id },
+        }),
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not upload the clip.');
     } finally {
@@ -265,7 +275,7 @@ export function ClipsPanel({ conversationId }: { conversationId: string }) {
         <div>
           <h3>Clips</h3>
           <p className="muted">
-            Short async audio or video updates — up to {MAX_CLIP_SECONDS}s.
+            Record up to {MAX_CLIP_SECONDS}s — clips post into Messages for everyone.
           </p>
         </div>
       </div>

@@ -18,13 +18,67 @@ import { useAuth } from '../auth/AuthContext';
 import { useDirectory } from '../people/DirectoryContext';
 import { displayName } from '../lib/format';
 
+type AskCitation = {
+  messageId: string;
+  conversationId: string;
+  conversationName: string | null;
+  conversationType: 'private' | 'group';
+  bodySnippet: string;
+  createdAt: string;
+};
+
+type AskResult = {
+  answer: string;
+  poweredByAi: boolean;
+  citations: AskCitation[];
+};
+
+type DigestSection = {
+  conversationId: string;
+  conversationName: string;
+  conversationType: 'private' | 'group';
+  unreadCount: number;
+  summary: string;
+  firstUnreadMessageId: string | null;
+  deepLink: string;
+};
+
+type DigestResult = {
+  generatedAt: string;
+  poweredByAi: boolean;
+  overview: string;
+  sections: DigestSection[];
+};
+
 type PaletteItem = {
   id: string;
-  group: 'Actions' | 'Channels' | 'Direct messages' | 'People' | 'Messages';
+  group:
+    | 'Actions'
+    | 'Ask Relay'
+    | 'Channels'
+    | 'Direct messages'
+    | 'People'
+    | 'Messages';
   title: string;
   subtitle?: string;
   run: () => void;
 };
+
+function parseAskQuery(raw: string): { isAsk: boolean; question: string } {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('?')) {
+    return { isAsk: true, question: trimmed.replace(/^\?+\s*/, '').trim() };
+  }
+  const askPrefix = trimmed.match(/^ask\s*:\s*(.+)$/i);
+  if (askPrefix) {
+    return { isAsk: true, question: askPrefix[1].trim() };
+  }
+  return { isAsk: false, question: trimmed };
+}
+
+function stripAskPrefix(raw: string): string {
+  return parseAskQuery(raw).question;
+}
 
 function isMacPlatform() {
   return (
@@ -58,26 +112,68 @@ export function CommandPalette() {
   const { byUserId, people, ensureProfiles } = useDirectory();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const [mode, setMode] = useState<'search' | 'ask'>('search');
   const [activeIndex, setActiveIndex] = useState(0);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [messageHits, setMessageHits] = useState<GlobalSearchHit[]>([]);
   const [busy, setBusy] = useState(false);
+  const [askBusy, setAskBusy] = useState(false);
+  const [askResult, setAskResult] = useState<AskResult | null>(null);
+  const [askError, setAskError] = useState('');
+  const [digestBusy, setDigestBusy] = useState(false);
+  const [digestResult, setDigestResult] = useState<DigestResult | null>(null);
+  const [digestError, setDigestError] = useState('');
   const inputRef = useRef<HTMLInputElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const digestPendingRef = useRef(false);
   const modKey = isMacPlatform() ? '⌘' : 'Ctrl';
+
+  const questionText = stripAskPrefix(query);
+  const isAskMode = mode === 'ask';
 
   const close = useCallback(() => {
     setOpen(false);
     setQuery('');
+    setMode('search');
     setActiveIndex(0);
     setMessageHits([]);
+    setAskResult(null);
+    setAskError('');
+    setAskBusy(false);
+    setDigestResult(null);
+    setDigestError('');
+    setDigestBusy(false);
+    digestPendingRef.current = false;
   }, []);
 
   const openPalette = useCallback(() => {
     setOpen(true);
     setQuery('');
+    setMode('search');
     setActiveIndex(0);
   }, []);
+
+  const runDailyDigest = useCallback(async () => {
+    if (digestBusy) return;
+    setDigestBusy(true);
+    setDigestError('');
+    setAskResult(null);
+    setAskError('');
+    try {
+      const response = await api<DigestResult>('/chat/digest', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      setDigestResult(response.data);
+    } catch (err) {
+      setDigestResult(null);
+      setDigestError(
+        err instanceof Error ? err.message : 'Daily digest failed',
+      );
+    } finally {
+      setDigestBusy(false);
+    }
+  }, [digestBusy]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -87,13 +183,25 @@ export function CommandPalette() {
       }
     };
     const onOpen = () => openPalette();
+    const onDigest = () => {
+      digestPendingRef.current = true;
+      openPalette();
+    };
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('relay:open-command-palette', onOpen);
+    window.addEventListener('relay:open-daily-digest', onDigest);
     return () => {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('relay:open-command-palette', onOpen);
+      window.removeEventListener('relay:open-daily-digest', onDigest);
     };
   }, [openPalette]);
+
+  useEffect(() => {
+    if (!open || !digestPendingRef.current) return;
+    digestPendingRef.current = false;
+    void runDailyDigest();
+  }, [open, runDailyDigest]);
 
   useEffect(() => {
     if (!open) return;
@@ -125,7 +233,19 @@ export function CommandPalette() {
 
   useEffect(() => {
     if (!open) return;
-    const term = query.trim();
+    // Legacy "? question" typing still flips into Ask mode.
+    if (parseAskQuery(query).isAsk) {
+      setMode('ask');
+    }
+    if (mode === 'ask') {
+      setMessageHits([]);
+      setBusy(false);
+      return;
+    }
+    setAskResult(null);
+    setAskError('');
+    setAskBusy(false);
+    const term = stripAskPrefix(query).trim();
     if (term.length < 2) {
       setMessageHits([]);
       setBusy(false);
@@ -152,13 +272,93 @@ export function CommandPalette() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [open, query]);
+  }, [open, query, mode]);
+
+  const runAskRelay = useCallback(
+    async (question: string) => {
+      const cleaned = question.trim();
+      if (cleaned.length < 3 || askBusy) return;
+      setAskBusy(true);
+      setAskError('');
+      setDigestResult(null);
+      setDigestError('');
+      try {
+        const response = await api<AskResult>('/chat/ask', {
+          method: 'POST',
+          body: JSON.stringify({ question: cleaned }),
+        });
+        setAskResult(response.data);
+      } catch (err) {
+        setAskResult(null);
+        setAskError(
+          err instanceof Error ? err.message : 'Ask Relay failed',
+        );
+      } finally {
+        setAskBusy(false);
+      }
+    },
+    [askBusy],
+  );
 
   const items = useMemo(() => {
-    const term = query.trim().toLowerCase();
+    const question = questionText.trim();
+    const term = isAskMode ? '' : question.toLowerCase();
     const list: PaletteItem[] = [];
 
+    if (question.length >= 3) {
+      list.push({
+        id: 'ask-relay-run',
+        group: 'Ask Relay',
+        title: askBusy
+          ? 'Asking…'
+          : isAskMode
+            ? `Ask: ${question}`
+            : `Ask Relay: ${question}`,
+        subtitle: askBusy
+          ? 'Searching messages and summarizing'
+          : 'AI answer grounded in your chat history — click or press Enter',
+        run: () => {
+          setMode('ask');
+          void runAskRelay(question);
+        },
+      });
+    }
+
+    if (isAskMode) {
+      if (list.length === 0) {
+        list.push({
+          id: 'ask-relay-hint',
+          group: 'Ask Relay',
+          title: 'Type a question above',
+          subtitle: 'Example: What channels do I have?',
+          run: () => inputRef.current?.focus(),
+        });
+      }
+      list.push({
+        id: 'action-daily-digest',
+        group: 'Actions',
+        title: digestBusy ? 'Generating digest…' : 'Daily digest',
+        subtitle: digestBusy
+          ? 'Summarizing unread channels and DMs'
+          : 'Morning catch-up across unread conversations',
+        run: () => {
+          void runDailyDigest();
+        },
+      });
+      return list;
+    }
+
     const actions: PaletteItem[] = [
+      {
+        id: 'action-ask-mode',
+        group: 'Actions',
+        title: 'Ask Relay',
+        subtitle: 'Ask AI about your workspace chat',
+        run: () => {
+          setMode('ask');
+          window.setTimeout(() => inputRef.current?.focus(), 20);
+        },
+      },
       {
         id: 'action-shortcuts',
         group: 'Actions',
@@ -166,6 +366,17 @@ export function CommandPalette() {
         subtitle: 'Jump channels, unreads, Threads, and more',
         run: () => {
           window.dispatchEvent(new CustomEvent('relay:open-shortcuts'));
+        },
+      },
+      {
+        id: 'action-daily-digest',
+        group: 'Actions',
+        title: digestBusy ? 'Generating digest…' : 'Daily digest',
+        subtitle: digestBusy
+          ? 'Summarizing unread channels and DMs'
+          : 'Morning catch-up across unread conversations',
+        run: () => {
+          void runDailyDigest();
         },
       },
       {
@@ -384,7 +595,8 @@ export function CommandPalette() {
 
     return list;
   }, [
-    query,
+    questionText,
+    isAskMode,
     conversations,
     messageHits,
     people,
@@ -392,6 +604,10 @@ export function CommandPalette() {
     byUserId,
     navigate,
     isAdmin,
+    askBusy,
+    runAskRelay,
+    digestBusy,
+    runDailyDigest,
   ]);
 
   useEffect(() => {
@@ -407,6 +623,15 @@ export function CommandPalette() {
   }, [activeIndex, open]);
 
   function runItem(item: PaletteItem) {
+    if (
+      item.id === 'ask-relay-run' ||
+      item.id === 'ask-relay-hint' ||
+      item.id === 'action-daily-digest' ||
+      item.id === 'action-ask-mode'
+    ) {
+      item.run();
+      return;
+    }
     close();
     item.run();
   }
@@ -415,6 +640,8 @@ export function CommandPalette() {
     return null;
   }
 
+  const canAsk = questionText.trim().length >= 3;
+  const showAskPanel = isAskMode || askBusy || Boolean(askResult) || Boolean(askError);
   const grouped = items.reduce<Record<string, PaletteItem[]>>((acc, item) => {
     (acc[item.group] ??= []).push(item);
     return acc;
@@ -436,36 +663,199 @@ export function CommandPalette() {
         aria-modal="true"
         aria-label="Command palette"
       >
+        <div className="command-palette-modes" role="tablist" aria-label="Palette mode">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={!isAskMode}
+            className={`command-palette-mode${!isAskMode ? ' is-active' : ''}`}
+            onClick={() => {
+              setMode('search');
+              setAskResult(null);
+              setAskError('');
+              window.setTimeout(() => inputRef.current?.focus(), 20);
+            }}
+          >
+            Search
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={isAskMode}
+            className={`command-palette-mode${isAskMode ? ' is-active' : ''}`}
+            onClick={() => {
+              setMode('ask');
+              window.setTimeout(() => inputRef.current?.focus(), 20);
+            }}
+          >
+            Ask Relay
+          </button>
+        </div>
         <div className="command-palette-search">
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-            <path
-              fill="currentColor"
-              d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 14 15.5l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"
-            />
+            {isAskMode ? (
+              <path
+                fill="currentColor"
+                d="M12 2a7 7 0 0 0-7 7c0 2.4 1.2 4.5 3 5.7V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.3c1.8-1.2 3-3.3 3-5.7a7 7 0 0 0-7-7zm-1 18h2v1h-2v-1z"
+              />
+            ) : (
+              <path
+                fill="currentColor"
+                d="M15.5 14h-.8l-.3-.3A6.5 6.5 0 1 0 14 15.5l.3.3v.8l5 5 1.5-1.5-5-5zm-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z"
+              />
+            )}
           </svg>
           <input
             ref={inputRef}
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder={`Jump to a channel, person, or message… (${modKey}K)`}
+            placeholder={
+              isAskMode
+                ? 'Ask anything about your workspace…'
+                : `Search channels, people, messages… (${modKey}K)`
+            }
             aria-autocomplete="list"
             aria-controls="command-palette-list"
             onKeyDown={(event) => {
               if (event.key === 'ArrowDown') {
                 event.preventDefault();
-                setActiveIndex((i) => Math.min(i + 1, Math.max(items.length - 1, 0)));
+                setActiveIndex((i) =>
+                  Math.min(i + 1, Math.max(items.length - 1, 0)),
+                );
               } else if (event.key === 'ArrowUp') {
                 event.preventDefault();
                 setActiveIndex((i) => Math.max(i - 1, 0));
               } else if (event.key === 'Enter') {
                 event.preventDefault();
+                if (isAskMode && canAsk) {
+                  void runAskRelay(questionText.trim());
+                  return;
+                }
                 const selected = items[activeIndex];
                 if (selected) runItem(selected);
               }
             }}
           />
-          <kbd className="command-palette-kbd">esc</kbd>
+          {isAskMode && canAsk ? (
+            <button
+              type="button"
+              className="btn command-palette-ask-btn"
+              disabled={askBusy}
+              onClick={() => void runAskRelay(questionText.trim())}
+            >
+              {askBusy ? 'Asking…' : 'Ask'}
+            </button>
+          ) : (
+            <kbd className="command-palette-kbd">esc</kbd>
+          )}
         </div>
+        {showAskPanel ? (
+          <div className="command-palette-ask" aria-live="polite">
+            {askBusy ? (
+              <p className="muted">Searching messages and writing an answer…</p>
+            ) : null}
+            {askError ? <p className="error">{askError}</p> : null}
+            {askResult ? (
+              <>
+                <div className="command-palette-ask-head">
+                  <strong>Ask Relay</strong>
+                  <span className="muted">
+                    {askResult.poweredByAi ? 'AI · grounded citations' : 'Local matches'}
+                  </span>
+                </div>
+                <pre className="command-palette-ask-answer">{askResult.answer}</pre>
+                {askResult.citations.length > 0 ? (
+                  <div className="command-palette-ask-citations">
+                    {askResult.citations.map((citation, index) => {
+                      const label = citation.conversationName
+                        ? `#${citation.conversationName.replace(/^#/, '')}`
+                        : citation.conversationType === 'group'
+                          ? '#channel'
+                          : 'DM';
+                      return (
+                        <button
+                          key={`${citation.messageId}-${index}`}
+                          type="button"
+                          className="command-palette-citation"
+                          title={citation.bodySnippet}
+                          onClick={() => {
+                            close();
+                            navigate(
+                              `/chat/${citation.conversationId}?focus=${encodeURIComponent(citation.messageId)}`,
+                            );
+                          }}
+                        >
+                          <span className="command-palette-citation-idx">
+                            {index + 1}
+                          </span>
+                          <span className="command-palette-citation-copy">
+                            <strong>{label}</strong>
+                            <small>{citation.bodySnippet}</small>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                ) : null}
+              </>
+            ) : !askBusy && !askError && isAskMode ? (
+              <p className="muted">
+                {canAsk
+                  ? 'Press Enter or click Ask.'
+                  : 'Type a question (at least a few words), then press Enter.'}
+              </p>
+            ) : null}
+          </div>
+        ) : null}
+        {digestBusy || digestResult || digestError ? (
+          <div className="command-palette-digest" aria-live="polite">
+            {digestBusy ? (
+              <p className="muted">Scanning unread channels and writing your digest…</p>
+            ) : null}
+            {digestError ? <p className="error">{digestError}</p> : null}
+            {digestResult ? (
+              <>
+                <div className="command-palette-digest-head">
+                  <strong>Daily digest</strong>
+                  <span className="muted">
+                    {digestResult.poweredByAi
+                      ? 'AI · unread catch-up'
+                      : 'Unread catch-up'}
+                  </span>
+                </div>
+                <pre className="command-palette-digest-overview">
+                  {digestResult.overview}
+                </pre>
+                {digestResult.sections.length > 0 ? (
+                  <div className="command-palette-digest-sections">
+                    {digestResult.sections.map((section) => (
+                      <button
+                        key={section.conversationId}
+                        type="button"
+                        className="command-palette-digest-section"
+                        title={section.summary}
+                        onClick={() => {
+                          close();
+                          navigate(section.deepLink);
+                        }}
+                      >
+                        <span className="command-palette-digest-section-meta">
+                          <strong>{section.conversationName}</strong>
+                          <span className="muted">
+                            {section.unreadCount} unread
+                          </span>
+                        </span>
+                        <small>{section.summary}</small>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="muted">Nothing unread to open.</p>
+                )}
+              </>
+            ) : null}
+          </div>
+        ) : null}
         <div
           id="command-palette-list"
           className="command-palette-list"
@@ -474,7 +864,11 @@ export function CommandPalette() {
         >
           {items.length === 0 ? (
             <p className="command-palette-empty muted">
-              {busy ? 'Searching…' : 'No matches. Try a channel name or message text.'}
+              {busy
+                ? 'Searching…'
+                : isAskMode
+                  ? 'Type a question, then press Enter or click Ask.'
+                  : 'No matches. Try a channel name, or switch to Ask Relay.'}
             </p>
           ) : (
             Object.entries(grouped).map(([group, groupItems]) => (
@@ -495,9 +889,13 @@ export function CommandPalette() {
                       onMouseEnter={() => setActiveIndex(index)}
                       onClick={() => runItem(item)}
                     >
-                      <span className="command-palette-item-title">{item.title}</span>
+                      <span className="command-palette-item-title">
+                        {item.title}
+                      </span>
                       {item.subtitle ? (
-                        <span className="command-palette-item-sub">{item.subtitle}</span>
+                        <span className="command-palette-item-sub">
+                          {item.subtitle}
+                        </span>
                       ) : null}
                     </button>
                   );
@@ -512,8 +910,9 @@ export function CommandPalette() {
             <kbd>↓</kbd> navigate
           </span>
           <span>
-            <kbd>↵</kbd> open
+            <kbd>↵</kbd> {isAskMode ? 'ask' : 'open'}
           </span>
+          <span>Use the Ask Relay tab for AI</span>
           <span>
             <kbd>{modKey}</kbd>
             <kbd>K</kbd> toggle

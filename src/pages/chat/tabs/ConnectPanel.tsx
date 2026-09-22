@@ -1,12 +1,54 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { api } from '../../../api/client';
-import type { ConnectInvite, ConnectLink, ConnectStatus } from '../../../api/types';
+import type {
+  ConnectActivityEvent,
+  ConnectInvite,
+  ConnectLink,
+  ConnectStatus,
+} from '../../../api/types';
 
 function absoluteInviteUrl(pathOrUrl: string | null | undefined) {
   if (!pathOrUrl) return '';
   if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
   return `${origin}${pathOrUrl.startsWith('/') ? pathOrUrl : `/${pathOrUrl}`}`;
+}
+
+function formatActivityAction(action: string, meta: Record<string, unknown>) {
+  switch (action) {
+    case 'connect.invite.created':
+      return meta.inviteKind === 'workspace_share'
+        ? `Workspace invite created for ${String(meta.email ?? 'partner')}`
+        : `Guest invite created for ${String(meta.email ?? 'guest')}`;
+    case 'connect.invite.revoked':
+      return `Invite revoked (${String(meta.email ?? 'unknown')})`;
+    case 'connect.invite.accepted':
+      return `Guest accepted — role: ${String(meta.role ?? 'guest')}`;
+    case 'connect.workspace.connected':
+      return `Workspaces connected${
+        meta.partnerOrganizationName
+          ? ` with ${String(meta.partnerOrganizationName)}`
+          : ''
+      }`;
+    case 'connect.channel.disconnected':
+      return `Shared channel disconnected (${String(meta.disconnectedBy ?? 'party')})`;
+    default:
+      return action.replace(/^connect\./, '').replace(/\./g, ' ');
+  }
+}
+
+function formatWhen(iso: string) {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  } catch {
+    return iso;
+  }
 }
 
 export function ConnectPanel({ conversationId }: { conversationId: string }) {
@@ -134,6 +176,8 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
         (invite.inviteKind ?? 'guest_email') === 'guest_email',
     ) ?? [];
   const links: ConnectLink[] = status?.links ?? [];
+  const linkHistory: ConnectLink[] = status?.linkHistory ?? [];
+  const activity: ConnectActivityEvent[] = status?.activity ?? [];
 
   return (
     <section className="feature-panel connect-panel">
@@ -146,6 +190,11 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
               : 'Share this channel with another workspace, or invite an external guest.'}
           </p>
         </div>
+        {status?.connectRole ? (
+          <span className={`connect-role-badge connect-role-${status.connectRole}`}>
+            {status.connectRole === 'host' ? 'Host workspace' : 'Partner workspace'}
+          </span>
+        ) : null}
       </div>
       <div className="connect-status">
         <span
@@ -307,10 +356,61 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
           </ul>
         </div>
       ) : null}
+
       {acceptedGuests.length > 0 ? (
-        <p className="muted">
-          Guests: {acceptedGuests.map((invite) => invite.email).join(', ')}
-        </p>
+        <div className="connect-invite-list">
+          <h4>Guest access</h4>
+          <ul>
+            {acceptedGuests.map((invite) => (
+              <li key={invite.id}>
+                <div>
+                  <strong>{invite.email}</strong>
+                  <span className="connect-role-pill">Guest</span>
+                  {invite.acceptedAt ? (
+                    <span className="muted"> · joined {formatWhen(invite.acceptedAt)}</span>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {linkHistory.length > 0 ? (
+        <div className="connect-invite-list">
+          <h4>Past connections</h4>
+          <ul>
+            {linkHistory.map((link) => (
+              <li key={link.id}>
+                <div>
+                  <strong>
+                    {link.partnerOrganizationName ||
+                      link.hostOrganizationName ||
+                      'Workspace'}
+                  </strong>
+                  <span className="muted"> · disconnected</span>
+                  {link.disconnectedAt ? (
+                    <span className="muted"> · {formatWhen(link.disconnectedAt)}</span>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {activity.length > 0 ? (
+        <div className="connect-activity">
+          <h4>Audit trail</h4>
+          <ol>
+            {activity.map((event) => (
+              <li key={event.id}>
+                <time dateTime={event.createdAt}>{formatWhen(event.createdAt)}</time>
+                <span>{formatActivityAction(event.action, event.meta)}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
       ) : null}
     </section>
   );

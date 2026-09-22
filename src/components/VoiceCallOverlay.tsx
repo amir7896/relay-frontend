@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useAuth } from '../auth/AuthContext';
 import { useVoiceCall } from '../calls/VoiceCallContext';
 import { VOICE_CLARITY_LABELS, type VoiceClarityMode } from '../calls/callVoiceClarity';
@@ -76,6 +77,17 @@ function MinimizeIcon() {
       <path
         fill="currentColor"
         d="M8.1 9.9 12 13.8l3.9-3.9 1.4 1.4L12 16.6 6.7 11.3z"
+      />
+    </svg>
+  );
+}
+
+function ShareIcon() {
+  return (
+    <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M20 3H9a2 2 0 0 0-2 2v2h2V5h11v10h-2v2h3a1 1 0 0 0 1-1V5a2 2 0 0 0-2-2zM15 9H4a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2zm0 10H4v-8h11v8z"
       />
     </svg>
   );
@@ -238,6 +250,7 @@ export function VoiceCallOverlay() {
     screenSharerId,
     minimized,
     pipActive,
+    pipWindow,
     supportsPip,
     remoteSpeaking,
     speakingPeerIds,
@@ -415,11 +428,14 @@ export function VoiceCallOverlay() {
                 : error || (isHuddle ? 'Huddle ended' : 'Call ended');
 
   const isHost = Boolean(me && (roster?.hostId ?? call?.hostId) === me);
+  const iAmSpeaking = Boolean(me && speakingPeerIds.includes(me));
+  const iAmSharing = Boolean(me && screenSharerId === me);
 
-  if (minimized && phase !== 'ended') {
-    return (
+  const miniBubble = (
       <div
-        className={`voice-call-mini${pipActive ? ' pip' : ''}`}
+        className={`voice-call-mini${pipActive ? ' pip' : ''}${
+          iAmSharing ? ' is-sharing' : ''
+        }${iAmSpeaking ? ' is-speaking-local' : ''}`}
         role="dialog"
         aria-label="Call minimized"
       >
@@ -433,18 +449,34 @@ export function VoiceCallOverlay() {
           aria-label="Expand call"
         >
           <span
-            className={`voice-call-mini-avatar${remoteSpeaking ? ' speaking' : ''}`}
+            className={`voice-call-mini-avatar${
+              remoteSpeaking || iAmSpeaking ? ' speaking' : ''
+            }`}
           >
             {avatarUrl ? <img src={avatarUrl} alt="" /> : peerInitials}
           </span>
           <span className="voice-call-mini-meta">
             <strong>{isHuddle ? 'Huddle' : isGroup ? 'Group call' : peerName}</strong>
             <small>
-              {onHold ? 'On hold' : statusText}
-              {screenSharerId ? ' · Sharing screen' : ''}
+              {onHold
+                ? 'On hold'
+                : iAmSharing
+                  ? "You're sharing"
+                  : statusText}
+              {screenSharerId && !iAmSharing ? ' · Sharing screen' : ''}
             </small>
           </span>
         </button>
+        {iAmSharing ? (
+          <button
+            type="button"
+            className="voice-call-round share active"
+            aria-label="Stop sharing"
+            onClick={() => void toggleScreenShare()}
+          >
+            <ShareIcon />
+          </button>
+        ) : null}
         <button
           type="button"
           className={`voice-call-round mute${muted || forceMuted ? ' active' : ''}`}
@@ -464,7 +496,13 @@ export function VoiceCallOverlay() {
           <PhoneIcon />
         </button>
       </div>
-    );
+  );
+
+  if (minimized && phase !== 'ended') {
+    if (pipActive && pipWindow?.document?.body) {
+      return createPortal(miniBubble, pipWindow.document.body);
+    }
+    return miniBubble;
   }
 
   return (
@@ -532,11 +570,23 @@ export function VoiceCallOverlay() {
             Host muted everyone
           </div>
         ) : null}
-        {showingShare && !shareExpanded ? (
+        {iAmSharing ? (
+          <div className="voice-call-share-you-banner" role="status">
+            <span>
+              <strong>You’re sharing your screen</strong>
+              <small>Everyone in the call can see it</small>
+            </span>
+            <button
+              type="button"
+              className="btn ghost danger-text"
+              onClick={() => void toggleScreenShare()}
+            >
+              Stop sharing
+            </button>
+          </div>
+        ) : showingShare ? (
           <div className="voice-call-hold-banner share" role="status">
-            {screenSharerId === me
-              ? 'You are sharing your screen'
-              : 'Screen sharing'}
+            Screen sharing
           </div>
         ) : null}
 
@@ -586,7 +636,7 @@ export function VoiceCallOverlay() {
                     mirror={!screenSharing}
                     label="You"
                     placeholder="You"
-                    speaking={false}
+                    speaking={iAmSpeaking}
                   />
                   {isGroup
                     ? participantTiles
@@ -635,7 +685,7 @@ export function VoiceCallOverlay() {
                 mirror
                 label="You"
                 placeholder="You"
-                speaking={false}
+                speaking={iAmSpeaking}
               />
               {isGroup
                 ? participantTiles

@@ -40,6 +40,7 @@ import {
 } from '../../calls/types';
 import {
   extractMentionIds,
+  extractSlackMentionIds,
   firstUrl,
   isPlaceholderBody,
   parseMentionQuery,
@@ -75,6 +76,7 @@ import type {
 } from '../../api/types';
 import type { MessengerOutletContext } from './MessengerPage';
 import { ChannelTabs, type ChannelTab } from './ChannelTabs';
+import { FilesPanel, type MediaKindTab } from './tabs/FilesPanel';
 
 const DELETE_FOR_EVERYONE_MS = Number.POSITIVE_INFINITY;
 const EDIT_WINDOW_MS = 15 * 60 * 1000;
@@ -175,10 +177,15 @@ function defaultScheduleLocalValue() {
   return toDatetimeLocalValue(new Date(Date.now() + 5 * 60 * 1000));
 }
 
-type MediaKindTab = 'all' | 'image' | 'file' | 'audio';
-
-function mediaKindOf(message: ChatMessage): 'image' | 'file' | 'audio' {
+function mediaKindOf(message: ChatMessage): 'image' | 'file' | 'audio' | 'video' {
   const mime = message.attachment?.mime ?? '';
+  const name = message.attachment?.name ?? '';
+  if (
+    mime.startsWith('video/') ||
+    /^clip-video-/i.test(name)
+  ) {
+    return 'video';
+  }
   if (
     message.type === 'audio' ||
     mime.startsWith('audio/') ||
@@ -203,6 +210,9 @@ function mediaDownloadName(message: ChatMessage): string {
   }
   if (kind === 'audio') {
     return 'voice-note.webm';
+  }
+  if (kind === 'video') {
+    return 'clip.webm';
   }
   return 'file';
 }
@@ -572,6 +582,21 @@ export function ThreadView() {
   const [error, setError] = useState('');
   const [actionError, setActionError] = useState('');
   const [slashNotice, setSlashNotice] = useState('');
+  const [askOpen, setAskOpen] = useState(false);
+  const [askQuestion, setAskQuestion] = useState('');
+  const [askBusy, setAskBusy] = useState(false);
+  const [askError, setAskError] = useState('');
+  const [askResult, setAskResult] = useState<{
+    answer: string;
+    poweredByAi: boolean;
+    citations: Array<{
+      messageId: string;
+      conversationId: string;
+      conversationName: string | null;
+      bodySnippet: string;
+    }>;
+  } | null>(null);
+  const askInputRef = useRef<HTMLInputElement | null>(null);
   const [slashCommands, setSlashCommands] = useState<
     Array<{ name: string; description: string; builtin?: boolean }>
   >([]);
@@ -610,20 +635,25 @@ export function ThreadView() {
   const [forwardMessage, setForwardMessage] = useState<ChatMessage | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [pinnedMessages, setPinnedMessages] = useState<ChatMessage[]>([]);
-  const [pinnedBannerOpen, setPinnedBannerOpen] = useState(false);
   const [mentionJumpId, setMentionJumpId] = useState<string | null>(null);
   const [unreadDividerId, setUnreadDividerId] = useState<string | null>(null);
+  const [catchUpSince, setCatchUpSince] = useState<string | null>(null);
+  const [catchUpUnreadCount, setCatchUpUnreadCount] = useState(0);
+  const [catchUpOpen, setCatchUpOpen] = useState(false);
+  const [catchUpBusy, setCatchUpBusy] = useState(false);
+  const [catchUpSummary, setCatchUpSummary] = useState('');
+  const [catchUpPoweredByAi, setCatchUpPoweredByAi] = useState(false);
+  const [catchUpFirstUnreadId, setCatchUpFirstUnreadId] = useState<
+    string | null
+  >(null);
+  const [catchUpError, setCatchUpError] = useState('');
   const [channelNotifyMode, setChannelNotifyMode] =
     useState<ChannelNotifyMode>('default');
   const [notifyMenuOpen, setNotifyMenuOpen] = useState(false);
   const [channelNotifyBusy, setChannelNotifyBusy] = useState(false);
   const [mentionBannerDismissed, setMentionBannerDismissed] = useState(false);
-  const [mediaOpen, setMediaOpen] = useState(false);
-  const [mediaKind, setMediaKind] = useState<MediaKindTab>('all');
-  const [mediaItems, setMediaItems] = useState<ChatMessage[]>([]);
-  const [mediaBusy, setMediaBusy] = useState(false);
-  const [mediaPage, setMediaPage] = useState(1);
-  const [mediaHasMore, setMediaHasMore] = useState(false);
+  const [filesInitialKind, setFilesInitialKind] = useState<MediaKindTab>('all');
+  const [dmFilesOpen, setDmFilesOpen] = useState(false);
   const [mediaDownloadingId, setMediaDownloadingId] = useState<string | null>(null);
   const [channelTab, setChannelTab] = useState<ChannelTab>('messages');
   const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
@@ -817,18 +847,36 @@ export function ThreadView() {
     [userGroups],
   );
 
-  /** All members (including you) — needed so @you renders WhatsApp-style without "@". */
+  /** Members + any loaded profiles — so `<@uuid>` bot mentions resolve to names. */
   const mentionRenderLabels = useMemo(() => {
-    if (!conversation || conversation.type !== 'group') {
-      return new Map<string, string>();
+    const map = new Map<string, string>();
+    for (const [userId, profile] of byUserId) {
+      map.set(userId, displayName(profile));
     }
-    return new Map(
-      conversation.members.map((member) => [
-        member.userId,
-        displayName(byUserId.get(member.userId)),
-      ]),
-    );
+    if (conversation?.type === 'group') {
+      for (const member of conversation.members) {
+        if (!map.has(member.userId)) {
+          map.set(member.userId, displayName(byUserId.get(member.userId)));
+        }
+      }
+    }
+    return map;
   }, [conversation, byUserId]);
+
+  useEffect(() => {
+    const ids = new Set<string>();
+    for (const message of messages) {
+      for (const mentionId of message.mentions ?? []) {
+        ids.add(mentionId);
+      }
+      for (const mentionId of extractSlackMentionIds(message.body ?? '')) {
+        ids.add(mentionId);
+      }
+    }
+    if (ids.size) {
+      void ensureProfiles([...ids]);
+    }
+  }, [messages, ensureProfiles]);
 
   const memberByUserId = useMemo(() => {
     const map = new Map(
@@ -1012,7 +1060,6 @@ export function ThreadView() {
     setConversation(null);
     setMessages([]);
     setPinnedMessages([]);
-    setPinnedBannerOpen(false);
     setMentionJumpId(null);
     setUnreadDividerId(null);
     setMentionBannerDismissed(false);
@@ -1060,6 +1107,12 @@ export function ThreadView() {
     const lastReadMs = myMembership?.lastReadAt
       ? new Date(myMembership.lastReadAt).getTime()
       : NaN;
+    setCatchUpSince(myMembership?.lastReadAt ?? conv.data.lastReadAt ?? null);
+    setCatchUpUnreadCount(unreadCount);
+    setCatchUpSummary('');
+    setCatchUpError('');
+    setCatchUpOpen(false);
+    setCatchUpFirstUnreadId(null);
     const channelMessages = historyBatch.filter(
       (item) => !item.threadRootId && item.type !== 'call',
     );
@@ -1079,6 +1132,9 @@ export function ThreadView() {
       }
     }
     setUnreadDividerId(dividerId);
+    if (dividerId) {
+      setCatchUpFirstUnreadId(dividerId);
+    }
 
     void loadChannelNotificationMode(id).then(setChannelNotifyMode);
 
@@ -1101,6 +1157,7 @@ export function ThreadView() {
       .then((response) => setSlashCommands(response.data.items ?? []))
       .catch(() =>
         setSlashCommands([
+          { name: 'ai', description: 'Ask Relay about this channel (/ai …)', builtin: true },
           { name: 'remind', description: 'Remind yourself (/remind 1h …)', builtin: true },
           { name: 'poll', description: 'Create a poll', builtin: true },
           { name: 'assign', description: 'Assign a list task', builtin: true },
@@ -1213,6 +1270,11 @@ export function ThreadView() {
     setError('');
     setActionError('');
     setComposer('');
+    setAskOpen(false);
+    setAskQuestion('');
+    setAskResult(null);
+    setAskError('');
+    setAskBusy(false);
     setRemindMenuOpen(false);
     setRemindCustomOpen(false);
     setReminderToast(null);
@@ -1231,12 +1293,8 @@ export function ThreadView() {
     setSearchQuery('');
     setSearchResults([]);
     setPinnedMessages([]);
-    setPinnedBannerOpen(false);
-    setMediaOpen(false);
-    setMediaKind('all');
-    setMediaItems([]);
-    setMediaPage(1);
-    setMediaHasMore(false);
+    setFilesInitialKind('all');
+    setDmFilesOpen(false);
     setMediaDownloadingId(null);
     setChannelTab('messages');
     setHighlightId(null);
@@ -1890,6 +1948,19 @@ export function ThreadView() {
     if (/^\/[a-zA-Z]/.test(body)) {
       setSlashNotice('');
       let raw = body;
+
+      // Channel-scoped Ask Relay — open the simple Ask panel.
+      if (/^\/ai\b/i.test(raw)) {
+        const question = raw.replace(/^\/ai\b/i, '').trim();
+        setComposer('');
+        clearMessageDraft(id);
+        openChannelAsk(question);
+        if (question.length >= 3) {
+          void runChannelAsk(question);
+        }
+        return;
+      }
+
       if (/^\/assign\b/i.test(raw)) {
         for (const member of mentionCandidates) {
           if (member.userId.startsWith('__')) continue;
@@ -1922,6 +1993,9 @@ export function ThreadView() {
           setSlashNotice(`Status set to “${response.data.customStatus}”`);
         } else if (response.data.kind === 'status') {
           setSlashNotice('Status cleared');
+        }
+        if (/^\/remind\b/i.test(raw)) {
+          void refreshLater();
         }
         setComposer('');
         clearMessageDraft(id);
@@ -2090,40 +2164,16 @@ export function ThreadView() {
   }
 
 
-  async function loadMedia(page = 1, kind: MediaKindTab = mediaKind, append = false) {
-    if (!id) {
-      return;
-    }
-    setMediaBusy(true);
-    try {
-      const response = await api<Paginated<ChatMessage>>(
-        `/chat/conversations/${id}/media?page=${page}&limit=40&kind=${kind}`,
-      );
-      const items = response.data.items
-        .map(normalizeMessage)
-        .filter((item) => item.attachment && !item.deletedForEveryone);
-      setMediaItems((current) => (append ? [...current, ...items] : items));
-      setMediaPage(page);
-      setMediaHasMore(Boolean(response.data.meta.hasNextPage));
-    } catch (err) {
-      if (!append) {
-        setMediaItems([]);
-      }
-      setActionError(err instanceof Error ? err.message : 'Could not load media');
-    } finally {
-      setMediaBusy(false);
-    }
-  }
-
-  function openMedia(kind: MediaKindTab = 'all') {
+  function openFilesPage(kind: MediaKindTab = 'all') {
     setToolsMenuOpen(false);
     setSearchOpen(false);
-    setMediaKind(kind);
-    setMediaOpen(true);
-    setMediaItems([]);
-    setMediaPage(1);
-    setMediaHasMore(false);
-    void loadMedia(1, kind, false);
+    setFilesInitialKind(kind);
+    if (conversation?.type === 'group') {
+      setDmFilesOpen(false);
+      setChannelTab('files');
+      return;
+    }
+    setDmFilesOpen(true);
   }
 
   useEffect(() => {
@@ -2135,7 +2185,7 @@ export function ThreadView() {
       mediaParam === 'image' || mediaParam === 'file' || mediaParam === 'audio'
         ? mediaParam
         : 'all';
-    openMedia(kind);
+    openFilesPage(kind);
     setSearchParams(
       (current) => {
         const next = new URLSearchParams(current);
@@ -2318,7 +2368,50 @@ export function ThreadView() {
     insertComposerSnippet(href);
   }
 
+  async function runChannelAsk(questionRaw?: string) {
+    const question = (questionRaw ?? askQuestion).trim();
+    if (question.length < 3 || askBusy) return;
+    setAskBusy(true);
+    setAskError('');
+    setAskResult(null);
+    setSlashNotice('');
+    try {
+      const response = await api<{
+        answer: string;
+        poweredByAi: boolean;
+        citations: Array<{
+          messageId: string;
+          conversationId: string;
+          conversationName: string | null;
+          bodySnippet: string;
+        }>;
+      }>('/chat/ask', {
+        method: 'POST',
+        body: JSON.stringify({ question, conversationId: id }),
+      });
+      setAskResult(response.data);
+      setAskOpen(true);
+    } catch (err) {
+      setAskError(err instanceof Error ? err.message : 'Ask Relay failed');
+      setAskOpen(true);
+    } finally {
+      setAskBusy(false);
+    }
+  }
+
+  function openChannelAsk(seed = '') {
+    setAskOpen(true);
+    setAskError('');
+    if (seed.trim()) setAskQuestion(seed.trim());
+    window.setTimeout(() => askInputRef.current?.focus(), 40);
+  }
+
   function insertSlashCommand(name: string) {
+    if (name === 'ai') {
+      setComposer('');
+      openChannelAsk();
+      return;
+    }
     if (name === 'assign') {
       setComposer('/assign ');
     } else if (name === 'remind') {
@@ -2914,6 +3007,39 @@ export function ThreadView() {
     const el = messageRefs.current.get(messageId);
     el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     window.setTimeout(() => setHighlightId(null), 1600);
+  }
+
+  async function runCatchMeUp() {
+    if (!id || catchUpBusy) return;
+    setCatchUpOpen(true);
+    setCatchUpBusy(true);
+    setCatchUpError('');
+    try {
+      const response = await api<{
+        summary: string;
+        poweredByAi: boolean;
+        messageCount: number;
+        firstUnreadMessageId: string | null;
+        since: string | null;
+      }>(`/chat/conversations/${id}/catch-up`, {
+        method: 'POST',
+        body: JSON.stringify({ since: catchUpSince }),
+      });
+      setCatchUpSummary(response.data.summary);
+      setCatchUpPoweredByAi(Boolean(response.data.poweredByAi));
+      if (response.data.firstUnreadMessageId) {
+        setCatchUpFirstUnreadId(response.data.firstUnreadMessageId);
+      }
+      if (response.data.messageCount > 0) {
+        setCatchUpUnreadCount(response.data.messageCount);
+      }
+    } catch (err) {
+      setCatchUpError(
+        err instanceof Error ? err.message : 'Could not catch you up',
+      );
+    } finally {
+      setCatchUpBusy(false);
+    }
   }
 
   useEffect(() => {
@@ -3733,16 +3859,20 @@ export function ThreadView() {
 
           <div className="thread-tools-secondary">
             <button
-              className={`ghost thread-tool-btn${mediaOpen ? ' active' : ''}`}
+              className={`ghost thread-tool-btn${
+                channelTab === 'files' || dmFilesOpen ? ' active' : ''
+              }`}
               type="button"
-              aria-label="Media"
-              title="Media"
-              aria-pressed={mediaOpen}
+              aria-label="Files"
+              title="Files"
+              aria-pressed={channelTab === 'files' || dmFilesOpen}
               onClick={() => {
-                if (mediaOpen) {
-                  setMediaOpen(false);
+                if (conversation?.type === 'group' && channelTab === 'files') {
+                  setChannelTab('messages');
+                } else if (dmFilesOpen) {
+                  setDmFilesOpen(false);
                 } else {
-                  openMedia('all');
+                  openFilesPage('all');
                 }
               }}
             >
@@ -3761,7 +3891,6 @@ export function ThreadView() {
               aria-pressed={searchOpen}
               onClick={() => {
                 setToolsMenuOpen(false);
-                setMediaOpen(false);
                 setSearchOpen((open) => !open);
               }}
             >
@@ -3904,16 +4033,25 @@ export function ThreadView() {
               <button
                 type="button"
                 role="menuitem"
-                onClick={() => openMedia('all')}
+                onClick={() => {
+                  setToolsMenuOpen(false);
+                  void runCatchMeUp();
+                }}
               >
-                Media
+                Catch me up
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => openFilesPage('all')}
+              >
+                Files
               </button>
               <button
                 type="button"
                 role="menuitem"
                 onClick={() => {
                   setToolsMenuOpen(false);
-                  setMediaOpen(false);
                   setSearchOpen(true);
                 }}
               >
@@ -4125,6 +4263,37 @@ export function ThreadView() {
         </div>
       ) : null}
 
+      {catchUpUnreadCount > 0 && unreadDividerId && !catchUpOpen ? (
+        <div className="catch-up-banner">
+          <button
+            type="button"
+            className="catch-up-banner-main"
+            onClick={() => void runCatchMeUp()}
+            disabled={catchUpBusy}
+          >
+            <span className="catch-up-banner-icon" aria-hidden="true">
+              ✦
+            </span>
+            <span className="catch-up-banner-copy">
+              <strong>
+                {catchUpBusy ? 'Catching you up…' : 'Catch me up'}
+              </strong>
+              <small>
+                {catchUpUnreadCount} unread · summarize what you missed
+              </small>
+            </span>
+          </button>
+          <button
+            type="button"
+            className="ghost catch-up-banner-dismiss"
+            aria-label="Dismiss catch up banner"
+            onClick={() => setCatchUpUnreadCount(0)}
+          >
+            ×
+          </button>
+        </div>
+      ) : null}
+
       {pinnedMessages.length > 0 ? (
         <div className="pinned-banner">
           <button
@@ -4135,7 +4304,9 @@ export function ThreadView() {
                 jumpToMessage(pinnedMessages[0].id);
                 return;
               }
-              setPinnedBannerOpen((open) => !open);
+              setChannelTab('pins');
+              setSearchOpen(false);
+              setToolsMenuOpen(false);
             }}
           >
             <span className="pinned-banner-icon" aria-hidden="true">
@@ -4165,39 +4336,18 @@ export function ThreadView() {
           ) : (
             <button
               type="button"
-              className="ghost pinned-banner-unpin"
-              aria-expanded={pinnedBannerOpen}
-              aria-label={pinnedBannerOpen ? 'Hide pinned messages' : 'Show pinned messages'}
-              onClick={() => setPinnedBannerOpen((open) => !open)}
+              className="ghost pinned-banner-view-all"
+              aria-label="Open Pins tab"
+              title="View all pins"
+              onClick={() => {
+                setChannelTab('pins');
+                setSearchOpen(false);
+                setToolsMenuOpen(false);
+              }}
             >
-              {pinnedBannerOpen ? '▴' : '▾'}
+              View all
             </button>
           )}
-          {pinnedBannerOpen && pinnedMessages.length > 1 ? (
-            <ul className="pinned-banner-list">
-              {pinnedMessages.map((item) => (
-                <li key={item.id}>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPinnedBannerOpen(false);
-                      jumpToMessage(item.id);
-                    }}
-                  >
-                    <strong>{displayName(byUserId.get(item.senderId))}</strong>
-                    <span>{replySnippet(item)}</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => void toggleMessagePin(item)}
-                  >
-                    Unpin
-                  </button>
-                </li>
-              ))}
-            </ul>
-          ) : null}
         </div>
       ) : null}
 
@@ -4279,22 +4429,37 @@ export function ThreadView() {
             setChannelTab(tab);
             setSearchOpen(false);
             setToolsMenuOpen(false);
-            setMediaOpen(false);
-          }}
-          onOpenFiles={() => {
-            setChannelTab('messages');
-            openMedia('all');
-          }}
-          onOpenPins={() => {
-            setChannelTab('messages');
-            if (pinnedMessages.length > 0) {
-              setPinnedBannerOpen(true);
+            setDmFilesOpen(false);
+            if (tab === 'files') {
+              setFilesInitialKind('all');
             }
+          }}
+          filesInitialKind={filesInitialKind}
+          onJumpToMessage={(messageId) => {
+            setChannelTab('messages');
+            window.setTimeout(() => jumpToMessage(messageId), 80);
+          }}
+          onPinsChanged={(items) => {
+            setPinnedMessages(items);
           }}
         />
       ) : null}
 
-      {conversation.type !== 'group' || channelTab === 'messages' ? (
+      {conversation.type === 'private' && dmFilesOpen ? (
+        <div className="channel-tab-panel is-files" role="tabpanel">
+          <FilesPanel
+            conversationId={conversation.id}
+            initialKind={filesInitialKind}
+            onJumpToMessage={(messageId) => {
+              setDmFilesOpen(false);
+              window.setTimeout(() => jumpToMessage(messageId), 80);
+            }}
+          />
+        </div>
+      ) : null}
+
+      {(conversation.type !== 'group' || channelTab === 'messages') &&
+      !(conversation.type === 'private' && dmFilesOpen) ? (
         <>
       {conversation.type === 'group' && (conversation.bookmarks?.length ?? 0) > 0 ? (
         <div className="channel-bookmarks-bar" aria-label="Channel bookmarks">
@@ -4417,16 +4582,17 @@ export function ThreadView() {
           const showAudio =
             !message.deletedForEveryone &&
             message.attachment &&
-            (message.type === 'audio' ||
-              message.attachment.mime.startsWith('audio/') ||
-              // Chrome sometimes records audio-only MediaRecorder blobs as video/webm
-              (message.type === 'audio' &&
-                message.attachment.mime.startsWith('video/')));
+            mediaKindOf(message) === 'audio';
+          const showVideo =
+            !message.deletedForEveryone &&
+            message.attachment &&
+            mediaKindOf(message) === 'video';
           const showFile =
             !message.deletedForEveryone &&
             message.attachment &&
             !showImage &&
             !showAudio &&
+            !showVideo &&
             (message.type === 'file' || Boolean(message.attachment.url));
           const botLabel = message.botUsername?.trim() || null;
           const showPoll =
@@ -4675,6 +4841,8 @@ export function ThreadView() {
                           src={message.attachment.url}
                           mime={message.attachment.mime}
                           mine={mine}
+                          conversationId={id}
+                          messageId={message.id}
                           sendStatus={message.sendStatus}
                           uploadProgress={message.uploadProgress}
                           onRetry={
@@ -4688,6 +4856,29 @@ export function ThreadView() {
                             type="button"
                             className="wa-media-download"
                             aria-label="Download voice note"
+                            title="Download"
+                            disabled={mediaDownloadingId === message.id}
+                            onClick={() => void handleDownloadMedia(message)}
+                          >
+                            ↓
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {showVideo && message.attachment ? (
+                      <div className="wa-media-wrap video clip-video">
+                        <video
+                          className="wa-clip-video"
+                          src={resolveMediaUrl(message.attachment.url)}
+                          controls
+                          playsInline
+                          preload="metadata"
+                        />
+                        {!pending ? (
+                          <button
+                            type="button"
+                            className="wa-media-download"
+                            aria-label="Download clip"
                             title="Download"
                             disabled={mediaDownloadingId === message.id}
                             onClick={() => void handleDownloadMedia(message)}
@@ -5618,6 +5809,84 @@ export function ThreadView() {
           Announcement channel — members can read, only admins can post.
         </p>
       ) : null}
+
+      {askOpen && !editingMessage ? (
+        <div className="channel-ask-panel" role="region" aria-label="Ask Relay">
+          <div className="channel-ask-head">
+            <div>
+              <strong>Ask about this channel</strong>
+              <p className="muted">
+                Type a normal question — no slash commands needed.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="ghost icon-btn"
+              aria-label="Close Ask Relay"
+              onClick={() => {
+                setAskOpen(false);
+                setAskError('');
+              }}
+            >
+              ×
+            </button>
+          </div>
+          <form
+            className="channel-ask-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void runChannelAsk();
+            }}
+          >
+            <input
+              ref={askInputRef}
+              value={askQuestion}
+              onChange={(event) => setAskQuestion(event.target.value)}
+              placeholder="e.g. What decisions were made here?"
+              aria-label="Ask a question about this channel"
+              disabled={askBusy}
+            />
+            <button
+              className="btn"
+              type="submit"
+              disabled={askBusy || askQuestion.trim().length < 3}
+            >
+              {askBusy ? 'Asking…' : 'Ask'}
+            </button>
+          </form>
+          {askBusy ? (
+            <p className="muted channel-ask-status">Reading this channel…</p>
+          ) : null}
+          {askError ? <p className="error channel-ask-status">{askError}</p> : null}
+          {askResult ? (
+            <div className="channel-ask-result">
+              <div className="channel-ask-result-head">
+                <strong>Answer</strong>
+                <span className="muted">
+                  {askResult.poweredByAi ? 'AI · this channel' : 'This channel'}
+                </span>
+              </div>
+              <pre className="channel-ask-answer">{askResult.answer}</pre>
+              {askResult.citations.length > 0 ? (
+                <div className="channel-ask-citations">
+                  {askResult.citations.map((citation, index) => (
+                    <button
+                      key={`${citation.messageId}-${index}`}
+                      type="button"
+                      className="channel-ask-citation"
+                      onClick={() => jumpToMessage(citation.messageId)}
+                    >
+                      <span>{index + 1}</span>
+                      <small>{citation.bodySnippet}</small>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
       <form
         className={`composer${editingMessage ? ' edit-mode' : ''}${
           voicePhase !== 'idle' ? ' voice-mode' : ''
@@ -6001,6 +6270,32 @@ export function ThreadView() {
                       onClick={() => void startHuddle(conversation.id)}
                     >
                       <HuddleIcon size={18} />
+                    </button>
+                  ) : null}
+
+                  {!editingMessage ? (
+                    <button
+                      className={`composer-tool composer-ask-tool${
+                        askOpen ? ' open' : ''
+                      }`}
+                      type="button"
+                      aria-label="Ask about this channel"
+                      title="Ask Relay about this channel"
+                      aria-pressed={askOpen}
+                      onClick={() => {
+                        if (askOpen) {
+                          setAskOpen(false);
+                        } else {
+                          openChannelAsk();
+                        }
+                      }}
+                    >
+                      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                        <path
+                          fill="currentColor"
+                          d="M12 2a7 7 0 0 0-4 12.7V17a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1v-2.3A7 7 0 0 0 12 2zm-1 18h2v2h-2v-2z"
+                        />
+                      </svg>
                     </button>
                   ) : null}
 
@@ -6583,135 +6878,6 @@ export function ThreadView() {
       </Modal>
 
       <Modal
-        open={mediaOpen}
-        title="Media"
-        size="lg"
-        onClose={() => setMediaOpen(false)}
-      >
-        <div className="media-gallery">
-          <div className="media-gallery-tabs" role="tablist" aria-label="Media type">
-            {(
-              [
-                ['all', 'All'],
-                ['image', 'Images'],
-                ['file', 'Files'],
-                ['audio', 'Voice'],
-              ] as const
-            ).map(([kind, label]) => (
-              <button
-                key={kind}
-                type="button"
-                role="tab"
-                aria-selected={mediaKind === kind}
-                className={mediaKind === kind ? 'active' : ''}
-                onClick={() => {
-                  if (mediaKind === kind) {
-                    return;
-                  }
-                  setMediaKind(kind);
-                  setMediaItems([]);
-                  setMediaPage(1);
-                  setMediaHasMore(false);
-                  void loadMedia(1, kind, false);
-                }}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-
-          {mediaBusy && mediaItems.length === 0 ? (
-            <p className="muted">Loading media…</p>
-          ) : mediaItems.length === 0 ? (
-            <p className="muted">No media in this chat yet.</p>
-          ) : (
-            <ul className="media-gallery-list">
-              {mediaItems.map((item) => {
-                const kind = mediaKindOf(item);
-                const attachment = item.attachment!;
-                return (
-                  <li key={item.id} className={`media-gallery-item kind-${kind}`}>
-                    <button
-                      type="button"
-                      className="media-gallery-preview"
-                      onClick={() => {
-                        setMediaOpen(false);
-                        jumpToMessage(item.id);
-                      }}
-                      title="Show in chat"
-                    >
-                      {kind === 'image' ? (
-                        <img
-                          src={resolveMediaUrl(attachment.url)}
-                          alt={attachment.name || 'Image'}
-                          loading="lazy"
-                        />
-                      ) : (
-                        <span className="media-gallery-icon" aria-hidden="true">
-                          {kind === 'audio'
-                            ? '♪'
-                            : fileExtLabel(attachment.name, attachment.mime)}
-                        </span>
-                      )}
-                    </button>
-                    <div className="media-gallery-meta">
-                      <strong>
-                        {kind === 'image'
-                          ? attachment.name || 'Photo'
-                          : kind === 'audio'
-                            ? 'Voice note'
-                            : attachment.name || 'File'}
-                      </strong>
-                      <small>
-                        {[
-                          kind === 'image'
-                            ? 'Image'
-                            : kind === 'audio'
-                              ? 'Voice'
-                              : 'File',
-                          formatFileSize(attachment.size),
-                          clock(item.createdAt),
-                        ]
-                          .filter(Boolean)
-                          .join(' · ')}
-                      </small>
-                    </div>
-                    <button
-                      type="button"
-                      className="ghost media-gallery-download"
-                      disabled={mediaDownloadingId === item.id}
-                      onClick={() => void handleOpenMedia(item)}
-                    >
-                      {mediaDownloadingId === item.id ? '…' : 'Open'}
-                    </button>
-                    <button
-                      type="button"
-                      className="ghost media-gallery-download"
-                      disabled={mediaDownloadingId === item.id}
-                      onClick={() => void handleDownloadMedia(item)}
-                    >
-                      {mediaDownloadingId === item.id ? '…' : 'Download'}
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-
-          {mediaHasMore ? (
-            <button
-              className="ghost full"
-              type="button"
-              disabled={mediaBusy}
-              onClick={() => void loadMedia(mediaPage + 1, mediaKind, true)}
-            >
-              {mediaBusy ? 'Loading…' : 'Load more'}
-            </button>
-          ) : null}
-        </div>
-      </Modal>
-
-      <Modal
         open={Boolean(forwardMessage)}
         title="Forward message"
         size="lg"
@@ -6735,6 +6901,54 @@ export function ThreadView() {
             ))}
           </ul>
         )}
+      </Modal>
+
+      <Modal
+        open={catchUpOpen}
+        title="Catch me up"
+        onClose={() => setCatchUpOpen(false)}
+      >
+        <div className="catch-up-modal">
+          <p className="muted modal-lead">
+            {catchUpBusy
+              ? 'Summarizing unread messages…'
+              : catchUpUnreadCount > 0
+                ? `Recap of ${catchUpUnreadCount} unread message${
+                    catchUpUnreadCount === 1 ? '' : 's'
+                  }`
+                : 'Unread recap'}
+            {catchUpPoweredByAi ? ' · AI' : catchUpSummary ? ' · local summary' : ''}
+          </p>
+          {catchUpError ? <p className="error">{catchUpError}</p> : null}
+          {catchUpBusy && !catchUpSummary ? (
+            <p className="muted">Working on it…</p>
+          ) : null}
+          {catchUpSummary ? (
+            <pre className="thread-summary catch-up-summary">{catchUpSummary}</pre>
+          ) : null}
+          <div className="modal-actions catch-up-actions">
+            {catchUpFirstUnreadId ? (
+              <button
+                type="button"
+                className="btn"
+                onClick={() => {
+                  const target = catchUpFirstUnreadId;
+                  setCatchUpOpen(false);
+                  jumpToMessage(target);
+                }}
+              >
+                Jump to first unread
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setCatchUpOpen(false)}
+            >
+              Close
+            </button>
+          </div>
+        </div>
       </Modal>
 
       <Modal

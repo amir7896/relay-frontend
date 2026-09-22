@@ -14,6 +14,7 @@ import { useDirectory } from '../../../people/useDirectory';
 import type {
   ChannelList,
   ChannelListItem,
+  ChannelListItemPriority,
   ChannelListItemStatus,
   Conversation,
 } from '../../../api/types';
@@ -25,6 +26,13 @@ import {
   startOfWeek,
   toDateKey,
 } from './ListsWeekView';
+import { ListIssueDrawer } from './ListIssueDrawer';
+import {
+  PRIORITIES,
+  issueKey,
+  normalizeListItem,
+  priorityMeta,
+} from './listIssueUtils';
 
 const STATUSES: Array<{
   id: ChannelListItemStatus;
@@ -40,10 +48,7 @@ type ListViewMode = 'board' | 'week';
 function normalizeList(list: ChannelList): ChannelList {
   return {
     ...list,
-    items: (list.items ?? []).map((item) => ({
-      ...item,
-      dueAt: item.dueAt ?? null,
-    })),
+    items: (list.items ?? []).map(normalizeListItem),
   };
 }
 
@@ -74,6 +79,17 @@ export function ListsPanel({
   const [newItemTitle, setNewItemTitle] = useState('');
   const [newItemAssignee, setNewItemAssignee] = useState('');
   const [newItemDue, setNewItemDue] = useState('');
+  const [newItemPriority, setNewItemPriority] =
+    useState<ChannelListItemPriority>('medium');
+  const [filterQuery, setFilterQuery] = useState('');
+  const [filterAssignee, setFilterAssignee] = useState<'all' | 'me' | 'unassigned' | string>(
+    'all',
+  );
+  const [filterPriority, setFilterPriority] = useState<
+    'all' | ChannelListItemPriority
+  >('all');
+  const [filterLabel, setFilterLabel] = useState('');
+  const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<ListViewMode>('board');
   const [weekAnchor, setWeekAnchor] = useState(() => startOfWeek(new Date()));
   const [renameValue, setRenameValue] = useState('');
@@ -105,18 +121,65 @@ export function ListsPanel({
   const selected =
     lists.find((list) => list.id === selectedId) ?? lists[0] ?? null;
   const items = selected?.items ?? [];
+  const rootItems = useMemo(
+    () => items.filter((item) => !item.parentItemId),
+    [items],
+  );
+  const labelOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const item of items) {
+      for (const label of item.labels ?? []) set.add(label);
+    }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [items]);
+
+  const filteredItems = useMemo(() => {
+    const q = filterQuery.trim().toLowerCase();
+    return rootItems.filter((item) => {
+      if (q) {
+        const hay = `${item.title} ${item.description ?? ''} ${(item.labels ?? []).join(' ')}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      if (filterAssignee === 'me' && item.assigneeId !== me) return false;
+      if (filterAssignee === 'unassigned' && item.assigneeId) return false;
+      if (
+        filterAssignee !== 'all' &&
+        filterAssignee !== 'me' &&
+        filterAssignee !== 'unassigned' &&
+        item.assigneeId !== filterAssignee
+      ) {
+        return false;
+      }
+      if (filterPriority !== 'all' && (item.priority ?? 'medium') !== filterPriority) {
+        return false;
+      }
+      if (filterLabel && !(item.labels ?? []).includes(filterLabel)) return false;
+      return true;
+    });
+  }, [
+    filterAssignee,
+    filterLabel,
+    filterPriority,
+    filterQuery,
+    me,
+    rootItems,
+  ]);
+
+  const selectedIssue = selectedIssueId
+    ? items.find((item) => item.id === selectedIssueId) ?? null
+    : null;
 
   const progress = useMemo(() => {
-    const total = items.length;
-    const done = countByStatus(items, 'done');
+    const total = rootItems.length;
+    const done = countByStatus(rootItems, 'done');
     return {
       total,
       done,
-      todo: countByStatus(items, 'todo'),
-      doing: countByStatus(items, 'doing'),
+      todo: countByStatus(rootItems, 'todo'),
+      doing: countByStatus(rootItems, 'doing'),
       percent: total ? Math.round((done / total) * 100) : 0,
     };
-  }, [items]);
+  }, [rootItems]);
 
   async function loadLists(preferId?: string) {
     setBusy(true);
@@ -151,6 +214,7 @@ export function ListsPanel({
 
   useEffect(() => {
     if (selected) setRenameValue(selected.name);
+    setSelectedIssueId(null);
   }, [selected?.id, selected?.name]);
 
   useEffect(() => {
@@ -286,7 +350,13 @@ export function ListsPanel({
     try {
       const response = await api<ChannelListItem>(`${basePath(listId)}/items`, {
         method: 'POST',
-        body: JSON.stringify({ title, status: 'todo', assigneeId, dueAt }),
+        body: JSON.stringify({
+          title,
+          status: 'todo',
+          assigneeId,
+          dueAt,
+          priority: newItemPriority,
+        }),
       });
       if (!response.data?.id) {
         throw new Error('Server did not return the new item');
@@ -294,16 +364,25 @@ export function ListsPanel({
       setLists((current) =>
         current.map((list) =>
           list.id === listId
-            ? { ...list, items: [...(list.items ?? []), response.data] }
+            ? {
+                ...list,
+                items: [
+                  ...(list.items ?? []),
+                  normalizeListItem(response.data),
+                ],
+              }
             : list,
         ),
       );
       setNewItemTitle('');
+      setNewItemPriority('medium');
       const bits = [
         assigneeId ? `assigned to ${assigneeLabel(assigneeId)}` : null,
         dueAt ? `due ${formatDueLabel(dueAt)}` : null,
+        newItemPriority !== 'medium' ? priorityMeta(newItemPriority).label : null,
       ].filter(Boolean);
-      setNotice(bits.length ? `Item added · ${bits.join(' · ')}.` : 'Item added.');
+      setNotice(bits.length ? `Issue created · ${bits.join(' · ')}.` : 'Issue created.');
+      setSelectedIssueId(response.data.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not add the item.');
     }
@@ -464,7 +543,8 @@ export function ListsPanel({
         <div>
           <h3>Lists</h3>
           <p className="muted lists-panel-sub">
-            Board for status · Week for due dates — drag to reschedule.
+            Jira-style issues — priority, labels, story points, subtasks, and
+            comments. Drag cards across the board.
           </p>
         </div>
         <div className="lists-view-toggle" role="tablist" aria-label="List view">
@@ -608,10 +688,26 @@ export function ListsPanel({
                 <input
                   value={newItemTitle}
                   onChange={(event) => setNewItemTitle(event.target.value)}
-                  placeholder="Add a task…"
-                  aria-label="New item title"
+                  placeholder="Create issue…"
+                  aria-label="New issue summary"
                   maxLength={500}
                 />
+                <select
+                  value={newItemPriority}
+                  onChange={(event) =>
+                    setNewItemPriority(
+                      event.target.value as ChannelListItemPriority,
+                    )
+                  }
+                  aria-label="Priority"
+                  className="list-add-priority"
+                >
+                  {PRIORITIES.map((row) => (
+                    <option key={row.id} value={row.id}>
+                      {row.label}
+                    </option>
+                  ))}
+                </select>
                 <div className="list-add-assignee">
                   <select
                     value={newItemAssignee}
@@ -655,17 +751,75 @@ export function ListsPanel({
                   type="submit"
                   disabled={!newItemTitle.trim()}
                 >
-                  Add item
+                  Create
                 </button>
               </form>
 
+              <div className="list-filters" aria-label="Issue filters">
+                <input
+                  value={filterQuery}
+                  onChange={(event) => setFilterQuery(event.target.value)}
+                  placeholder="Search issues…"
+                  aria-label="Search issues"
+                />
+                <select
+                  value={filterAssignee}
+                  onChange={(event) => setFilterAssignee(event.target.value)}
+                  aria-label="Filter by assignee"
+                >
+                  <option value="all">Anyone</option>
+                  <option value="me">Assigned to me</option>
+                  <option value="unassigned">Unassigned</option>
+                  {memberIds
+                    .filter((id) => id !== me)
+                    .map((id) => (
+                      <option key={id} value={id}>
+                        {displayName(byUserId.get(id))}
+                      </option>
+                    ))}
+                </select>
+                <select
+                  value={filterPriority}
+                  onChange={(event) =>
+                    setFilterPriority(
+                      event.target.value as 'all' | ChannelListItemPriority,
+                    )
+                  }
+                  aria-label="Filter by priority"
+                >
+                  <option value="all">Any priority</option>
+                  {PRIORITIES.map((row) => (
+                    <option key={row.id} value={row.id}>
+                      {row.label}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={filterLabel}
+                  onChange={(event) => setFilterLabel(event.target.value)}
+                  aria-label="Filter by label"
+                >
+                  <option value="">Any label</option>
+                  {labelOptions.map((label) => (
+                    <option key={label} value={label}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div
+                className={`list-workspace${selectedIssue ? ' with-drawer' : ''}`}
+              >
               {viewMode === 'week' ? (
                 <ListsWeekView
-                  items={items}
+                  items={filteredItems}
                   weekAnchor={weekAnchor}
                   onWeekAnchorChange={setWeekAnchor}
                   draggingId={draggingId}
                   dropDayKey={dropDayKey}
+                  selectedIssueId={selectedIssueId}
+                  onSelectIssue={setSelectedIssueId}
                   onDragStart={onCardDragStart}
                   onDragEnd={onCardDragEnd}
                   onDayDragOver={onDayDragOver}
@@ -675,7 +829,7 @@ export function ListsPanel({
               ) : (
               <div className="list-board" role="list">
                 {STATUSES.map((column) => {
-                  const columnItems = items.filter(
+                  const columnItems = filteredItems.filter(
                     (item) => item.status === column.id,
                   );
                   const isDropTarget = dropTarget === column.id;
@@ -702,17 +856,27 @@ export function ListsPanel({
                             ? byUserId.get(item.assigneeId)
                             : null;
                           const isMine = Boolean(me && item.assigneeId === me);
+                          const meta = priorityMeta(item.priority);
+                          const key = selected
+                            ? issueKey(selected.name, item, items)
+                            : item.id.slice(0, 8);
+                          const childCount = items.filter(
+                            (row) => row.parentItemId === item.id,
+                          ).length;
                           return (
                             <li
                               key={item.id}
-                              className={`list-card${
+                              className={`list-card priority-${item.priority ?? 'medium'}${
                                 draggingId === item.id ? ' dragging' : ''
-                              }${isMine ? ' is-mine' : ''}`}
+                              }${isMine ? ' is-mine' : ''}${
+                                selectedIssueId === item.id ? ' is-selected' : ''
+                              }`}
                               draggable
                               onDragStart={(event) =>
                                 onCardDragStart(event, item)
                               }
                               onDragEnd={onCardDragEnd}
+                              onClick={() => setSelectedIssueId(item.id)}
                             >
                               <div className="list-card-top">
                                 <span
@@ -733,17 +897,64 @@ export function ListsPanel({
                                     <circle cx="11" cy="12" r="1.2" fill="currentColor" />
                                   </svg>
                                 </span>
-                                <p className="list-card-title">{item.title}</p>
+                                <div className="list-card-main">
+                                  <span className="list-card-key">{key}</span>
+                                  <p className="list-card-title">{item.title}</p>
+                                  {item.jiraKey ? (
+                                    <a
+                                      className="list-card-jira"
+                                      href={item.jiraUrl || undefined}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      onClick={(event) => event.stopPropagation()}
+                                      title="Open in Jira"
+                                    >
+                                      {item.jiraKey}
+                                    </a>
+                                  ) : null}
+                                </div>
                                 <button
                                   className="list-card-delete"
                                   type="button"
                                   aria-label={`Delete ${item.title}`}
                                   title="Delete"
-                                  onClick={() => void deleteItem(item.id)}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void deleteItem(item.id);
+                                  }}
                                 >
                                   ×
                                 </button>
                               </div>
+
+                              <div className="list-card-meta-row">
+                                <span
+                                  className={`list-priority-badge priority-${item.priority ?? 'medium'}`}
+                                  title={meta.label}
+                                >
+                                  {meta.short} {meta.label}
+                                </span>
+                                {typeof item.estimate === 'number' ? (
+                                  <span className="list-estimate-chip">
+                                    {item.estimate} pts
+                                  </span>
+                                ) : null}
+                                {childCount > 0 ? (
+                                  <span className="list-subtask-chip">
+                                    {childCount} sub
+                                  </span>
+                                ) : null}
+                              </div>
+
+                              {(item.labels ?? []).length > 0 ? (
+                                <div className="list-card-labels">
+                                  {(item.labels ?? []).slice(0, 4).map((label) => (
+                                    <span key={label} className="list-label-chip">
+                                      {label}
+                                    </span>
+                                  ))}
+                                </div>
+                              ) : null}
 
                               <div className="list-card-assignee">
                                 {item.assigneeId ? (
@@ -832,30 +1043,13 @@ export function ListsPanel({
                                   </span>
                                 )}
                               </div>
-
-                              <div className="list-card-move">
-                                {STATUSES.filter((s) => s.id !== item.status).map(
-                                  (target) => (
-                                    <button
-                                      key={target.id}
-                                      type="button"
-                                      className="ghost list-card-move-btn"
-                                      onClick={() =>
-                                        void updateItemStatus(item, target.id)
-                                      }
-                                    >
-                                      {target.label}
-                                    </button>
-                                  ),
-                                )}
-                              </div>
                             </li>
                           );
                         })}
                       </ul>
                       {columnItems.length === 0 ? (
                         <p className="muted list-column-empty">
-                          {draggingId ? 'Drop here' : 'No items'}
+                          {draggingId ? 'Drop here' : 'No issues'}
                         </p>
                       ) : null}
                     </section>
@@ -863,6 +1057,39 @@ export function ListsPanel({
                 })}
               </div>
               )}
+
+              {selected && selectedIssue ? (
+                <ListIssueDrawer
+                  conversationId={conversationId}
+                  listId={selected.id}
+                  listName={selected.name}
+                  item={selectedIssue}
+                  allItems={items}
+                  memberIds={memberIds}
+                  onClose={() => setSelectedIssueId(null)}
+                  onUpdated={(next) => {
+                    patchItemLocal(selected.id, next.id, next);
+                  }}
+                  onOpenItem={setSelectedIssueId}
+                  onCreatedSubtask={(next) => {
+                    setLists((current) =>
+                      current.map((list) =>
+                        list.id === selected.id
+                          ? {
+                              ...list,
+                              items: [...(list.items ?? []), next],
+                            }
+                          : list,
+                      ),
+                    );
+                  }}
+                  onDeleted={(itemId) => {
+                    void deleteItem(itemId);
+                    setSelectedIssueId(null);
+                  }}
+                />
+              ) : null}
+              </div>
             </>
           )}
         </div>

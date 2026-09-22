@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import { getAccessToken } from '../auth/session';
 
 type VoiceNotePlayerProps = {
   src: string;
   mime?: string;
   mine?: boolean;
+  conversationId?: string;
+  messageId?: string;
   sendStatus?: 'uploading' | 'sending' | 'failed';
   uploadProgress?: number;
   onRetry?: () => void;
@@ -42,6 +45,7 @@ function fallbackPeaks(count: number): number[] {
 async function extractWavePeaks(
   url: string,
   barCount = WAVE_BARS,
+  context?: { conversationId?: string; messageId?: string },
 ): Promise<number[]> {
   if (!url || typeof window === 'undefined') {
     return fallbackPeaks(barCount);
@@ -54,7 +58,28 @@ async function extractWavePeaks(
     return fallbackPeaks(barCount);
   }
   try {
-    const response = await fetch(url);
+    const token = getAccessToken();
+    const authHeaders: HeadersInit = {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      'ngrok-skip-browser-warning': 'true',
+    };
+    let response: Response | null = null;
+    const conversationId = context?.conversationId;
+    const messageId = context?.messageId;
+    if (
+      conversationId &&
+      messageId &&
+      !messageId.startsWith('local-') &&
+      !url.startsWith('blob:')
+    ) {
+      response = await fetch(
+        `/api/chat/conversations/${conversationId}/messages/${messageId}/download?disposition=inline`,
+        { headers: authHeaders },
+      );
+    }
+    if (!response?.ok) {
+      response = await fetch(url, { headers: authHeaders });
+    }
     if (!response.ok) return fallbackPeaks(barCount);
     const buffer = await response.arrayBuffer();
     const ctx = new AudioCtx();
@@ -102,6 +127,8 @@ export function VoiceNotePlayer({
   src,
   mime,
   mine = false,
+  conversationId,
+  messageId,
   sendStatus,
   uploadProgress = 0,
   onRetry,
@@ -129,13 +156,16 @@ export function VoiceNotePlayer({
         cancelled = true;
       };
     }
-    void extractWavePeaks(mediaSrc, WAVE_BARS).then((next) => {
+    void extractWavePeaks(mediaSrc, WAVE_BARS, {
+      conversationId,
+      messageId,
+    }).then((next) => {
       if (!cancelled) setPeaks(next);
     });
     return () => {
       cancelled = true;
     };
-  }, [mediaSrc, isPending]);
+  }, [mediaSrc, isPending, conversationId, messageId]);
 
   useEffect(() => {
     const audio = audioRef.current;

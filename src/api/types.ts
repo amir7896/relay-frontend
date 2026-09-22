@@ -378,6 +378,8 @@ export type ScheduledMessage = {
   sentMessageId: string | null;
   error: string | null;
   createdAt: string;
+  conversationName?: string | null;
+  conversationType?: 'private' | 'group';
 };
 
 export type MessageReminder = {
@@ -417,6 +419,7 @@ export type Conversation = {
   lastReadAt: string | null;
   muted: boolean;
   pinned: boolean;
+  pinnedAt?: string | null;
   disappearingDurationSeconds?: number;
   blockedByMe?: boolean;
   blockedMe?: boolean;
@@ -508,6 +511,7 @@ export type ConversationCanvas = {
   conversationId: string;
   title: string;
   body: string;
+  ydocState?: string | null;
   updatedBy: string;
   createdAt: string;
   updatedAt: string | null;
@@ -526,15 +530,38 @@ export type CanvasComment = {
 };
 
 export type ChannelListItemStatus = 'todo' | 'doing' | 'done';
+export type ChannelListItemPriority =
+  | 'lowest'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'highest';
 
 export type ChannelListItem = {
   id: string;
   listId: string;
   title: string;
+  description?: string;
   status: ChannelListItemStatus;
+  priority?: ChannelListItemPriority;
+  labels?: string[];
+  estimate?: number | null;
+  parentItemId?: string | null;
   assigneeId: string | null;
   dueAt: string | null;
   sortOrder: number;
+  jiraKey?: string | null;
+  jiraUrl?: string | null;
+  createdAt: string;
+  updatedAt?: string;
+};
+
+export type ChannelListItemComment = {
+  id: string;
+  listId: string;
+  itemId: string;
+  authorId: string;
+  body: string;
   createdAt: string;
 };
 
@@ -639,6 +666,14 @@ export type ConnectLink = {
   disconnectedAt: string | null;
 };
 
+export type ConnectActivityEvent = {
+  id: string;
+  action: string;
+  actorId: string;
+  meta: Record<string, unknown>;
+  createdAt: string;
+};
+
 export type ConnectStatus = {
   conversationId: string;
   isShared: boolean;
@@ -646,6 +681,8 @@ export type ConnectStatus = {
   conversationName?: string | null;
   invites: ConnectInvite[];
   links?: ConnectLink[];
+  linkHistory?: ConnectLink[];
   connectRole?: 'host' | 'partner' | null;
   hostConversationId?: string | null;
+  activity?: ConnectActivityEvent[];
 };
