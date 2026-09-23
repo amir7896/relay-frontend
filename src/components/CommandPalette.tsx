@@ -30,6 +30,7 @@ type AskCitation = {
 type AskResult = {
   answer: string;
   poweredByAi: boolean;
+  demoMode?: boolean;
   citations: AskCitation[];
 };
 
@@ -760,7 +761,11 @@ export function CommandPalette() {
                 <div className="command-palette-ask-head">
                   <strong>Ask Relay</strong>
                   <span className="muted">
-                    {askResult.poweredByAi ? 'AI · grounded citations' : 'Local matches'}
+                    {askResult.demoMode
+                      ? 'Demo AI · grounded citations'
+                      : askResult.poweredByAi
+                        ? 'AI · grounded citations'
+                        : 'Local matches'}
                   </span>
                 </div>
                 <pre className="command-palette-ask-answer">{askResult.answer}</pre>

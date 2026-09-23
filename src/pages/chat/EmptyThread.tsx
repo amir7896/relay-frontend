@@ -1,5 +1,5 @@
 import { useOutletContext } from 'react-router-dom';
-import type { MessengerOutletContext } from './MessengerPage';
+import type { MessengerOutletContext } from './messengerTypes';
 
 export function EmptyThread() {
   const { openNewChat, openNewGroup } = useOutletContext<MessengerOutletContext>();

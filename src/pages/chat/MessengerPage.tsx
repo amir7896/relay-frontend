@@ -26,6 +26,9 @@ import {
 import { useDirectory } from '../../people/useDirectory';
 import { UserAvatar } from '../../components/UserAvatar';
 import { useOrganization } from '../../organizations/OrganizationContext';
+import { WikiView } from './WikiView';
+import { IncidentsView } from './IncidentsView';
+import type { MessengerOutletContext } from './messengerTypes';
 import type {
   BookmarkCollection,
   ChatMessage,
@@ -44,22 +47,16 @@ import type {
   UserProfile,
 } from '../../api/types';
 
-type HomeView = 'unreads' | 'activity' | 'drafts' | 'threads' | 'later';
+type HomeView =
+  | 'unreads'
+  | 'activity'
+  | 'drafts'
+  | 'threads'
+  | 'later'
+  | 'wiki'
+  | 'incidents';
 
-export type MessengerOutletContext = {
-  openNewChat: () => void;
-  openNewGroup: () => void;
-  clearUnread: (conversationId: string) => void;
-  setUnread: (
-    conversationId: string,
-    unreadCount: number,
-    opts?: { firstUnreadMessageId?: string | null },
-  ) => void;
-  refreshInbox: () => Promise<void>;
-  conversations: Conversation[];
-  laterItems: MessageReminder[];
-  refreshLater: () => Promise<void>;
-};
+export type { MessengerOutletContext } from './messengerTypes';
 
 function hitConversationTitle(
   hit: GlobalSearchHit,
@@ -303,6 +300,9 @@ export function MessengerPage() {
     scope: string;
   } | null>(null);
   const suppressChatNavClickRef = useRef(false);
+  /** Manual order for unsectioned Channels / DMs (persisted locally). */
+  const [poolChannelOrder, setPoolChannelOrder] = useState<string[]>([]);
+  const [poolDmOrder, setPoolDmOrder] = useState<string[]>([]);
   const [starredCollapsed, setStarredCollapsed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [notifyBanner, setNotifyBanner] = useState(false);
@@ -1107,25 +1107,102 @@ export function MessengerPage() {
     return ids;
   }, [sidebarSections]);
 
+  const poolOrderStorageKey = useMemo(() => {
+    if (!me || !activeOrganizationId) return null;
+    return `relay:sidebar-pool-order:${activeOrganizationId}:${me}`;
+  }, [me, activeOrganizationId]);
+
+  useEffect(() => {
+    if (!poolOrderStorageKey) {
+      setPoolChannelOrder([]);
+      setPoolDmOrder([]);
+      return;
+    }
+    try {
+      const raw = localStorage.getItem(poolOrderStorageKey);
+      if (!raw) {
+        setPoolChannelOrder([]);
+        setPoolDmOrder([]);
+        return;
+      }
+      const parsed = JSON.parse(raw) as {
+        channels?: unknown;
+        dms?: unknown;
+      };
+      setPoolChannelOrder(
+        Array.isArray(parsed.channels)
+          ? parsed.channels.filter((id): id is string => typeof id === 'string')
+          : [],
+      );
+      setPoolDmOrder(
+        Array.isArray(parsed.dms)
+          ? parsed.dms.filter((id): id is string => typeof id === 'string')
+          : [],
+      );
+    } catch {
+      setPoolChannelOrder([]);
+      setPoolDmOrder([]);
+    }
+  }, [poolOrderStorageKey]);
+
+  function persistPoolOrder(channelsOrder: string[], dmsOrder: string[]) {
+    if (!poolOrderStorageKey) return;
+    try {
+      localStorage.setItem(
+        poolOrderStorageKey,
+        JSON.stringify({ channels: channelsOrder, dms: dmsOrder }),
+      );
+    } catch {
+      // ignore quota / private mode
+    }
+  }
+
+  function applyPoolOrder(
+    list: Conversation[],
+    orderIds: string[],
+  ): Conversation[] {
+    if (list.length <= 1 || orderIds.length === 0) return list;
+    const byId = new Map(list.map((item) => [item.id, item]));
+    const used = new Set<string>();
+    const ordered: Conversation[] = [];
+    for (const id of orderIds) {
+      const item = byId.get(id);
+      if (item) {
+        ordered.push(item);
+        used.add(id);
+      }
+    }
+    for (const item of list) {
+      if (!used.has(item.id)) ordered.push(item);
+    }
+    return ordered;
+  }
+
   const channels = useMemo(
     () =>
-      filtered.filter(
-        (item) =>
-          item.type === 'group' &&
-          !sectionedIds.has(item.id) &&
-          !item.pinned,
+      applyPoolOrder(
+        filtered.filter(
+          (item) =>
+            item.type === 'group' &&
+            !sectionedIds.has(item.id) &&
+            !item.pinned,
+        ),
+        poolChannelOrder,
       ),
-    [filtered, sectionedIds],
+    [filtered, sectionedIds, poolChannelOrder],
   );
   const directs = useMemo(
     () =>
-      filtered.filter(
-        (item) =>
-          item.type === 'private' &&
-          !sectionedIds.has(item.id) &&
-          !item.pinned,
+      applyPoolOrder(
+        filtered.filter(
+          (item) =>
+            item.type === 'private' &&
+            !sectionedIds.has(item.id) &&
+            !item.pinned,
+        ),
+        poolDmOrder,
       ),
-    [filtered, sectionedIds],
+    [filtered, sectionedIds, poolDmOrder],
   );
   const starredItems = useMemo(() => {
     return filtered
@@ -1341,6 +1418,9 @@ export function MessengerPage() {
       setGroupAnnounceOnly(false);
       setGroupOpen(true);
       void refreshDirectory();
+    },
+    openWiki: () => {
+      void openWikiInbox();
     },
     clearUnread,
     setUnread,
@@ -1613,6 +1693,29 @@ export function MessengerPage() {
     }
   }
 
+  function reorderPoolConversations(
+    kind: 'channel' | 'dm',
+    fromId: string,
+    toId: string,
+  ) {
+    if (fromId === toId) return;
+    const source = kind === 'channel' ? channels : directs;
+    const ordered = source.map((item) => item.id);
+    const fromIndex = ordered.indexOf(fromId);
+    const toIndex = ordered.indexOf(toId);
+    if (fromIndex < 0 || toIndex < 0) return;
+    const next = [...ordered];
+    const [moved] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, moved);
+    if (kind === 'channel') {
+      setPoolChannelOrder(next);
+      persistPoolOrder(next, poolDmOrder);
+    } else {
+      setPoolDmOrder(next);
+      persistPoolOrder(poolChannelOrder, next);
+    }
+  }
+
   function sectionUnreadCount(sectionItems: Conversation[]) {
     return sectionItems.reduce((sum, item) => {
       if (item.id === activeConversationId) return sum;
@@ -1624,7 +1727,12 @@ export function MessengerPage() {
 
   function renderConversationRow(
     item: Conversation,
-    dragScope?: 'starred' | `section:${string}` | 'pool' | null,
+    dragScope?:
+      | 'starred'
+      | `section:${string}`
+      | 'pool:channel'
+      | 'pool:dm'
+      | null,
   ) {
     const title = conversationTitle(item, me, byUserId);
     const peer = otherMember(item, me);
@@ -1663,7 +1771,10 @@ export function MessengerPage() {
       (liveLobby?.joinedIds.length ?? 0) > 0;
     const canDrag = Boolean(dragScope) && !sidebarBusy;
     const canReorder =
-      dragScope === 'starred' || Boolean(dragScope?.startsWith('section:'));
+      dragScope === 'starred' ||
+      dragScope === 'pool:channel' ||
+      dragScope === 'pool:dm' ||
+      Boolean(dragScope?.startsWith('section:'));
 
     const applyConversationDrop = (targetId: string) => {
       const payload = dragConversationRef.current;
@@ -1674,6 +1785,17 @@ export function MessengerPage() {
       if (!fromId || fromId === targetId || !dragScope) return;
       if (dragScope === 'starred' && fromScope === 'starred') {
         void reorderStarredConversations(fromId, targetId);
+        return;
+      }
+      if (
+        dragScope === 'pool:channel' &&
+        fromScope === 'pool:channel'
+      ) {
+        reorderPoolConversations('channel', fromId, targetId);
+        return;
+      }
+      if (dragScope === 'pool:dm' && fromScope === 'pool:dm') {
+        reorderPoolConversations('dm', fromId, targetId);
         return;
       }
       if (dragScope.startsWith('section:') && fromScope === dragScope) {
@@ -1703,9 +1825,9 @@ export function MessengerPage() {
         }}
       >
         {canDrag ? (
-          <span
+          <button
+            type="button"
             className="chat-row-grip"
-            role="button"
             tabIndex={0}
             title={
               canReorder
@@ -1733,7 +1855,7 @@ export function MessengerPage() {
               suppressChatNavClickRef.current = true;
               dragConversationRef.current = {
                 id: item.id,
-                scope: dragScope ?? 'pool',
+                scope: dragScope ?? 'pool:channel',
               };
               setDraggingConversationId(item.id);
               event.dataTransfer.setData(
@@ -1744,8 +1866,6 @@ export function MessengerPage() {
             }}
             onDragEnd={() => {
               setDraggingConversationId(null);
-              // drop fires before dragend in spec, but keep payload briefly
-              // so late drop handlers can still read it.
               window.setTimeout(() => {
                 if (dragConversationRef.current?.id === item.id) {
                   dragConversationRef.current = null;
@@ -1755,7 +1875,7 @@ export function MessengerPage() {
             }}
           >
             <span aria-hidden="true">⋮⋮</span>
-          </span>
+          </button>
         ) : null}
         <NavLink
           className={`chat-row${isChannel ? ' channel-row' : ''}${
@@ -2363,6 +2483,18 @@ export function MessengerPage() {
     }
   }
 
+  function openWikiInbox() {
+    setHomeView('wiki');
+    setModalError('');
+    if (activeIdRef.current) navigate('/chat');
+  }
+
+  function openIncidentsInbox() {
+    setHomeView('incidents');
+    setModalError('');
+    if (activeIdRef.current) navigate('/chat');
+  }
+
   function remindAtInOneHour() {
     return new Date(Date.now() + 60 * 60 * 1000);
   }
@@ -2702,6 +2834,40 @@ export function MessengerPage() {
                 <span className="inbox-nav-meta">{savedTotalCount}</span>
               ) : null}
             </button>
+            <button
+              type="button"
+              className={`inbox-nav-row${
+                homeView === 'wiki' ? ' is-active' : ''
+              }`}
+              onClick={() => openWikiInbox()}
+            >
+              <span className="inbox-nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="18" height="18">
+                  <path
+                    fill="currentColor"
+                    d="M4 3.5A1.5 1.5 0 0 1 5.5 2H9v16H5.5A1.5 1.5 0 0 1 4 16.5v-13ZM11 2h3.5A1.5 1.5 0 0 1 16 3.5v13a1.5 1.5 0 0 1-1.5 1.5H11V2Zm1.5 3.25h2v1.5h-2v-1.5Zm0 3h2v1.5h-2v-1.5Zm0 3h2v1.5h-2v-1.5Z"
+                  />
+                </svg>
+              </span>
+              <span className="inbox-nav-label">Wiki</span>
+            </button>
+            <button
+              type="button"
+              className={`inbox-nav-row${
+                homeView === 'incidents' ? ' is-active' : ''
+              }`}
+              onClick={() => openIncidentsInbox()}
+            >
+              <span className="inbox-nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 20 20" width="18" height="18">
+                  <path
+                    fill="currentColor"
+                    d="M10 2.2 17.5 16H2.5L10 2.2Zm0 3.3L5.2 14.5h9.6L10 5.5ZM9.1 8.2h1.8v3.6H9.1V8.2Zm0 4.8h1.8V15H9.1v-2Z"
+                  />
+                </svg>
+              </span>
+              <span className="inbox-nav-label">Incidents</span>
+            </button>
           </nav>
 
           <div className="inbox-section-head">
@@ -2902,7 +3068,7 @@ export function MessengerPage() {
               </div>
             );
           })}
-          {channels.map((item) => renderConversationRow(item, 'pool'))}
+          {channels.map((item) => renderConversationRow(item, 'pool:channel'))}
           {channels.length === 0 && !query.trim() && sidebarSections.length === 0 ? (
             isGuest ? (
               <p className="muted inbox-empty-link">
@@ -2933,7 +3099,7 @@ export function MessengerPage() {
             </button>
           ) : null}
         </div>
-          {directs.map((item) => renderConversationRow(item, 'pool'))}
+          {directs.map((item) => renderConversationRow(item, 'pool:dm'))}
           {directs.length === 0 && !query.trim() ? (
             isGuest ? (
               <p className="muted inbox-empty-link">No direct messages yet</p>
@@ -3052,176 +3218,247 @@ export function MessengerPage() {
                     ? 'Drafts'
                     : homeView === 'threads'
                       ? 'Following'
-                      : 'Later'}
+                      : homeView === 'wiki'
+                        ? 'Wiki'
+                        : homeView === 'incidents'
+                          ? 'Incidents'
+                          : 'Later'}
             </h2>
           </header>
           <div className="inbox-home-body">
             {homeView === 'unreads' ? (
               <>
-<div className="unreads-toolbar">
-          <p className="muted unreads-toolbar-copy">
-            {unreadsTotal > 0
-              ? `${unreadsTotal} unread across ${unreadConversations.length} conversation${
-                  unreadConversations.length === 1 ? '' : 's'
-                }`
-              : 'You’re caught up — no unread messages.'}
-          </p>
-          {unreadConversations.length > 0 ? (
-            <button
-              type="button"
-              className="ghost unreads-mark-all"
-              disabled={unreadsBusy}
-              onClick={() => void markAllUnreadsRead()}
-            >
-              {unreadsBusy ? 'Marking…' : 'Mark all as read'}
-            </button>
-          ) : null}
-        </div>
+                <div className="unreads-toolbar">
+                  <div className="unreads-toolbar-copy">
+                    <p className="unreads-toolbar-count">
+                      {unreadsTotal > 0
+                        ? `${unreadsTotal} unread`
+                        : 'All caught up'}
+                    </p>
+                    <p className="muted unreads-toolbar-sub">
+                      {unreadsTotal > 0
+                        ? `Across ${unreadConversations.length} conversation${
+                            unreadConversations.length === 1 ? '' : 's'
+                          }`
+                        : 'New messages in channels and DMs will show up here.'}
+                    </p>
+                  </div>
+                  {unreadConversations.length > 0 ? (
+                    <button
+                      type="button"
+                      className="btn unreads-mark-all"
+                      disabled={unreadsBusy}
+                      onClick={() => void markAllUnreadsRead()}
+                    >
+                      {unreadsBusy ? 'Marking…' : 'Mark all as read'}
+                    </button>
+                  ) : null}
+                </div>
 
-        {unreadConversations.length === 0 ? (
-          <div className="unreads-empty">
-            <p className="muted">
-              New messages in channels and DMs will land here — same idea as
-              Slack Unreads.
-            </p>
-          </div>
-        ) : (
-          <div className="unreads-feed">
-            {unreadChannels.length > 0 ? (
-              <section className="unreads-section">
-                <h3 className="unreads-section-label">Channels</h3>
-                <ul className="unreads-list">
-                  {unreadChannels.map((conversation) => {
-                    const title = conversationTitle(
-                      conversation,
-                      me,
-                      byUserId,
-                    );
-                    const snippet = conversation.lastMessage
-                      ? messageSnippet(conversation.lastMessage, me, mentionLabel)
-                      : 'New activity';
-                    return (
-                      <li key={conversation.id}>
-                        <div
-                          className={`unreads-row${
-                            conversation.hasUnreadMention ? ' has-mention' : ''
-                          }`}
-                        >
-                          <button
-                            type="button"
-                            className="unreads-row-main"
-                            onClick={() => openUnreadConversation(conversation)}
-                          >
-                            <span className="unreads-row-title">
-                              <span className="unreads-hash" aria-hidden="true">
-                                #
-                              </span>
-                              {title.replace(/^#/, '')}
-                              {conversation.hasUnreadMention ? (
-                                <span className="unreads-mention-pill">@</span>
-                              ) : null}
-                            </span>
-                            <span className="unreads-row-snippet muted">
-                              {snippet}
-                            </span>
-                          </button>
-                          <div className="unreads-row-side">
-                            {conversation.lastMessageAt ? (
-                              <RelativeTime value={conversation.lastMessageAt} />
-                            ) : null}
-                            <span className="inbox-unread-pill">
-                              {Math.max(1, conversation.unreadCount || 0)}
-                            </span>
-                            <button
-                              type="button"
-                              className="ghost unreads-mark-one"
-                              title="Mark as read"
-                              aria-label={`Mark ${title} as read`}
-                              onClick={() =>
-                                void markConversationRead(conversation.id)
-                              }
-                            >
-                              ✓
-                            </button>
-                          </div>
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </section>
-            ) : null}
+                {unreadConversations.length === 0 ? (
+                  <div className="unreads-empty">
+                    <div className="unreads-empty-icon" aria-hidden="true">
+                      ✓
+                    </div>
+                    <p className="unreads-empty-title">You’re all caught up</p>
+                    <p className="muted">
+                      When channels or DMs get new messages, they’ll land here —
+                      same idea as Slack Unreads.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="unreads-feed">
+                    {unreadChannels.length > 0 ? (
+                      <section className="unreads-section">
+                        <h3 className="unreads-section-label">
+                          Channels
+                          <span className="unreads-section-count">
+                            {unreadChannels.length}
+                          </span>
+                        </h3>
+                        <ul className="unreads-list">
+                          {unreadChannels.map((conversation) => {
+                            const title = conversationTitle(
+                              conversation,
+                              me,
+                              byUserId,
+                            );
+                            const snippet = conversation.lastMessage
+                              ? messageSnippet(
+                                  conversation.lastMessage,
+                                  me,
+                                  mentionLabel,
+                                )
+                              : 'New activity';
+                            return (
+                              <li key={conversation.id}>
+                                <div
+                                  className={`unreads-row${
+                                    conversation.hasUnreadMention
+                                      ? ' has-mention'
+                                      : ''
+                                  }`}
+                                >
+                                  <button
+                                    type="button"
+                                    className="unreads-row-main"
+                                    onClick={() =>
+                                      openUnreadConversation(conversation)
+                                    }
+                                  >
+                                    <span
+                                      className="unreads-channel-avatar"
+                                      aria-hidden="true"
+                                    >
+                                      #
+                                    </span>
+                                    <span className="unreads-row-copy">
+                                      <span className="unreads-row-title">
+                                        {title.replace(/^#/, '')}
+                                        {conversation.hasUnreadMention ? (
+                                          <span className="unreads-mention-pill">
+                                            @
+                                          </span>
+                                        ) : null}
+                                      </span>
+                                      <span className="unreads-row-snippet muted">
+                                        {snippet}
+                                      </span>
+                                    </span>
+                                  </button>
+                                  <div className="unreads-row-side">
+                                    {conversation.lastMessageAt ? (
+                                      <RelativeTime
+                                        value={conversation.lastMessageAt}
+                                      />
+                                    ) : null}
+                                    <span className="inbox-unread-pill">
+                                      {Math.max(
+                                        1,
+                                        conversation.unreadCount || 0,
+                                      )}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      className="ghost unreads-mark-one"
+                                      title="Mark as read"
+                                      aria-label={`Mark ${title} as read`}
+                                      onClick={() =>
+                                        void markConversationRead(
+                                          conversation.id,
+                                        )
+                                      }
+                                    >
+                                      ✓
+                                    </button>
+                                  </div>
+                                </div>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </section>
+                    ) : null}
 
-            {unreadDms.length > 0 ? (
-              <section className="unreads-section">
-                <h3 className="unreads-section-label">Direct messages</h3>
-                <ul className="unreads-list">
-                  {unreadDms.map((conversation) => {
-                    const title = conversationTitle(
-                      conversation,
-                      me,
-                      byUserId,
-                    );
-                    const peer = otherMember(conversation, me);
-                    const snippet = conversation.lastMessage
-                      ? messageSnippet(conversation.lastMessage, me, mentionLabel)
-                      : 'New activity';
-                    return (
-                      <li key={conversation.id}>
-                        <div
-                          className={`unreads-row${
-                            conversation.hasUnreadMention ? ' has-mention' : ''
-                          }`}
-                        >
-                          <button
-                            type="button"
-                            className="unreads-row-main"
-                            onClick={() => openUnreadConversation(conversation)}
-                          >
-                            <UserAvatar
-                              profile={
-                                peer ? byUserId.get(peer.userId) : null
-                              }
-                              name={title}
-                              size="sm"
-                              className="unreads-dm-avatar"
-                            />
-                            <span className="unreads-row-copy">
-                              <span className="unreads-row-title">{title}</span>
-                              <span className="unreads-row-snippet muted">
-                                {snippet}
-                              </span>
-                            </span>
-                          </button>
-                          <div className="unreads-row-side">
-                            {conversation.lastMessageAt ? (
-                              <RelativeTime value={conversation.lastMessageAt} />
-                            ) : null}
-                            <span className="inbox-unread-pill">
-                              {Math.max(1, conversation.unreadCount || 0)}
-                            </span>
-                            <button
-                              type="button"
-                              className="ghost unreads-mark-one"
-                              title="Mark as read"
-                              aria-label={`Mark ${title} as read`}
-                              onClick={() =>
-                                void markConversationRead(conversation.id)
-                              }
-                            >
-                              ✓
-                            </button>
-                          </div>
-                        </div>
-                      </li>
-                    );
-                  })}
-                </ul>
-              </section>
-            ) : null}
-          </div>
-        )}
-        {modalError ? <p className="error">{modalError}</p> : null}
+                    {unreadDms.length > 0 ? (
+                      <section className="unreads-section">
+                        <h3 className="unreads-section-label">
+                          Direct messages
+                          <span className="unreads-section-count">
+                            {unreadDms.length}
+                          </span>
+                        </h3>
+                        <ul className="unreads-list">
+                          {unreadDms.map((conversation) => {
+                            const title = conversationTitle(
+                              conversation,
+                              me,
+                              byUserId,
+                            );
+                            const peer = otherMember(conversation, me);
+                            const snippet = conversation.lastMessage
+                              ? messageSnippet(
+                                  conversation.lastMessage,
+                                  me,
+                                  mentionLabel,
+                                )
+                              : 'New activity';
+                            return (
+                              <li key={conversation.id}>
+                                <div
+                                  className={`unreads-row${
+                                    conversation.hasUnreadMention
+                                      ? ' has-mention'
+                                      : ''
+                                  }`}
+                                >
+                                  <button
+                                    type="button"
+                                    className="unreads-row-main"
+                                    onClick={() =>
+                                      openUnreadConversation(conversation)
+                                    }
+                                  >
+                                    <UserAvatar
+                                      profile={
+                                        peer
+                                          ? byUserId.get(peer.userId)
+                                          : null
+                                      }
+                                      name={title}
+                                      size="sm"
+                                      className="unreads-dm-avatar"
+                                    />
+                                    <span className="unreads-row-copy">
+                                      <span className="unreads-row-title">
+                                        {title}
+                                        {conversation.hasUnreadMention ? (
+                                          <span className="unreads-mention-pill">
+                                            @
+                                          </span>
+                                        ) : null}
+                                      </span>
+                                      <span className="unreads-row-snippet muted">
+                                        {snippet}
+                                      </span>
+                                    </span>
+                                  </button>
+                                  <div className="unreads-row-side">
+                                    {conversation.lastMessageAt ? (
+                                      <RelativeTime
+                                        value={conversation.lastMessageAt}
+                                      />
+                                    ) : null}
+                                    <span className="inbox-unread-pill">
+                                      {Math.max(
+                                        1,
+                                        conversation.unreadCount || 0,
+                                      )}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      className="ghost unreads-mark-one"
+                                      title="Mark as read"
+                                      aria-label={`Mark ${title} as read`}
+                                      onClick={() =>
+                                        void markConversationRead(
+                                          conversation.id,
+                                        )
+                                      }
+                                    >
+                                      ✓
+                                    </button>
+                                  </div>
+                                </div>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      </section>
+                    ) : null}
+                  </div>
+                )}
+                {modalError ? <p className="error">{modalError}</p> : null}
               </>
             ) : null}
             {homeView === 'activity' ? (
@@ -4084,6 +4321,15 @@ export function MessengerPage() {
           {modalError ? <p className="error">{modalError}</p> : null}
         </div>
               </>
+            ) : null}
+            {homeView === 'wiki' ? <WikiView /> : null}
+            {homeView === 'incidents' ? (
+              <IncidentsView
+                onOpenChannel={(conversationId) => {
+                  setHomeView(null);
+                  navigate(`/chat/${conversationId}`);
+                }}
+              />
             ) : null}
           </div>
         </section>

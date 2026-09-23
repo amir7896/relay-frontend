@@ -25,7 +25,7 @@ import type {
   OutgoingWebhook,
   Paginated,
 } from '../../api/types';
-import type { MessengerOutletContext } from './MessengerPage';
+import type { MessengerOutletContext } from './messengerTypes';
 
 const DISAPPEARING_OPTIONS: Array<{ value: number; label: string }> = [
   { value: 0, label: 'Off' },

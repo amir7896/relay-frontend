@@ -35,6 +35,16 @@ import {
   otherMember,
 } from '../../lib/format';
 import {
+  formatInTimeZone,
+  isQuietAt,
+  nextAfterQuietHours,
+  nextWallClockInZone,
+  parseDatetimeLocalValue,
+  shortTimeZoneLabel,
+  toDatetimeLocalValue as dateToDatetimeLocal,
+  type ScheduleContext,
+} from '../../lib/scheduleTz';
+import {
   callHistoryLabel,
   parseCallHistoryBody,
 } from '../../calls/types';
@@ -55,6 +65,11 @@ import {
   loadMessageDraft,
   setMessageDraft,
 } from '../../lib/messageDrafts';
+import {
+  isSpeechRecognitionSupported,
+  startVoiceCaptionSession,
+  type VoiceCaptionSession,
+} from '../../lib/speechRecognition';
 import { downloadMedia, openMedia as openAttachmentMedia } from '../../lib/downloadMedia';
 import {
   loadChannelNotificationMode,
@@ -71,10 +86,12 @@ import type {
   MessageReminder,
   Paginated,
   ScheduledMessage,
+  SavedReply,
   SeenResult,
   UserGroup,
+  Incident,
 } from '../../api/types';
-import type { MessengerOutletContext } from './MessengerPage';
+import type { MessengerOutletContext } from './messengerTypes';
 import { ChannelTabs, type ChannelTab } from './ChannelTabs';
 import { FilesPanel, type MediaKindTab } from './tabs/FilesPanel';
 
@@ -232,6 +249,7 @@ function normalizeMessage(message: ChatMessage): ChatMessage {
     mentions: message.mentions ?? [],
     linkPreview: message.linkPreview ?? null,
     poll: message.poll ?? null,
+    interactive: message.interactive ?? null,
     editedAt: message.editedAt ?? null,
     pinned: Boolean(message.pinned),
     pinnedAt: message.pinnedAt ?? null,
@@ -573,7 +591,7 @@ export function ThreadView() {
   const navigate = useNavigate();
   const confirmDialog = useConfirm();
   const workspace = useWorkspace();
-  const { clearUnread, setUnread, refreshInbox, conversations, laterItems, refreshLater } =
+  const { clearUnread, setUnread, refreshInbox, conversations, laterItems, refreshLater, openWiki } =
     useOutletContext<MessengerOutletContext>();
   const { byUserId, ensureProfiles } = useDirectory();
   const [conversation, setConversation] = useState<Conversation | null>(null);
@@ -582,6 +600,8 @@ export function ThreadView() {
   const [error, setError] = useState('');
   const [actionError, setActionError] = useState('');
   const [slashNotice, setSlashNotice] = useState('');
+  const [channelIncident, setChannelIncident] = useState<Incident | null>(null);
+  const [incidentBusy, setIncidentBusy] = useState(false);
   const [askOpen, setAskOpen] = useState(false);
   const [askQuestion, setAskQuestion] = useState('');
   const [askBusy, setAskBusy] = useState(false);
@@ -589,6 +609,7 @@ export function ThreadView() {
   const [askResult, setAskResult] = useState<{
     answer: string;
     poweredByAi: boolean;
+    demoMode?: boolean;
     citations: Array<{
       messageId: string;
       conversationId: string;
@@ -615,6 +636,7 @@ export function ThreadView() {
     top: number;
     left: number;
     placeAbove: boolean;
+    maxHeight: number;
   } | null>(null);
   const [remindMenuOpen, setRemindMenuOpen] = useState(false);
   const [remindCustomOpen, setRemindCustomOpen] = useState(false);
@@ -692,8 +714,18 @@ export function ThreadView() {
   const [scheduleAt, setScheduleAt] = useState(defaultScheduleLocalValue);
   const [scheduledMessages, setScheduledMessages] = useState<ScheduledMessage[]>([]);
   const [scheduleBusy, setScheduleBusy] = useState(false);
+  const [scheduleContext, setScheduleContext] = useState<ScheduleContext | null>(
+    null,
+  );
   const [uploading, setUploading] = useState(false);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
+  const [savedRepliesOpen, setSavedRepliesOpen] = useState(false);
+  const [savedReplies, setSavedReplies] = useState<SavedReply[]>([]);
+  const [savedRepliesBusy, setSavedRepliesBusy] = useState(false);
+  const [savedReplyFormOpen, setSavedReplyFormOpen] = useState(false);
+  const [savedReplyTitle, setSavedReplyTitle] = useState('');
+  const [savedReplyBody, setSavedReplyBody] = useState('');
+  const [savedReplyShortcut, setSavedReplyShortcut] = useState('');
   const [formatToolbarOpen, setFormatToolbarOpen] = useState(true);
   const [composerEmojiOpen, setComposerEmojiOpen] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -714,10 +746,17 @@ export function ThreadView() {
   const [translateBusyId, setTranslateBusyId] = useState<string | null>(null);
   const activeThreadRootRef = useRef<ChatMessage | null>(null);
   activeThreadRootRef.current = activeThreadRoot;
+  /** Prevents double-counting the same thread reply (HTTP response + socket). */
+  const countedThreadReplyIdsRef = useRef(new Set<string>());
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const docInputRef = useRef<HTMLInputElement | null>(null);
   const attachMenuRef = useRef<HTMLDivElement | null>(null);
+  const savedRepliesRef = useRef<HTMLDivElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const voiceCaptionSessionRef = useRef<VoiceCaptionSession | null>(null);
+  const [voiceCaption, setVoiceCaption] = useState('');
+  const [voiceCaptionInterim, setVoiceCaptionInterim] = useState('');
+  const [voiceCaptionSupported] = useState(() => isSpeechRecognitionSupported());
   const audioChunksRef = useRef<Blob[]>([]);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -800,6 +839,52 @@ export function ThreadView() {
   );
   const peer = conversation ? otherMember(conversation, me) : undefined;
   const peerOnline = peer ? peer.status !== 'offline' : false;
+
+  useEffect(() => {
+    if (!scheduleOpen || !id) {
+      return;
+    }
+    let cancelled = false;
+    void api<ScheduleContext>(`/chat/conversations/${id}/schedule-context`)
+      .then((response) => {
+        if (!cancelled) {
+          setScheduleContext(response.data);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setScheduleContext(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [scheduleOpen, id]);
+
+  const schedulePreview = useMemo(() => {
+    const when = parseDatetimeLocalValue(scheduleAt);
+    if (!when) {
+      return null;
+    }
+    const myTz =
+      scheduleContext?.myTimezone ||
+      Intl.DateTimeFormat().resolvedOptions().timeZone ||
+      'UTC';
+    const peerCtx = scheduleContext?.peer ?? null;
+    const peerQuiet = peerCtx ? isQuietAt(peerCtx, when) : false;
+    return {
+      when,
+      myLabel: formatInTimeZone(when, myTz),
+      myTzLabel: shortTimeZoneLabel(myTz),
+      peerLabel: peerCtx
+        ? formatInTimeZone(when, peerCtx.timezone)
+        : null,
+      peerTzLabel: peerCtx ? shortTimeZoneLabel(peerCtx.timezone) : null,
+      peerQuiet,
+      peerName: peer ? displayName(byUserId.get(peer.userId)) : 'Teammate',
+    };
+  }, [scheduleAt, scheduleContext, peer, byUserId]);
+
   const groupOnlineCount =
     conversation?.type === 'group'
       ? conversation.members.filter(
@@ -1096,6 +1181,7 @@ export function ThreadView() {
       null;
     setMentionJumpId(mentionJumpTarget);
     setMentionBannerDismissed(false);
+    setChannelIncident(null);
     setLoading(false);
 
     // Capture unread "New" divider before we mark the channel read.
@@ -1157,15 +1243,22 @@ export function ThreadView() {
       .then((response) => setSlashCommands(response.data.items ?? []))
       .catch(() =>
         setSlashCommands([
-          { name: 'ai', description: 'Ask Relay about this channel (/ai …)', builtin: true },
+          { name: 'ai', description: 'Ask Relay (opens Ask panel)', builtin: true },
           { name: 'remind', description: 'Remind yourself (/remind 1h …)', builtin: true },
           { name: 'poll', description: 'Create a poll', builtin: true },
+          { name: 'approve', description: 'Post an approval card', builtin: true },
+          { name: 'sr', description: 'Send a saved reply (/sr shortcut)', builtin: true },
+          { name: 'wiki', description: 'Workspace wiki (/wiki share slug)', builtin: true },
+          { name: 'incident', description: 'Ops war-room (/incident open sev2 title)', builtin: true },
           { name: 'assign', description: 'Assign a list task', builtin: true },
           { name: 'status', description: 'Set your status', builtin: true },
           { name: 'help', description: 'List slash commands', builtin: true },
         ]),
       );
     void loadBookmarks();
+    if (conv.data.type === 'group') {
+      void loadChannelIncident();
+    }
     if (holdAutoSeenRef.current) {
       return;
     }
@@ -1190,6 +1283,48 @@ export function ThreadView() {
       );
     } catch {
       setBookmarkedIds(new Set());
+    }
+  }
+
+  async function loadChannelIncident() {
+    try {
+      const response = await api<Incident | null>(
+        `/chat/conversations/${id}/incident`,
+      );
+      setChannelIncident(response.data ?? null);
+    } catch {
+      setChannelIncident(null);
+    }
+  }
+
+  async function updateChannelIncident(status: 'mitigated' | 'resolved') {
+    if (!channelIncident) return;
+    setIncidentBusy(true);
+    setActionError('');
+    try {
+      const response = await api<{
+        incident: Incident;
+        message: ChatMessage | null;
+      }>(`/chat/incidents/${channelIncident.id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status }),
+      });
+      setChannelIncident(
+        response.data.incident.status === 'resolved'
+          ? null
+          : response.data.incident,
+      );
+      if (response.data.message) {
+        setMessages((current) =>
+          upsertMessage(current, normalizeMessage(response.data.message!)),
+        );
+      }
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not update incident',
+      );
+    } finally {
+      setIncidentBusy(false);
     }
   }
 
@@ -1298,6 +1433,7 @@ export function ThreadView() {
     setMediaDownloadingId(null);
     setChannelTab('messages');
     setHighlightId(null);
+    countedThreadReplyIdsRef.current.clear();
     setMessages((current) => {
       current.forEach(revokeAttachmentBlob);
       return [];
@@ -1323,32 +1459,11 @@ export function ThreadView() {
           const openRoot = activeThreadRootRef.current;
           const openMatches =
             Boolean(openRoot) && openRoot!.id === normalized.threadRootId;
-
-          if (openMatches) {
-            setThreadReplies((current) => {
-              const exists = current.some((item) => item.id === normalized.id);
-              if (!exists) {
-                queueMicrotask(() => {
-                  setMessages((msgs) =>
-                    msgs.map((item) =>
-                      item.id === normalized.threadRootId
-                        ? {
-                            ...item,
-                            replyCount: (item.replyCount ?? 0) + 1,
-                          }
-                        : item,
-                    ),
-                  );
-                  setActiveThreadRoot((root) =>
-                    root && root.id === normalized.threadRootId
-                      ? { ...root, replyCount: (root.replyCount ?? 0) + 1 }
-                      : root,
-                  );
-                });
-              }
-              return upsertMessage(current, normalized);
-            });
-          } else {
+          const alreadyCounted = countedThreadReplyIdsRef.current.has(
+            normalized.id,
+          );
+          if (!alreadyCounted) {
+            countedThreadReplyIdsRef.current.add(normalized.id);
             setMessages((msgs) =>
               msgs.map((item) =>
                 item.id === normalized.threadRootId
@@ -1359,6 +1474,16 @@ export function ThreadView() {
                   : item,
               ),
             );
+            if (openMatches) {
+              setActiveThreadRoot((root) =>
+                root && root.id === normalized.threadRootId
+                  ? { ...root, replyCount: (root.replyCount ?? 0) + 1 }
+                  : root,
+              );
+            }
+          }
+          if (openMatches) {
+            setThreadReplies((current) => upsertMessage(current, normalized));
           }
           clearUnread(id);
           if (holdAutoSeenRef.current) {
@@ -1750,6 +1875,33 @@ export function ThreadView() {
     };
   }, [attachMenuOpen]);
 
+  useEffect(() => {
+    if (!savedRepliesOpen) {
+      return;
+    }
+    const onPointerDown = (event: Event) => {
+      const root = savedRepliesRef.current;
+      if (root && !root.contains(event.target as Node)) {
+        setSavedRepliesOpen(false);
+        setSavedReplyFormOpen(false);
+      }
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setSavedRepliesOpen(false);
+        setSavedReplyFormOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('touchstart', onPointerDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('touchstart', onPointerDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [savedRepliesOpen]);
+
   // Keep Join banner in sync if the socket ring was missed
   useEffect(() => {
     if (!conversation || conversation.type !== 'group') {
@@ -1961,6 +2113,14 @@ export function ThreadView() {
         return;
       }
 
+      // Bare /wiki opens the workspace wiki home (list/share still hits the API).
+      if (/^\/wiki\s*$/i.test(raw) || /^\/wiki\s+open\b/i.test(raw)) {
+        setComposer('');
+        clearMessageDraft(id);
+        openWiki();
+        return;
+      }
+
       if (/^\/assign\b/i.test(raw)) {
         for (const member of mentionCandidates) {
           if (member.userId.startsWith('__')) continue;
@@ -1974,14 +2134,34 @@ export function ThreadView() {
       }
       try {
         const response = await api<{
-          kind: 'message' | 'ephemeral' | 'status';
+          kind: 'message' | 'ephemeral' | 'status' | 'ask';
           message?: ChatMessage;
           ephemeral?: string | null;
           customStatus?: string | null;
+          ask?: {
+            answer: string;
+            poweredByAi: boolean;
+            demoMode?: boolean;
+            citations: Array<{
+              messageId: string;
+              conversationId: string;
+              conversationName: string | null;
+              bodySnippet: string;
+            }>;
+          };
         }>(`/chat/conversations/${id}/slash`, {
           method: 'POST',
           body: JSON.stringify({ raw }),
         });
+        if (response.data.kind === 'ask' && response.data.ask) {
+          setAskQuestion(raw.replace(/^\/ai\b/i, '').trim());
+          setAskResult(response.data.ask);
+          setAskOpen(true);
+          setAskError('');
+          setComposer('');
+          clearMessageDraft(id);
+          return;
+        }
         if (response.data.kind === 'message' && response.data.message) {
           setMessages((current) =>
             upsertMessage(current, normalizeMessage(response.data.message!)),
@@ -1996,6 +2176,9 @@ export function ThreadView() {
         }
         if (/^\/remind\b/i.test(raw)) {
           void refreshLater();
+        }
+        if (/^\/incident\b/i.test(raw)) {
+          void loadChannelIncident();
         }
         setComposer('');
         clearMessageDraft(id);
@@ -2083,6 +2266,109 @@ export function ThreadView() {
       setMessages((current) => upsertMessage(current, normalizeMessage(response.data)));
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not record vote');
+    }
+  }
+
+  async function loadSavedReplies() {
+    setSavedRepliesBusy(true);
+    try {
+      const response = await api<SavedReply[]>('/chat/saved-replies');
+      setSavedReplies(response.data ?? []);
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not load saved replies',
+      );
+    } finally {
+      setSavedRepliesBusy(false);
+    }
+  }
+
+  async function openSavedRepliesPanel() {
+    setAttachMenuOpen(false);
+    setSavedRepliesOpen((open) => {
+      const next = !open;
+      if (next) {
+        void loadSavedReplies();
+      } else {
+        setSavedReplyFormOpen(false);
+      }
+      return next;
+    });
+  }
+
+  function insertSavedReply(reply: SavedReply) {
+    setComposer(reply.body);
+    setSavedRepliesOpen(false);
+    setSavedReplyFormOpen(false);
+    window.setTimeout(() => composerInputRef.current?.focus(), 20);
+  }
+
+  async function createSavedReplyFromForm() {
+    const title = savedReplyTitle.trim();
+    const body = savedReplyBody.trim();
+    if (!title || !body || savedRepliesBusy) {
+      return;
+    }
+    setSavedRepliesBusy(true);
+    setActionError('');
+    try {
+      const response = await api<SavedReply>('/chat/saved-replies', {
+        method: 'POST',
+        body: JSON.stringify({
+          title,
+          body,
+          shortcut: savedReplyShortcut.trim() || null,
+        }),
+      });
+      setSavedReplies((current) => [response.data, ...current]);
+      setSavedReplyTitle('');
+      setSavedReplyBody('');
+      setSavedReplyShortcut('');
+      setSavedReplyFormOpen(false);
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not save reply',
+      );
+    } finally {
+      setSavedRepliesBusy(false);
+    }
+  }
+
+  async function deleteSavedReply(replyId: string) {
+    const confirmed = await confirmDialog({
+      title: 'Delete saved reply?',
+      message: 'This removes the template from your library.',
+      confirmLabel: 'Delete',
+      cancelLabel: 'Cancel',
+      danger: true,
+    });
+    if (!confirmed) return;
+    try {
+      await api(`/chat/saved-replies/${replyId}`, { method: 'DELETE' });
+      setSavedReplies((current) => current.filter((item) => item.id !== replyId));
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not delete saved reply',
+      );
+    }
+  }
+
+  async function invokeMessageAction(messageId: string, actionId: string) {
+    try {
+      const response = await api<ChatMessage>(
+        `/chat/conversations/${id}/messages/${messageId}/actions`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ actionId }),
+        },
+      );
+      setMessages((current) =>
+        upsertMessage(current, normalizeMessage(response.data)),
+      );
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : 'Could not complete action',
+      );
     }
   }
 
@@ -2207,6 +2493,7 @@ export function ThreadView() {
       'files',
       'pins',
       'canvas',
+      'board',
       'lists',
       'clips',
       'workflows',
@@ -2379,6 +2666,7 @@ export function ThreadView() {
       const response = await api<{
         answer: string;
         poweredByAi: boolean;
+        demoMode?: boolean;
         citations: Array<{
           messageId: string;
           conversationId: string;
@@ -2418,6 +2706,10 @@ export function ThreadView() {
       setComposer('/remind 1h ');
     } else if (name === 'poll') {
       setComposer('/poll ');
+    } else if (name === 'approve') {
+      setComposer('/approve ');
+    } else if (name === 'sr') {
+      setComposer('/sr ');
     } else if (name === 'status') {
       setComposer('/status ');
     } else {
@@ -2514,6 +2806,8 @@ export function ThreadView() {
   function resetVoiceSession() {
     clearRecordingTimer();
     stopMediaStream();
+    voiceCaptionSessionRef.current?.stop();
+    voiceCaptionSessionRef.current = null;
     mediaRecorderRef.current = null;
     audioChunksRef.current = [];
     discardOnStopRef.current = false;
@@ -2525,6 +2819,8 @@ export function ThreadView() {
     setPreviewFile(null);
     setPreviewPlaying(false);
     setRecordingMs(0);
+    setVoiceCaption('');
+    setVoiceCaptionInterim('');
     setVoicePhase('idle');
   }
 
@@ -2535,6 +2831,10 @@ export function ThreadView() {
       setPreviewFile(null);
       setPreviewPlaying(false);
       discardOnStopRef.current = false;
+      setVoiceCaption('');
+      setVoiceCaptionInterim('');
+      voiceCaptionSessionRef.current?.stop();
+      voiceCaptionSessionRef.current = null;
 
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaStreamRef.current = stream;
@@ -2562,10 +2862,14 @@ export function ThreadView() {
         stopMediaStream();
         clearRecordingTimer();
         mediaRecorderRef.current = null;
+        voiceCaptionSessionRef.current?.stop();
+        voiceCaptionSessionRef.current = null;
+        setVoiceCaptionInterim('');
         if (discardOnStopRef.current) {
           discardOnStopRef.current = false;
           audioChunksRef.current = [];
           setRecordingMs(0);
+          setVoiceCaption('');
           setVoicePhase('idle');
           return;
         }
@@ -2606,6 +2910,13 @@ export function ThreadView() {
         setRecordingMs(Date.now() - recordingStartedAtRef.current);
       }, 200);
       setVoicePhase('recording');
+
+      voiceCaptionSessionRef.current = startVoiceCaptionSession({
+        onUpdate: (finalText, interimText) => {
+          setVoiceCaption(finalText);
+          setVoiceCaptionInterim(interimText);
+        },
+      });
     } catch {
       resetVoiceSession();
       setActionError('Microphone access is required for voice notes');
@@ -2617,6 +2928,9 @@ export function ThreadView() {
       return;
     }
     discardOnStopRef.current = false;
+    voiceCaptionSessionRef.current?.stop();
+    voiceCaptionSessionRef.current = null;
+    setVoiceCaptionInterim('');
     const recorder = mediaRecorderRef.current;
     if (recorder && recorder.state !== 'inactive') {
       recorder.stop();
@@ -2626,6 +2940,10 @@ export function ThreadView() {
   function discardVoice() {
     if (voicePhase === 'recording') {
       discardOnStopRef.current = true;
+      voiceCaptionSessionRef.current?.stop();
+      voiceCaptionSessionRef.current = null;
+      setVoiceCaption('');
+      setVoiceCaptionInterim('');
       const recorder = mediaRecorderRef.current;
       if (recorder && recorder.state !== 'inactive') {
         recorder.stop();
@@ -2647,8 +2965,9 @@ export function ThreadView() {
       return;
     }
     const file = previewFile;
+    const caption = voiceCaption.trim();
     resetVoiceSession();
-    await uploadAndSend(file, 'audio');
+    await uploadAndSend(file, 'audio', caption);
   }
 
   function togglePreviewPlayback() {
@@ -2669,6 +2988,7 @@ export function ThreadView() {
   async function uploadAndSend(
     file: File,
     kind?: 'image' | 'audio' | 'file',
+    captionOverride?: string,
   ) {
     if (!me) {
       setActionError('You must be signed in to send media');
@@ -2689,7 +3009,10 @@ export function ThreadView() {
         ? `local-${crypto.randomUUID()}`
         : `local-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const localUrl = URL.createObjectURL(file);
-    const caption = composer.trim();
+    const caption =
+      typeof captionOverride === 'string'
+        ? captionOverride.trim()
+        : composer.trim();
     const replySnapshot = replyTo;
     const placeholder =
       resolvedKind === 'audio'
@@ -3197,13 +3520,24 @@ export function ThreadView() {
       );
       const items = response.data.items.map(normalizeMessage);
       setThreadReplies(items);
+      for (const item of items) {
+        countedThreadReplyIdsRef.current.add(item.id);
+      }
+      const total =
+        response.data.meta.total ??
+        items.length;
       setActiveThreadRoot((current) =>
         current && current.id === threadRootId
           ? {
               ...current,
-              replyCount: response.data.meta.total || current.replyCount || items.length,
+              replyCount: total,
             }
           : current,
+      );
+      setMessages((msgs) =>
+        msgs.map((item) =>
+          item.id === threadRootId ? { ...item, replyCount: total } : item,
+        ),
       );
       await ensureProfiles([
         ...items.map((item) => item.senderId),
@@ -3280,16 +3614,19 @@ export function ThreadView() {
       const normalized = normalizeMessage(response.data);
       setThreadReplies((current) => upsertMessage(current, normalized));
       setThreadComposer('');
-      setMessages((current) =>
-        current.map((item) =>
-          item.id === activeThreadRoot.id
-            ? { ...item, replyCount: (item.replyCount ?? 0) + 1 }
-            : item,
-        ),
-      );
-      setActiveThreadRoot((root) =>
-        root ? { ...root, replyCount: (root.replyCount ?? 0) + 1 } : root,
-      );
+      if (!countedThreadReplyIdsRef.current.has(normalized.id)) {
+        countedThreadReplyIdsRef.current.add(normalized.id);
+        setMessages((current) =>
+          current.map((item) =>
+            item.id === activeThreadRoot.id
+              ? { ...item, replyCount: (item.replyCount ?? 0) + 1 }
+              : item,
+          ),
+        );
+        setActiveThreadRoot((root) =>
+          root ? { ...root, replyCount: (root.replyCount ?? 0) + 1 } : root,
+        );
+      }
     } catch (err) {
       setActionError(err instanceof Error ? err.message : 'Could not send reply');
     } finally {
@@ -3566,11 +3903,35 @@ export function ThreadView() {
     const rect = anchor.getBoundingClientRect();
     const menuWidth = 220;
     const gap = 8;
+    const edge = 8;
     let left = alignEnd ? rect.right - menuWidth : rect.left;
-    left = Math.max(8, Math.min(left, window.innerWidth - menuWidth - 8));
-    // Always open below the message / anchor (same as reaction picker).
+    left = Math.max(edge, Math.min(left, window.innerWidth - menuWidth - edge));
+
+    const spaceBelow = window.innerHeight - rect.bottom - edge;
+    const spaceAbove = rect.top - edge;
+    const preferredHeight = Math.min(window.innerHeight * 0.7, 420);
+
+    // Flip above when the menu won't fit below and there's more room above.
+    const placeAbove =
+      spaceBelow < Math.min(preferredHeight, 300) && spaceAbove > spaceBelow;
+
+    if (placeAbove) {
+      setMenuAnchor({
+        top: Math.max(edge, rect.top - gap),
+        left,
+        placeAbove: true,
+        maxHeight: Math.max(160, Math.min(preferredHeight, spaceAbove - gap)),
+      });
+      return;
+    }
+
     const top = rect.bottom + gap;
-    setMenuAnchor({ top, left, placeAbove: false });
+    setMenuAnchor({
+      top,
+      left,
+      placeAbove: false,
+      maxHeight: Math.max(160, Math.min(preferredHeight, window.innerHeight - top - edge)),
+    });
   }
 
   function toggleMessageMenu(
@@ -3612,6 +3973,7 @@ export function ThreadView() {
       message.deletedForEveryone ||
       isPendingMessage(message) ||
       message.type === 'poll' ||
+      message.type === 'interactive' ||
       message.type === 'call'
     ) {
       return false;
@@ -4142,6 +4504,45 @@ export function ThreadView() {
         </div>
       ) : null}
 
+      {channelIncident ? (
+        <div
+          className={`thread-incident-banner sev-${channelIncident.severity}${
+            channelIncident.status === 'mitigated' ? ' is-mitigated' : ''
+          }`}
+          role="status"
+        >
+          <span className={`thread-incident-sev sev-${channelIncident.severity}`}>
+            {channelIncident.severity.toUpperCase()}
+          </span>
+          <div className="thread-incident-main">
+            <strong>{channelIncident.title}</strong>
+            <span className="muted">
+              War room · {channelIncident.status}
+            </span>
+          </div>
+          <div className="thread-incident-actions">
+            {channelIncident.status === 'open' ? (
+              <button
+                type="button"
+                className="ghost"
+                disabled={incidentBusy}
+                onClick={() => void updateChannelIncident('mitigated')}
+              >
+                Mitigate
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="btn"
+              disabled={incidentBusy}
+              onClick={() => void updateChannelIncident('resolved')}
+            >
+              Resolve
+            </button>
+          </div>
+        </div>
+      ) : null}
+
       {canJoinOngoing ? (
         <button
           className={`wa-ongoing-call${ongoingIsHuddle ? ' is-huddle' : ''}`}
@@ -4598,8 +4999,15 @@ export function ThreadView() {
           const showPoll =
             !message.deletedForEveryone &&
             (message.type === 'poll' || Boolean(message.poll?.question));
+          const showInteractive =
+            !message.deletedForEveryone &&
+            (message.type === 'interactive' ||
+              Boolean(message.interactive?.title));
           const caption =
-            !showPoll && message.body && !isPlaceholderBody(message.body)
+            !showPoll &&
+            !showInteractive &&
+            message.body &&
+            !isPlaceholderBody(message.body)
               ? message.body
               : null;
           return (
@@ -4837,31 +5245,49 @@ export function ThreadView() {
                     ) : null}
                     {showAudio && message.attachment ? (
                       <div className="wa-media-wrap audio">
-                        <VoiceNotePlayer
-                          src={message.attachment.url}
-                          mime={message.attachment.mime}
-                          mine={mine}
-                          conversationId={id}
-                          messageId={message.id}
-                          sendStatus={message.sendStatus}
-                          uploadProgress={message.uploadProgress}
-                          onRetry={
-                            message.sendStatus === 'failed'
-                              ? () => void retryPendingMessage(message)
-                              : undefined
-                          }
-                        />
-                        {!pending ? (
-                          <button
-                            type="button"
-                            className="wa-media-download"
-                            aria-label="Download voice note"
-                            title="Download"
-                            disabled={mediaDownloadingId === message.id}
-                            onClick={() => void handleDownloadMedia(message)}
-                          >
-                            ↓
-                          </button>
+                        <div className="wa-voice-row">
+                          <VoiceNotePlayer
+                            src={message.attachment.url}
+                            mime={message.attachment.mime}
+                            mine={mine}
+                            conversationId={id}
+                            messageId={message.id}
+                            sendStatus={message.sendStatus}
+                            uploadProgress={message.uploadProgress}
+                            onRetry={
+                              message.sendStatus === 'failed'
+                                ? () => void retryPendingMessage(message)
+                                : undefined
+                            }
+                          />
+                          {!pending ? (
+                            <button
+                              type="button"
+                              className="wa-media-download"
+                              aria-label="Download voice note"
+                              title="Download"
+                              disabled={mediaDownloadingId === message.id}
+                              onClick={() => void handleDownloadMedia(message)}
+                            >
+                              ↓
+                            </button>
+                          ) : null}
+                        </div>
+                        {caption ? (
+                          <div className="wa-voice-caption">
+                            <span className="wa-voice-caption-label">
+                              Transcript
+                            </span>
+                            <div className="wa-voice-caption-body">
+                              <MentionedText
+                                body={caption}
+                                mentionLabels={mentionRenderLabels}
+                                userGroupHandles={userGroupHandles}
+                                selfId={me}
+                                messageId={message.id}
+                              />
+                            </div>
+                          </div>
                         ) : null}
                       </div>
                     ) : null}
@@ -5000,7 +5426,53 @@ export function ThreadView() {
                         </p>
                       </div>
                     ) : null}
-                    {caption ? (
+                    {showInteractive && message.interactive ? (
+                      <div
+                        className={`wa-interactive status-${message.interactive.status}`}
+                      >
+                        <p className="wa-interactive-kicker">Approval</p>
+                        <p className="wa-interactive-title">
+                          {message.interactive.title}
+                        </p>
+                        {message.interactive.status === 'open' ? (
+                          <div className="wa-interactive-actions">
+                            {message.interactive.actions.map((action) => (
+                              <button
+                                key={action.id}
+                                type="button"
+                                className={`wa-interactive-btn style-${action.style}`}
+                                disabled={pending}
+                                onClick={() =>
+                                  void invokeMessageAction(
+                                    message.id,
+                                    action.id,
+                                  )
+                                }
+                              >
+                                {action.label}
+                              </button>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="wa-interactive-result">
+                            {message.interactive.status === 'approved'
+                              ? 'Approved'
+                              : 'Denied'}
+                            {message.interactive.decidedBy
+                              ? ` by ${
+                                  displayName(
+                                    byUserId.get(message.interactive.decidedBy),
+                                  ) ||
+                                  (message.interactive.decidedByMe
+                                    ? 'you'
+                                    : 'a teammate')
+                                }`
+                              : ''}
+                          </p>
+                        )}
+                      </div>
+                    ) : null}
+                    {caption && !showAudio ? (
                       <p className="wa-text">
                         <MentionedText
                           body={caption}
@@ -5206,7 +5678,11 @@ export function ThreadView() {
                     className={`msg-menu msg-menu-fixed${
                       menuAnchor.placeAbove ? ' place-above' : ''
                     }`}
-                    style={{ top: menuAnchor.top, left: menuAnchor.left }}
+                    style={{
+                      top: menuAnchor.top,
+                      left: menuAnchor.left,
+                      maxHeight: menuAnchor.maxHeight,
+                    }}
                     role="menu"
                     onPointerDown={(event) => event.stopPropagation()}
                   >
@@ -5746,30 +6222,96 @@ export function ThreadView() {
 
       {scheduleOpen && !editingMessage && !conversation.blockedMe ? (
         <div className="schedule-composer">
-          <label>
-            Send later
-            <input
-              type="datetime-local"
-              value={scheduleAt}
-              min={toDatetimeLocalValue(new Date(Date.now() + 60_000))}
-              onChange={(event) => setScheduleAt(event.target.value)}
-            />
-          </label>
-          <button
-            type="button"
-            className="btn"
-            disabled={!composer.trim() || scheduleBusy}
-            onClick={() => void scheduleSend()}
-          >
-            {scheduleBusy ? 'Scheduling…' : 'Schedule'}
-          </button>
-          <button
-            type="button"
-            className="ghost"
-            onClick={() => setScheduleOpen(false)}
-          >
-            Close
-          </button>
+          <div className="schedule-composer-main">
+            <label>
+              Send later
+              <input
+                type="datetime-local"
+                value={scheduleAt}
+                min={toDatetimeLocalValue(new Date(Date.now() + 60_000))}
+                onChange={(event) => setScheduleAt(event.target.value)}
+              />
+            </label>
+            {schedulePreview ? (
+              <div className="schedule-tz-preview" aria-live="polite">
+                <p>
+                  <strong>Your time:</strong> {schedulePreview.myLabel}
+                  <span className="muted"> · {schedulePreview.myTzLabel}</span>
+                </p>
+                {schedulePreview.peerLabel ? (
+                  <p>
+                    <strong>Their time:</strong> {schedulePreview.peerLabel}
+                    <span className="muted">
+                      {' '}
+                      · {schedulePreview.peerTzLabel} ({schedulePreview.peerName})
+                    </span>
+                  </p>
+                ) : (
+                  <p className="muted">
+                    Open a DM to see the recipient&apos;s local time.
+                  </p>
+                )}
+                {schedulePreview.peerQuiet ? (
+                  <p className="schedule-tz-quiet" role="status">
+                    Falls in their quiet hours
+                    {scheduleContext?.peer
+                      ? ` (${scheduleContext.peer.quietStart}–${scheduleContext.peer.quietEnd})`
+                      : ''}
+                    . They may not get a notification until later.
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            {scheduleContext?.peer ? (
+              <div className="schedule-tz-suggestions">
+                <button
+                  type="button"
+                  className="ghost schedule-tz-chip"
+                  onClick={() => {
+                    const next = nextWallClockInZone(
+                      scheduleContext.peer!.timezone,
+                      9,
+                      0,
+                    );
+                    setScheduleAt(dateToDatetimeLocal(next));
+                  }}
+                >
+                  Arrive 9:00 their morning
+                </button>
+                {scheduleContext.peer.quietHoursEnabled ? (
+                  <button
+                    type="button"
+                    className="ghost schedule-tz-chip"
+                    onClick={() => {
+                      const next = nextAfterQuietHours(scheduleContext.peer!);
+                      if (next) {
+                        setScheduleAt(dateToDatetimeLocal(next));
+                      }
+                    }}
+                  >
+                    After their quiet hours
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+          <div className="schedule-composer-actions">
+            <button
+              type="button"
+              className="btn"
+              disabled={!composer.trim() || scheduleBusy}
+              onClick={() => void scheduleSend()}
+            >
+              {scheduleBusy ? 'Scheduling…' : 'Schedule'}
+            </button>
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setScheduleOpen(false)}
+            >
+              Close
+            </button>
+          </div>
         </div>
       ) : null}
 
@@ -5863,7 +6405,11 @@ export function ThreadView() {
               <div className="channel-ask-result-head">
                 <strong>Answer</strong>
                 <span className="muted">
-                  {askResult.poweredByAi ? 'AI · this channel' : 'This channel'}
+                  {askResult.demoMode
+                    ? 'Demo AI · this channel'
+                    : askResult.poweredByAi
+                      ? 'AI · this channel'
+                      : 'This channel'}
                 </span>
               </div>
               <pre className="channel-ask-answer">{askResult.answer}</pre>
@@ -5946,6 +6492,17 @@ export function ThreadView() {
             >
               <span className="voice-recorder-stop-icon" />
             </button>
+            <p className="voice-caption-live" aria-live="polite">
+              {voiceCaption || voiceCaptionInterim
+                ? `${voiceCaption}${
+                    voiceCaptionInterim
+                      ? `${voiceCaption ? ' ' : ''}${voiceCaptionInterim}`
+                      : ''
+                  }`
+                : voiceCaptionSupported
+                  ? 'Listening for caption…'
+                  : 'Caption unavailable in this browser — you can type one after stop'}
+            </p>
           </div>
         ) : voicePhase === 'preview' ? (
           <div className="voice-recorder preview" role="group" aria-label="Voice note preview">
@@ -6019,6 +6576,20 @@ export function ThreadView() {
             >
               {uploading ? '…' : 'Send'}
             </button>
+            <label className="voice-caption-field">
+              <span>Caption / transcript</span>
+              <textarea
+                value={voiceCaption}
+                onChange={(event) => setVoiceCaption(event.target.value)}
+                rows={2}
+                maxLength={4000}
+                placeholder={
+                  voiceCaptionSupported
+                    ? 'Auto-captioned — edit before sending'
+                    : 'Add a caption (optional)'
+                }
+              />
+            </label>
           </div>
         ) : (
           <>
@@ -6247,6 +6818,131 @@ export function ThreadView() {
                           >
                             Poll
                           </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {!editingMessage ? (
+                    <div className="composer-attach-wrap" ref={savedRepliesRef}>
+                      <button
+                        className={`composer-tool${savedRepliesOpen ? ' open' : ''}`}
+                        type="button"
+                        aria-label="Saved replies"
+                        title="Saved replies"
+                        aria-expanded={savedRepliesOpen}
+                        onClick={() => void openSavedRepliesPanel()}
+                      >
+                        SR
+                      </button>
+                      {savedRepliesOpen ? (
+                        <div
+                          className="composer-saved-replies"
+                          role="dialog"
+                          aria-label="Saved replies"
+                        >
+                          <div className="composer-saved-replies-head">
+                            <strong>Saved replies</strong>
+                            <button
+                              type="button"
+                              className="ghost"
+                              onClick={() => {
+                                setSavedReplyFormOpen((open) => !open);
+                                if (!savedReplyFormOpen && composer.trim()) {
+                                  setSavedReplyBody(composer);
+                                  setSavedReplyTitle(
+                                    composer.trim().slice(0, 40),
+                                  );
+                                }
+                              }}
+                            >
+                              {savedReplyFormOpen ? 'Cancel' : 'New'}
+                            </button>
+                          </div>
+                          {savedReplyFormOpen ? (
+                            <div className="composer-saved-replies-form">
+                              <label>
+                                Title
+                                <input
+                                  value={savedReplyTitle}
+                                  onChange={(event) =>
+                                    setSavedReplyTitle(event.target.value)
+                                  }
+                                  maxLength={80}
+                                  placeholder="On it"
+                                />
+                              </label>
+                              <label>
+                                Message
+                                <textarea
+                                  value={savedReplyBody}
+                                  onChange={(event) =>
+                                    setSavedReplyBody(event.target.value)
+                                  }
+                                  rows={3}
+                                  maxLength={4000}
+                                  placeholder="On it — will update you by EOD."
+                                />
+                              </label>
+                              <label>
+                                Shortcut (optional)
+                                <input
+                                  value={savedReplyShortcut}
+                                  onChange={(event) =>
+                                    setSavedReplyShortcut(event.target.value)
+                                  }
+                                  maxLength={32}
+                                  placeholder="onit → /sr onit"
+                                />
+                              </label>
+                              <button
+                                type="button"
+                                className="btn"
+                                disabled={
+                                  savedRepliesBusy ||
+                                  !savedReplyTitle.trim() ||
+                                  !savedReplyBody.trim()
+                                }
+                                onClick={() => void createSavedReplyFromForm()}
+                              >
+                                {savedRepliesBusy ? 'Saving…' : 'Save reply'}
+                              </button>
+                            </div>
+                          ) : null}
+                          {savedRepliesBusy && savedReplies.length === 0 ? (
+                            <p className="muted">Loading…</p>
+                          ) : null}
+                          {!savedRepliesBusy && savedReplies.length === 0 ? (
+                            <p className="muted">
+                              No saved replies yet. Create one for quick inserts,
+                              or send with <code>/sr shortcut</code>.
+                            </p>
+                          ) : null}
+                          <ul className="composer-saved-replies-list">
+                            {savedReplies.map((reply) => (
+                              <li key={reply.id}>
+                                <button
+                                  type="button"
+                                  className="composer-saved-reply-item"
+                                  onClick={() => insertSavedReply(reply)}
+                                >
+                                  <strong>{reply.title}</strong>
+                                  <span>{reply.body}</span>
+                                  {reply.shortcut ? (
+                                    <small>/sr {reply.shortcut}</small>
+                                  ) : null}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="composer-saved-reply-delete"
+                                  aria-label={`Delete ${reply.title}`}
+                                  onClick={() => void deleteSavedReply(reply.id)}
+                                >
+                                  ×
+                                </button>
+                              </li>
+                            ))}
+                          </ul>
                         </div>
                       ) : null}
                     </div>

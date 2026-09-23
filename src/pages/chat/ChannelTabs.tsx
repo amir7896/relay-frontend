@@ -6,6 +6,7 @@ import { ConnectPanel } from './tabs/ConnectPanel';
 import { FilesPanel, type MediaKindTab } from './tabs/FilesPanel';
 import { ListsPanel } from './tabs/ListsPanel';
 import { PinsPanel } from './tabs/PinsPanel';
+import { WhiteboardPanel } from './tabs/WhiteboardPanel';
 import { WorkflowsPanel } from './tabs/WorkflowsPanel';
 
 export type ChannelTab =
@@ -13,6 +14,7 @@ export type ChannelTab =
   | 'files'
   | 'pins'
   | 'canvas'
+  | 'board'
   | 'lists'
   | 'clips'
   | 'workflows'
@@ -34,6 +36,7 @@ const TABS: Array<{ id: ChannelTab; label: string; groupsOnly?: boolean }> = [
   { id: 'files', label: 'Files' },
   { id: 'pins', label: 'Pins' },
   { id: 'canvas', label: 'Canvas' },
+  { id: 'board', label: 'Board' },
   { id: 'lists', label: 'Lists' },
   { id: 'clips', label: 'Clips' },
   { id: 'workflows', label: 'Workflows' },
@@ -76,7 +79,9 @@ export function ChannelTabs({
             activeTab === 'lists' ? ' is-lists' : ''
           }${activeTab === 'apps' ? ' is-apps' : ''}${
             activeTab === 'files' ? ' is-files' : ''
-          }${activeTab === 'pins' ? ' is-pins' : ''}`}
+          }${activeTab === 'pins' ? ' is-pins' : ''}${
+            activeTab === 'board' ? ' is-board' : ''
+          }`}
           role="tabpanel"
         >
           {activeTab === 'files' ? (
@@ -96,6 +101,9 @@ export function ChannelTabs({
           {activeTab === 'canvas' ? (
             <CanvasPanel conversationId={conversationId} />
           ) : null}
+          {activeTab === 'board' ? (
+            <WhiteboardPanel conversationId={conversationId} />
+          ) : null}
           {activeTab === 'lists' ? (
             <ListsPanel
               conversationId={conversationId}
@@ -111,6 +119,8 @@ export function ChannelTabs({
           {activeTab === 'apps' ? (
             <AppsPanel
               conversationId={conversationId}
+              conversation={conversation}
+              onJumpToMessage={onJumpToMessage}
               onTrySlashCommand={(commandName) => {
                 onTabChange('messages');
                 window.setTimeout(() => {

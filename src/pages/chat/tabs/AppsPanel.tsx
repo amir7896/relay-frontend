@@ -1,7 +1,9 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '../../../api/client';
 import type { AppCatalogItem, Conversation, InstalledApp } from '../../../api/types';
 import { MrkdwnEditor } from '../../../components/MrkdwnEditor';
+import { clock, displayName } from '../../../lib/format';
+import { useDirectory } from '../../../people/useDirectory';
 import { SlashMarketplacePanel } from './SlashMarketplacePanel';
 
 const BOT_KEYS = new Set(['standup', 'dsu', 'daily-meeting']);
@@ -49,6 +51,30 @@ type BotConfig = {
   summaryOffsetMinutes: number;
 };
 
+type StandupReply = {
+  userId: string;
+  body: string;
+  messageId: string | null;
+  at: string | null;
+};
+
+type StandupBoard = {
+  open: boolean;
+  run: {
+    id: string;
+    appKey: string;
+    promptMessageId: string | null;
+    runDate: string;
+    promptedAt: string | null;
+    status: string;
+  } | null;
+  questions: string[];
+  replies: StandupReply[];
+  pendingUserIds: string[];
+  repliedCount: number;
+  memberCount: number;
+};
+
 function emptyConfig(appKey: string, channelId: string): BotConfig {
   return {
     conversationId: channelId,
@@ -62,10 +88,14 @@ function emptyConfig(appKey: string, channelId: string): BotConfig {
 
 export function AppsPanel({
   conversationId,
+  conversation,
   onTrySlashCommand,
+  onJumpToMessage,
 }: {
   conversationId: string;
+  conversation?: Conversation;
   onTrySlashCommand?: (commandName: string) => void;
+  onJumpToMessage?: (messageId: string) => void;
 }) {
   const [appsSection, setAppsSection] = useState<'apps' | 'slash'>('apps');
   const [apps, setApps] = useState<AppCatalogItem[]>([]);
@@ -79,6 +109,10 @@ export function AppsPanel({
   const [integrationKey, setIntegrationKey] = useState('');
   const [integrationConfig, setIntegrationConfig] =
     useState<IntegrationConfig | null>(null);
+  const [board, setBoard] = useState<StandupBoard | null>(null);
+  const [boardLoading, setBoardLoading] = useState(false);
+  const [summaryBusy, setSummaryBusy] = useState(false);
+  const { byUserId, ensureProfiles } = useDirectory();
 
   const installedMap = useMemo(() => {
     const map = new Map<string, InstalledApp>();
@@ -87,6 +121,29 @@ export function AppsPanel({
     }
     return map;
   }, [installed]);
+
+  const hasStandupBot = useMemo(
+    () => [...BOT_KEYS].some((key) => installedMap.has(key)),
+    [installedMap],
+  );
+
+  const loadBoard = useCallback(async () => {
+    if (!hasStandupBot) {
+      setBoard(null);
+      return;
+    }
+    setBoardLoading(true);
+    try {
+      const res = await api<StandupBoard>(
+        `/chat/conversations/${conversationId}/standup`,
+      );
+      setBoard(res.data ?? null);
+    } catch {
+      setBoard(null);
+    } finally {
+      setBoardLoading(false);
+    }
+  }, [conversationId, hasStandupBot]);
 
   async function refresh() {
     const [catalog, current, inbox] = await Promise.all([
@@ -111,6 +168,20 @@ export function AppsPanel({
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    void loadBoard();
+  }, [loadBoard]);
+
+  useEffect(() => {
+    if (!board) return;
+    const ids = [
+      ...board.replies.map((r) => r.userId),
+      ...board.pendingUserIds,
+      ...(conversation?.members?.map((m) => m.userId) ?? []),
+    ];
+    void ensureProfiles(ids);
+  }, [board, conversation?.members, ensureProfiles]);
 
   function openConfig(app: AppCatalogItem) {
     const existing = installedMap.get(app.key);
@@ -263,6 +334,39 @@ export function AppsPanel({
     }
   }
 
+  async function sendTestEvent(
+    appKey: 'github' | 'jira',
+    kind?: 'issue' | 'pull_request',
+  ) {
+    setBusyKey(`demo-${appKey}`);
+    setError('');
+    try {
+      await api(
+        `/chat/conversations/${conversationId}/apps/${encodeURIComponent(appKey)}/events/demo`,
+        {
+          method: 'POST',
+          body: JSON.stringify(kind ? { kind } : {}),
+        },
+      );
+      await refresh();
+      setNotice(
+        appKey === 'jira'
+          ? 'Demo Jira event posted — open Messages to see the bot update.'
+          : kind === 'pull_request'
+            ? 'Demo GitHub PR event posted — open Messages to see it.'
+            : 'Demo GitHub issue event posted — open Messages to see it.',
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : `Could not send ${appKey} test event.`,
+      );
+    } finally {
+      setBusyKey('');
+    }
+  }
+
   async function postNow(appKey: string) {
     setBusyKey(appKey);
     setError('');
@@ -278,10 +382,31 @@ export function AppsPanel({
       setNotice(
         'Posted now in the channel — open Messages to reply in the thread. The daily schedule still runs separately at the configured time.',
       );
+      await loadBoard();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not post standup.');
     } finally {
       setBusyKey('');
+    }
+  }
+
+  async function postSummary() {
+    if (!board?.open || !board.run) return;
+    setSummaryBusy(true);
+    setError('');
+    try {
+      await api(`/chat/conversations/${conversationId}/standup/summary`, {
+        method: 'POST',
+        body: JSON.stringify({ appKey: board.run.appKey }),
+      });
+      setNotice('Standup summary posted in the thread.');
+      await loadBoard();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Could not post standup summary.',
+      );
+    } finally {
+      setSummaryBusy(false);
     }
   }
 
@@ -571,8 +696,144 @@ export function AppsPanel({
               >
                 {busyKey === integrationKey ? 'Saving…' : 'Save settings'}
               </button>
+              {integrationKey === 'github' || integrationKey === 'jira' ? (
+                <button
+                  className="ghost"
+                  type="button"
+                  disabled={busyKey === `demo-${integrationKey}`}
+                  onClick={() =>
+                    void sendTestEvent(
+                      integrationKey as 'github' | 'jira',
+                      integrationKey === 'github' ? 'issue' : undefined,
+                    )
+                  }
+                >
+                  {busyKey === `demo-${integrationKey}`
+                    ? 'Sending…'
+                    : 'Send test event'}
+                </button>
+              ) : null}
             </div>
           </form>
+        ) : null}
+
+        {hasStandupBot ? (
+          <section className="standup-today-board" aria-label="Standup today">
+            <div className="standup-today-head">
+              <div>
+                <h4 className="apps-section-title">Standup today</h4>
+                <p className="muted standup-today-sub">
+                  {boardLoading
+                    ? 'Loading…'
+                    : board?.open
+                      ? `${board.repliedCount} of ${board.memberCount} replied · ${
+                          board.run?.appKey || 'standup'
+                        }`
+                      : 'No open standup in this channel yet — use Post now on a bot below.'}
+                </p>
+              </div>
+              <div className="standup-today-actions">
+                <button
+                  className="ghost"
+                  type="button"
+                  disabled={boardLoading}
+                  onClick={() => void loadBoard()}
+                >
+                  Refresh
+                </button>
+                {board?.open ? (
+                  <button
+                    className="btn"
+                    type="button"
+                    disabled={summaryBusy || board.repliedCount === 0}
+                    onClick={() => void postSummary()}
+                  >
+                    {summaryBusy ? 'Summarizing…' : 'Post summary'}
+                  </button>
+                ) : null}
+              </div>
+            </div>
+
+            {board?.open && board.questions.length ? (
+              <ol className="standup-today-questions">
+                {board.questions.map((q) => (
+                  <li key={q}>{q}</li>
+                ))}
+              </ol>
+            ) : null}
+
+            {board?.open ? (
+              <div className="standup-today-grid">
+                <div className="standup-today-col">
+                  <h5>
+                    Replied{' '}
+                    <span className="muted">({board.replies.length})</span>
+                  </h5>
+                  {board.replies.length === 0 ? (
+                    <p className="muted">Waiting for the first reply…</p>
+                  ) : (
+                    <ul className="standup-today-list">
+                      {board.replies.map((reply) => (
+                        <li key={reply.userId}>
+                          <div className="standup-today-row">
+                            <strong>
+                              {displayName(byUserId.get(reply.userId))}
+                            </strong>
+                            <span className="muted">
+                              {reply.at ? clock(reply.at) : ''}
+                            </span>
+                          </div>
+                          <p className="standup-today-body">
+                            {reply.body.slice(0, 280)}
+                            {reply.body.length > 280 ? '…' : ''}
+                          </p>
+                          {reply.messageId && onJumpToMessage ? (
+                            <button
+                              className="ghost"
+                              type="button"
+                              onClick={() => onJumpToMessage(reply.messageId!)}
+                            >
+                              Jump to reply
+                            </button>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                <div className="standup-today-col">
+                  <h5>
+                    Pending{' '}
+                    <span className="muted">
+                      ({board.pendingUserIds.length})
+                    </span>
+                  </h5>
+                  {board.pendingUserIds.length === 0 ? (
+                    <p className="muted">Everyone has checked in.</p>
+                  ) : (
+                    <ul className="standup-today-pending">
+                      {board.pendingUserIds.map((userId) => (
+                        <li key={userId}>
+                          {displayName(byUserId.get(userId))}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {board.run?.promptMessageId && onJumpToMessage ? (
+                    <button
+                      className="ghost"
+                      type="button"
+                      onClick={() =>
+                        onJumpToMessage(board.run!.promptMessageId!)
+                      }
+                    >
+                      Open prompt thread
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+          </section>
         ) : null}
 
         <div className="apps-catalog">
@@ -688,6 +949,24 @@ export function AppsPanel({
                             onClick={() => void startZoomMeeting()}
                           >
                             Start meeting
+                          </button>
+                        ) : null}
+                        {app.key === 'github' || app.key === 'jira' ? (
+                          <button
+                            className="ghost"
+                            type="button"
+                            title="Post a sample inbound webhook event to this channel"
+                            disabled={busyKey === `demo-${app.key}`}
+                            onClick={() =>
+                              void sendTestEvent(
+                                app.key as 'github' | 'jira',
+                                app.key === 'github' ? 'issue' : undefined,
+                              )
+                            }
+                          >
+                            {busyKey === `demo-${app.key}`
+                              ? 'Sending…'
+                              : 'Send test event'}
                           </button>
                         ) : null}
                         <button

@@ -1,5 +1,10 @@
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
-import { Suspense, lazy, type ReactNode } from 'react';
+import {
+  Suspense,
+  lazy,
+  type ComponentType,
+  type ReactNode,
+} from 'react';
 import { AuthProvider } from './auth/AuthContext';
 import { OrganizationProvider } from './organizations/OrganizationContext';
 import { ThemeProvider } from './theme/ThemeContext';
@@ -10,80 +15,85 @@ import { GuestLayout } from './components/GuestLayout';
 import { Protected } from './components/Protected';
 import { RequireWorkspace } from './components/RequireWorkspace';
 
-const EmptyThread = lazy(() =>
-  import('./pages/chat/EmptyThread').then((m) => ({ default: m.EmptyThread })),
+function lazyNamed<T extends Record<string, unknown>>(
+  loader: () => Promise<T>,
+  name: keyof T & string,
+) {
+  return lazy(async () => {
+    const mod = await loader();
+    const Comp = mod[name];
+    if (typeof Comp !== 'function') {
+      throw new Error(
+        `Lazy route "${name}" resolved to ${String(Comp)} — check the module export`,
+      );
+    }
+    return { default: Comp as ComponentType };
+  });
+}
+
+const EmptyThread = lazyNamed(
+  () => import('./pages/chat/EmptyThread'),
+  'EmptyThread',
 );
-const MessengerPage = lazy(() =>
-  import('./pages/chat/MessengerPage').then((m) => ({ default: m.MessengerPage })),
+const MessengerPage = lazyNamed(
+  () => import('./pages/chat/MessengerPage'),
+  'MessengerPage',
 );
-const ConversationDetailsPage = lazy(() =>
-  import('./pages/chat/ConversationDetailsPage').then((m) => ({
-    default: m.ConversationDetailsPage,
-  })),
+const ConversationDetailsPage = lazyNamed(
+  () => import('./pages/chat/ConversationDetailsPage'),
+  'ConversationDetailsPage',
 );
-const ThreadView = lazy(() =>
-  import('./pages/chat/ThreadView').then((m) => ({ default: m.ThreadView })),
+const ThreadView = lazyNamed(
+  () => import('./pages/chat/ThreadView'),
+  'ThreadView',
 );
-const LandingPage = lazy(() =>
-  import('./pages/LandingPage').then((m) => ({ default: m.LandingPage })),
+const LandingPage = lazyNamed(() => import('./pages/LandingPage'), 'LandingPage');
+const LoginPage = lazyNamed(() => import('./pages/LoginPage'), 'LoginPage');
+const PeoplePage = lazyNamed(() => import('./pages/PeoplePage'), 'PeoplePage');
+const AnalyticsPage = lazyNamed(
+  () => import('./pages/AnalyticsPage'),
+  'AnalyticsPage',
 );
-const LoginPage = lazy(() =>
-  import('./pages/LoginPage').then((m) => ({ default: m.LoginPage })),
+const BlockedUsersPage = lazyNamed(
+  () => import('./pages/BlockedUsersPage'),
+  'BlockedUsersPage',
 );
-const PeoplePage = lazy(() =>
-  import('./pages/PeoplePage').then((m) => ({ default: m.PeoplePage })),
+const ProfilePage = lazyNamed(() => import('./pages/ProfilePage'), 'ProfilePage');
+const RegisterPage = lazyNamed(
+  () => import('./pages/RegisterPage'),
+  'RegisterPage',
 );
-const AnalyticsPage = lazy(() =>
-  import('./pages/AnalyticsPage').then((m) => ({ default: m.AnalyticsPage })),
+const ForgotPasswordPage = lazyNamed(
+  () => import('./pages/ForgotPasswordPage'),
+  'ForgotPasswordPage',
 );
-const BlockedUsersPage = lazy(() =>
-  import('./pages/BlockedUsersPage').then((m) => ({
-    default: m.BlockedUsersPage,
-  })),
+const ResetPasswordPage = lazyNamed(
+  () => import('./pages/ResetPasswordPage'),
+  'ResetPasswordPage',
 );
-const ProfilePage = lazy(() =>
-  import('./pages/ProfilePage').then((m) => ({ default: m.ProfilePage })),
+const VerifyEmailPage = lazyNamed(
+  () => import('./pages/VerifyEmailPage'),
+  'VerifyEmailPage',
 );
-const RegisterPage = lazy(() =>
-  import('./pages/RegisterPage').then((m) => ({ default: m.RegisterPage })),
+const InviteAcceptPage = lazyNamed(
+  () => import('./pages/InviteAcceptPage'),
+  'InviteAcceptPage',
 );
-const ForgotPasswordPage = lazy(() =>
-  import('./pages/ForgotPasswordPage').then((m) => ({
-    default: m.ForgotPasswordPage,
-  })),
+const ChannelInviteAcceptPage = lazyNamed(
+  () => import('./pages/chat/ChannelInviteAcceptPage'),
+  'ChannelInviteAcceptPage',
 );
-const ResetPasswordPage = lazy(() =>
-  import('./pages/ResetPasswordPage').then((m) => ({
-    default: m.ResetPasswordPage,
-  })),
+const ConnectAcceptPage = lazyNamed(
+  () => import('./pages/chat/ConnectAcceptPage'),
+  'ConnectAcceptPage',
 );
-const VerifyEmailPage = lazy(() =>
-  import('./pages/VerifyEmailPage').then((m) => ({
-    default: m.VerifyEmailPage,
-  })),
+const OnboardingPage = lazyNamed(
+  () => import('./pages/OnboardingPage'),
+  'OnboardingPage',
 );
-const InviteAcceptPage = lazy(() =>
-  import('./pages/InviteAcceptPage').then((m) => ({
-    default: m.InviteAcceptPage,
-  })),
-);
-const ChannelInviteAcceptPage = lazy(() =>
-  import('./pages/chat/ChannelInviteAcceptPage').then((m) => ({
-    default: m.ChannelInviteAcceptPage,
-  })),
-);
-const ConnectAcceptPage = lazy(() =>
-  import('./pages/chat/ConnectAcceptPage').then((m) => ({
-    default: m.ConnectAcceptPage,
-  })),
-);
-const OnboardingPage = lazy(() =>
-  import('./pages/OnboardingPage').then((m) => ({ default: m.OnboardingPage })),
-);
-const SsoCallbackPage = lazy(() =>
-  import('./pages/SsoCallbackPage').then((m) => ({
-    default: m.SsoCallbackPage,
-  })),
+const SsoCallbackPage = lazyNamed(
+  () => import('./pages/SsoCallbackPage'),
+  'SsoCallbackPage',
 );
 
 function RouteFallback() {

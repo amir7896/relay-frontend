@@ -229,6 +229,24 @@ export type PollView = {
   totalVotes: number;
 };
 
+export type InteractiveAction = {
+  id: string;
+  label: string;
+  style: 'primary' | 'danger' | 'default';
+  value: 'approve' | 'deny';
+};
+
+export type InteractiveView = {
+  kind: 'approval';
+  title: string;
+  status: 'open' | 'approved' | 'denied';
+  actions: InteractiveAction[];
+  decidedBy: string | null;
+  decidedAt: string | null;
+  decidedValue: 'approve' | 'deny' | null;
+  decidedByMe: boolean;
+};
+
 export type MessageBookmark = {
   id: string;
   conversationId: string;
@@ -306,6 +324,7 @@ export type ChatMessage = {
   mentions: string[];
   linkPreview: LinkPreview | null;
   poll?: PollView | null;
+  interactive?: InteractiveView | null;
   reactions: MessageReaction[];
   editedAt: string | null;
   pinned?: boolean;
@@ -380,6 +399,43 @@ export type ScheduledMessage = {
   createdAt: string;
   conversationName?: string | null;
   conversationType?: 'private' | 'group';
+};
+
+export type SavedReply = {
+  id: string;
+  title: string;
+  body: string;
+  shortcut: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type WikiPage = {
+  id: string;
+  title: string;
+  slug: string;
+  body: string;
+  createdBy: string;
+  updatedBy: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type IncidentSeverity = 'sev1' | 'sev2' | 'sev3' | 'sev4';
+export type IncidentStatus = 'open' | 'mitigated' | 'resolved';
+
+export type Incident = {
+  id: string;
+  conversationId: string;
+  conversationName: string | null;
+  severity: IncidentSeverity;
+  title: string;
+  status: IncidentStatus;
+  openedBy: string;
+  resolvedBy: string | null;
+  resolvedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type MessageReminder = {

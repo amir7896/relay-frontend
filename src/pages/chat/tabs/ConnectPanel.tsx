@@ -77,6 +77,15 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
       .then((data) => {
         if (!active) return;
         setStatus(data);
+        const pending = data?.invites?.filter((invite) => invite.status === 'pending') ?? [];
+        const newest = pending[0];
+        if (newest) {
+          const url = absoluteInviteUrl(
+            newest.inviteUrl ||
+              (newest.token ? `/connect-invite/${newest.token}` : ''),
+          );
+          if (url) setLastInviteUrl(url);
+        }
       })
       .catch(() => {
         if (active) setNotice('Connect is not available for this conversation yet.');
@@ -92,13 +101,16 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
     setBusy(true);
     setNotice('');
     try {
-      const created = await api<ConnectInvite & { inviteUrl?: string; token?: string }>(
-        `/chat/conversations/${conversationId}/connect/invite`,
-        {
-          method: 'POST',
-          body: JSON.stringify({ email: email.trim(), mode }),
-        },
-      );
+      const created = await api<
+        ConnectInvite & {
+          inviteUrl?: string;
+          token?: string;
+          emailDelivered?: boolean;
+        }
+      >(`/chat/conversations/${conversationId}/connect/invite`, {
+        method: 'POST',
+        body: JSON.stringify({ email: email.trim(), mode }),
+      });
       await refresh();
       setEmail('');
       const url = absoluteInviteUrl(
@@ -106,13 +118,25 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
           (created.data.token ? `/connect-invite/${created.data.token}` : ''),
       );
       setLastInviteUrl(url);
+      const mailed = created.data.emailDelivered
+        ? ' Email sent.'
+        : ' Copy the link below if email was not delivered.';
       setNotice(
         url
           ? mode === 'workspace'
-            ? 'Workspace share invite created. Send the link to an admin in the partner org.'
-            : 'Guest invite created. Copy the link and send it to your collaborator.'
+            ? `Workspace share invite ready.${mailed}`
+            : `Guest invite ready.${mailed}`
           : 'Invitation created.',
       );
+      if (url) {
+        window.setTimeout(() => {
+          const input = document.querySelector<HTMLInputElement>(
+            '.connect-link-box input',
+          );
+          input?.focus();
+          input?.select();
+        }, 50);
+      }
     } catch (err) {
       setNotice(
         err instanceof Error ? err.message : 'Could not send the invitation.',
@@ -125,7 +149,7 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
   async function copyLink(url: string) {
     try {
       await navigator.clipboard.writeText(url);
-      setNotice('Invite link copied.');
+      setNotice('Invite link copied — paste it in Slack, email, or chat.');
     } catch {
       setNotice('Could not copy the link. Select and copy it manually.');
     }
@@ -272,9 +296,18 @@ export function ConnectPanel({ conversationId }: { conversationId: string }) {
 
       {lastInviteUrl ? (
         <div className="connect-link-box">
-          <input type="text" readOnly value={lastInviteUrl} aria-label="Connect invite link" />
+          <label className="connect-link-label">
+            Invite link
+            <input
+              type="text"
+              readOnly
+              value={lastInviteUrl}
+              aria-label="Connect invite link"
+              onFocus={(event) => event.currentTarget.select()}
+            />
+          </label>
           <button
-            className="btn ghost"
+            className="btn"
             type="button"
             onClick={() => void copyLink(lastInviteUrl)}
           >
